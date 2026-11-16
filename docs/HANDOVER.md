@@ -9,9 +9,14 @@
 > Estado: **el juego arranca de punta a punta** (loader, boot machine de Konami,
 > NVRAM, instanciación de escena), el **x87 está corregido**, los **atlas de
 > fuente se construyen y se suben** y el port es **estable 30 s sin crashes**.
-> El bloqueo activo es el **layout/UV del atlas de `CTexFont`**: el texto se
-> dibuja pero sale como ruido. Lee §5 y §6 primero. Este documento es el prompt
-> de transferencia para una sesión nueva; el repo es
+> **Causa raíz del ruido de texto identificada**: el juego pide
+> `GetGlyphOutlineA` con `fmt=6` = **`GGO_GRAY8_BITMAP`**, no `GGO_NATIVE` (2);
+> nuestro `font.c` devuelve un *outline* y el rasterizador del juego lo lee como
+> bitmap de 8 bpp. Ver §5.2. Además, el **boot de Konami ya corre** (los
+> managers se actualizan y el quad del logo se dibuja), pero la textura real de
+> `KonamiLogo.pak` aún no se carga porque el state machine del boot/attract
+> manager se queda en el sub-estado 8. Ver §5.4. Este documento es el prompt de
+> transferencia para una sesión nueva; el repo es
 > `/var/home/vm/Proyectos/SALA DE TRABAJO/otomedius-recomp`.
 
 ---
@@ -164,6 +169,8 @@ OTOMEDIUS_NOMOVIE=1              # force VFW_E_NOT_FOUND
 OTOMEDIUS_NO_FREETYPE=1          # force the synthetic rectangle glyph path
 OTOMEDIUS_FONT=/path/font.ttf    # override the FreeType font (CJK, etc.)
 OTOMEDIUS_TEXDBG=1               # dump each font atlas to /tmp/opencode/tex_*.pgm
+OTOMEDIUS_KONAMI=1               # experimental: drive the KonamiLogo manager
+                                 # directly from render.c (0x439920 + 0x4395B0)
 OTOMEDIUS_DIR=path               # game directory
 ```
 
@@ -459,6 +466,8 @@ Dispatcher extras added this session: `x86_watch_hit`, `x86_peek_dump`,
 | `ac_io_update` | `0` | |
 | `ac_io_pjei_update_control_status_buffer` | **`1`** | with 0, `0x413552` takes the "no data" branch and the game **never** calls `ac_io_pjei_get_control_status_buffer` — i.e. the cabinet input is frozen forever |
 | `ac_io_pjei_get_control_status_buffer` | `0`, writes the 16-byte buffer | 16-bit switch word, active low: bit0 up, 1 down, 2 left, 3 right, 4..7 shot/bomb/option/special, 8 start, 9 coin |
+| `ac_io_pjei_unlock_coincounter` | **`1`** | `0x413D3F` treats 0 as a hard error: logs `1183 ac_io_pjei_unlock_coincounter` through `0x403DB0`, which sets `[0x5DE220]=0xFFFFFFFF` and suspends every manager. This was one of the three errors that blocked the Konami boot. |
+| `bms_time_get_clock_blocking(type, uint64_t *out)` | `0`, writes a real monotonic ms clock | The out pointer is the **second** argument (`arg32(1)`), not the first. Reading arg0 wrote to address 0/1 and left the caller's frequency at zero, so `0x44D400` divided by zero and the CRT raised an unhandled exception. |
 | `ac_io_is_active2(dummy,&status)` | **`1`**, `*status = 0` | 0 made the detector read an uninitialised out-param and fall into I/O mode 7 (hard error) |
 | `ac_io_pjei_req_secplug_check()` | **`1`** | 0 = rejected → I/O mode 7 |
 | `ac_io_pjei_req_secplug_check_isfinished(&status)` | **`1`**, **`*status = 0x14`** | `0x4133D6` compares with 20; anything else → mode 7 |
@@ -696,6 +705,38 @@ it maps `u_norm = floor(u)*cell_u + frac(u)` (and the same for V), where
 the intended atlas cell, but §5.2 shows the atlas packing still disagrees with
 the 48×6 cell size.
 
+### 4.16 Konami boot: the three errors that suspended every manager
+
+The boot/attract manager (`0x4547E0`) and the KonamiLogo manager (`0x4393A0`,
+update `0x439550`, draw `0x4395B0`) were alive but never ran because
+`[0x5DE220]` (the manager enable mask) was `0xFFFFFFFF`.  Three independent
+errors set it through `0x403DB0`:
+
+1. **Shader compile** — `D3DXCreateEffect` is a stub returning `E_FAIL`, so the
+   asset loader logs `2302:Failed Create Shader` (`0x559580`) and
+   `2306:Failed Build` (`0x5594C4`).  `patches.c` now intercepts `0x403DB0`
+   and ignores exactly those two format strings.
+2. **AVS coin counter** — `ac_io_pjei_unlock_coincounter` returned 0; `0x413D3F`
+   logs `1183 ...` (`0x5587D4`).  The stub now returns 1 (see §4.1).
+3. **BMS clock** — `bms_time_get_clock_blocking` read the wrong argument and
+   returned 0, so `0x44D400` divided by zero.  The stub now uses `arg32(1)` and
+   a real `CLOCK_MONOTONIC` millisecond counter (see §4.1).
+
+Additional guards in `patches.c`:
+
+* `0x402840` (save `bookkeep.bin`) is skipped: the save path builds
+  `E:\nvmem\bookkeep.bin`, the host-path conversion corrupts the name, and the
+  following `CreateFileA` gets a garbage string and raises an unhandled
+  exception.  Bookkeeping is not needed for the logo.
+* `0x4547E0` (boot/attract update) forces `[0x5E2136]=1` (cabinet I/O ready),
+  skips the "wait for I/O" state (`[mgr+0xC]=1`), and clears the boot/attract
+  manager slot `0x5DE258` when the state machine is at state 1 / sub-state 1.
+  Without this the state machine never advances past state 0.
+* `OTOMEDIUS_KONAMI=1` (in `render.c`) bypasses `0x4547E0` entirely and calls
+  `0x439920` (set the logo string) + `0x4395B0` (draw) on the KonamiLogo
+  manager at `[0x5DE23C]` every frame.  This draws the logo quad but not the
+  real texture (see §5.4).
+
 ## 5. Estado Actual y Bug/Bloqueo Activo
 
 ### 5.1 Lo que funciona (verificado en local y en Flatpak)
@@ -749,52 +790,70 @@ depuración es el rectángulo rojo `(372,476)-(907,547)`. Los otros 4 quads
 tienen coordenadas enormes (`bbox=(-303352,8)-(2926,319040)`) y quedan fuera
 de pantalla; son un camino de dibujo aparte, pendiente de revisar.
 
-### 5.2 Bloqueo activo: el layout/UV del atlas de `CTexFont`
+### 5.2 Bloqueo de texto: `GGO_GRAY8_BITMAP` vs `GGO_NATIVE` (causa raíz)
 
-El texto ya **no es invisible** (el atlas tiene alpha y los glifos son
-reales), pero se ve como **ruido/rayas**. Datos medidos:
+**El juego NO pide `GGO_NATIVE`.**  La llamada real es:
 
-1. Con FreeType el atlas 512×64 tiene **22 717 píxeles** con alpha
-   (`first=17ffffff`, `alpha0=0`). El atlas anterior sintético tenía 324.
-2. El atlas es **denso**: un único componente conexo `(0,18)-(511,63)` con
-   22 299 píxeles; la celda `(288,24)` de 48×6 tiene **273/288** píxeles no
-   cero. Comparado con el atlas sintético (cajas huecas), esto demuestra que
-   los glifos reales se están escribiendo unos encima de otros.
-3. La tabla de fuente del juego (`0x5BE7CC`, entrada del font index 1) es:
-   `+0x00=0` (string), `+0x04=0x60` (96), `+0x08=24.0`, `+0x0C=24.0`,
-   `+0x10=0.09375`, `+0x14=0.09375`, `+0x18=0x10004100` (glyph array).
-   `0.09375 = 48/512 = 6/64`: la celda lógica es **48×6 px**.
-4. Los glyph records son `N=(6,4)`, `O=(7,4)`, `W=(5,5)`, `I=(1,4)`,
-   `T=(2,5)`, `A=(3,3)`, `L=(4,4)`, `Z=(8,5)`, `G=(9,3)`.
-5. El quad de texto pasa `u=6.0..6.09375`, `v=4.0..4.09375`: un **span de
-   celda** de `0.09375` en U (48 px) y `0.09375` en V (6 px).
-6. El atlas empaqueta glifos de **~6 px** de ancho (`gmCellIncX` a `h/4` es
-   ~3 px, a `h=24` ~13 px), pero el span U del quad es **48 px**. Cada quad
-   muestrea entre 4 y 8 glifos en vez de uno → ruido.
+```
+gdi32: GetGlyphOutlineA(ch=101 fmt=6 gm=009fee24 gm2=1003d66a cb=0 buf=00000000)
+gdi32: GetGlyphOutlineA(ch=101 fmt=6 gm=009fee24 gm2=1003d66a cb=1160 buf=1003d6e8)
+```
 
-Hipótesis, en orden:
+`fmt=6` es **`GGO_GRAY8_BITMAP`** (las constantes Win32 son
+`GGO_BITMAP=1`, `GGO_NATIVE=2`, `GGO_GRAY2_BITMAP=4`,
+`GGO_GRAY4_BITMAP=5`, `GGO_GRAY8_BITMAP=6`).  Nuestro `native/font.c`
+comprueba `format & 2` y devuelve un **outline** (`TTPOLYGONHEADER` /
+`TTPOLYCURVE`), pero el juego lo lee como un **bitmap de 8 bpp** en la rama
+`0x409E5E` de `0x409D20` (la rama se elige con `[font+0x38]==1`, que es el
+caso: `f38=1 f39=0`).  Los bytes del outline se interpretan como alpha →
+**ruido/rayas**.  Esta es la causa raíz, no el empaquetado.
 
-1. El **packer de `CTexFont`** (`0x409C00` → `0x409D20`) avanza el lápiz X
-   con `gmCellIncX` (o con el ancho del glifo), no con el ancho de celda de
-   48 px. Hay que instrumentar `0x409D20` y volcar `[edi+0x28]` (pen X),
-   `[edi+0x2C]` (pen Y), `[edi+0x4C]`/`[edi+0x50]` (ancho/alto del glifo)
-   para cada carácter y compararlo con las UVs de los glyph records.
-2. El **tamaño de la `FT_Face`** no es el correcto. Ahora se usa `h/4`
-   (24 → 6 px) porque la celda V es 6 px; pero la celda U es 48 px. Probar
-   `h` y `h*2` y medir el atlas/pen. La proporción 4× puede ser solo vertical.
-3. La **convención UV** del juego puede necesitar una **texture matrix** que
-   no se está aplicando (`SetTransform` no se llama; `D3DTSS_TEXTURETRANSFORMFLAGS`
-   se pone a 0). El remapeo actual en `draw_up_vertices` es una aproximación.
-4. El **7º argumento** de `GetGlyphOutlineA` es un segundo
-   `GLYPHMETRICS`-shaped buffer en `&[font+0x3A]`. El juego lo precalcula como
-   offsets UV; **no se debe espejar** el `gm` de la API ahí (el espejo está
-   desactivado en `gm_mirror`).
-5. El rasterizador `0x409D20` tiene dos caminos seleccionados por
-   `[font+0x38]` y `[font+0x39]` (bitmap/outline y 1bpp/4bpp). Hay que
-   confirmar que GGO_NATIVE entra por el camino de líneas y no por el de
-   bitmap.
+Datos medidos con `OTO_PACKDBG=1` (instrumentación temporal en
+`.work/gen/rc_002.c`, no en el repo):
 
-El remapeo actual de UVs de celda en `native/render.c` es:
+```
+pack: font=1003d630 f38=1 f39=0 penX=0 penY=0 gm=009fee24
+      bbX=7 bbY=7 orgX=0 orgY=6 incX=7 incY=0 gm10=0 buf=1003d6e8
+pack2: arg2=009fee68 *arg2=4096 arg3=009fee70
+       a3[0]=0000000e a3[1]=0000000c a3[2]=00000003 a3[3]=00000000
+pack3: font=1003d630: 605e0a40 0f010000 0f000002 1003d618
+       00000017 00000030 00010001 0dc00001 3f800000 3f800000 ...
+```
+
+* El objeto de fuente es `0x1003d630`; su textura es `0x605e0a40`
+  (**1024×512**, no 512×64).  `[font+0x38]=1` (modo gray8),
+  `[font+0x39]=0`.
+* `arg2` es un struct de 2 dwords: `[0]=4096` (stride de fila en bytes,
+  1024 px × 4) y `[1]=0x1003d6e8` (puntero al buffer del atlas).
+* `arg3` es el `TEXTMETRICA` (tmHeight=14, tmAscent=12, tmDescent=3).
+* `gm` es el `GLYPHMETRICS` de la API: `bbX=7 bbY=7 orgX=0 orgY=6
+  incX=7 incY=0`.  El juego lee el avance de `gm+0x10` en `0x409F5E`
+  (`movsx edx, word ptr [esp+0x30]`), que vale 0; el `gmCellIncX` real
+  está en `gm+0x0C`.  El local `gm` tiene 20 bytes (5 dwords puestos a 0
+  en `0x409B50`), así que el juego espera un struct de 20 bytes con el
+  avance en `+0x10`.  Esto es un **problema secundario**: aunque se
+  arregle, el atlas seguirá siendo ruido mientras se devuelva un outline
+  en vez de un bitmap gray8.
+
+**Fix correcto (pendiente de aplicar):**
+
+1. En `native/font.c`, implementar de verdad `GGO_GRAY8_BITMAP`:
+   renderizar el glifo con FreeType a un bitmap de cobertura, escribir
+   `stride = (width + 3) & ~3` bytes por fila, un byte por píxel
+   (0..255), y rellenar `gmBlackBoxX/Y`, `gmptGlyphOrigin`,
+   `gmCellIncX/Y`.  `GGO_BITMAP` (1) es 1 bpp MSB-first con
+   `stride = ((width + 31) / 32) * 4`.  `GGO_NATIVE` (2) solo para
+   `format == 2`.
+2. En `native/win32_misc.c`, `g_GetGlyphOutlineA` debe enrutar por
+   `format` exacto, no por `format & GGO_NATIVE`.
+3. Escribir también el avance en `gm+0x10` (además de `gm+0x0C`) para
+   que `0x409F5E` avance `penX`; el juego lee `gm+0x10`.
+4. Validar con `OTOMEDIUS_TEXDBG=1`: el atlas debe ser **disperso**
+   (glifos separados) y el frame debe mostrar “NOW INITIALIZING”
+   legible en `(448,480)-(832,536)`.
+
+El remapeo de UVs de celda en `native/render.c` sigue siendo necesario
+para llegar a la celda correcta, pero **no** es la causa del ruido:
 
 ```c
 cell_u = maxu - minu;
@@ -808,8 +867,14 @@ if (cell_uv) {
 ```
 
 Con `u=6.0`, `cell_u=0.09375` da `u_norm=0.5625` (texel 288) y con
-`6.09375` da `0.65625` (texel 336): un span de 48 texels. Si el atlas real
-empaqueta a 6 px, este span es 8× demasiado grande.
+`6.09375` da `0.65625` (texel 336): un span de 48 texels.  La tabla de
+fuente (`0x5BE7CC`/`0x5BE7E8`) tiene `+0x10=0.09375`, `+0x14=0.09375`
+(48/512 = 6/64), y los glyph records son `N=(6,4)`, `O=(7,4)`,
+`W=(5,5)`, `I=(1,4)`, `T=(2,5)`, `A=(3,3)`, `L=(4,4)`, `Z=(8,5)`,
+`G=(9,3)`.  El atlas de 1024×512 usa `0.09375 = 96/1024` en U y
+`0.09375 = 48/512` en V, así que la celda lógica es **96×48 px** para
+ese atlas (no 48×6).  Confirmar con el atlas real antes de tocar el
+remapeo.
 
 ### 5.3 Problemas secundarios y estado del árbol
 
@@ -823,6 +888,8 @@ empaqueta a 6 px, este span es 8× demasiado grande.
 * **Escena real**: solo se ha cargado `Once.pak`. `0x45EB20` (Title),
   `0x45FF10` (Warning) y `0x439A8C` (KonamiLogo) **nunca se han llamado**.
   “NOW INITIALIZING” es la consola de depuración, no la pantalla del juego.
+  El boot de Konami **sí** corre ahora (ver §5.4), pero la textura real de
+  `KonamiLogo.pak` aún no se carga.
 * **Japonés**: la fuente por defecto es DejaVu Sans (ASCII). Para CJK usar
   `OTOMEDIUS_FONT=/ruta/NotoSansCJK.ttc` o similar; el runtime tiene DejaVu
   en `/usr/share/fonts/dejavu/DejaVuSans.ttf`, y `/run/host/fonts` puede
@@ -831,22 +898,48 @@ empaqueta a 6 px, este span es 8× demasiado grande.
   Están fuera de pantalla y no bloquean, pero conviene identificar el draw
   (posiblemente el marco de la consola con una escala mal calculada).
 
+### 5.4 Boot de Konami: estado actual
+
+Tras los parches de §4.16, el juego **ya no crashea** y los managers se
+actualizan cada frame:
+
+```
+[watch] 00439550 #1 ... ecx=1003fa78 edx=0055c870   ; KonamiLogo update
+[watch] 004547e0 #1 ... ecx=1003fbe0 edx=00563db0   ; boot/attract update
+```
+
+* `0x439550` (KonamiLogo update) y `0x4547E0` (boot/attract update) se
+  llaman cada frame.
+* El **quad del logo se dibuja**: `up=2..4 verts=4..8 fvf=000044
+  bbox=(0,0)-(2312,1024)`.  Sale como **rectángulo blanco** porque la
+  textura real de `KonamiLogo.pak` no está cargada (`tex0=00000000`).
+* El state machine del boot/attract manager (`0x4547E0`) avanza de
+  `state=0` a `state=1`, y de `sub=0` a `sub=1` y `sub=8`, pero se queda
+  atascado en **`state=1 sub=8`** (`0x454A74`).  Ese bloque asigna 0xC
+  bytes y llama al constructor `0x429210`, que registra en `0x5DE258`;
+  en nuestra ejecución `[0x5DE258]` sigue a 0 y el sub-estado no avanza
+  a 9.  Hay que averiguar si `0x4142B0` devuelve 0 o si `0x429210` no
+  llega a registrar.
+* Con `OTOMEDIUS_KONAMI=1` se salta `0x4547E0` y se llama directamente
+  `0x439920` (fija el string) + `0x4395B0` (dibuja) sobre el manager de
+  `[0x5DE23C]`.  Eso dibuja el quad pero **no** la textura real.
+* El atlas de fuente del logo (`0x607e0b20`, 2048×128) se crea y se
+  bloquea (`LockRect`), pero el logo real es una textura de
+  `KonamiLogo.pak`, no el atlas de texto.
+
 Ficheros modificados/nuevos en el working tree (checkpoint sin commit al
 escribir esto; el commit se hará al cerrar la sesión):
 
 ```
-M io.github.nicobm.OtomediusRecomp.json
-M native/d3d9.c
-M native/d3d9_objects.c
-M native/patches.c
-M native/platform_sdl.c
-M native/render.c
-M native/win32_misc.c
-M native/x86rt.c
-M tools/recomp/emit.py
-?? native/font.c
-?? native/font.h
+M native/avs.c        # coin counter returns 1; BMS clock arg/real time
+M native/patches.c    # shader error ignore, bookkeep skip, boot state force
+M native/render.c     # OTOMEDIUS_KONAMI experimental hook
+M docs/HANDOVER.md    # this document
 ```
+
+Los cambios de la sesión anterior (`font.c`, `font.h`, `d3d9*.c`,
+`win32_misc.c`, `x86rt.c`, `emit.py`, manifiesto) ya están en el commit
+`aff81d6`.
 
 `docs/HANDOVER.md` y `README.md` también se actualizan en el checkpoint.
 
@@ -859,63 +952,78 @@ locales.
 
 ## 6. Plan de Acción Inmediato
 
-### Paso 1 — Recompilar el Flatpak y verificar FreeType
+### Paso 1 — Implementar `GGO_GRAY8_BITMAP` (texto legible)
 
-El Flatpak instalado es **anterior** a FreeType. Recompilar:
+El juego pide `fmt=6` (`GGO_GRAY8_BITMAP`), no `GGO_NATIVE`.  En
+`native/font.c`:
+
+1. Añadir una función `font_glyph_bitmap(handle, ch, format, gm, cb, buf,
+   &size)` que:
+   - `FT_Load_Glyph(face, gi, FT_LOAD_RENDER | FT_LOAD_TARGET_NORMAL)`.
+   - Para `GGO_GRAY8_BITMAP` (6): `stride = (bitmap.width + 3) & ~3`,
+     `size = stride * bitmap.rows`, copiar `bitmap.buffer` (un byte por
+     píxel, 0..255).
+   - Para `GGO_BITMAP` (1): `stride = ((width + 31) / 32) * 4`, empaquetar
+     1 bpp MSB-first.
+   - Rellenar `gmBlackBoxX/Y`, `gmptGlyphOrigin`, `gmCellIncX/Y` y
+     **también** `gm+0x10` con el avance (el juego lee `gm+0x10` en
+     `0x409F5E`).
+2. En `native/win32_misc.c`, `g_GetGlyphOutlineA` debe enrutar por
+   `format` exacto: `2` → outline (el código actual), `6` → gray8,
+   `1` → 1bpp.  No usar `format & GGO_NATIVE`.
+3. Recompilar y validar:
+   ```sh
+   sh /tmp/opencode/build.sh font.c win32_misc.c
+   cd ../.work/oto && OTOMEDIUS_TEXDBG=1 OTOMEDIUS_DUMP_FB=/tmp/opencode/t.ppm \
+     OTOMEDIUS_DUMP_AT=300 ../obj/otomedius-recomp .
+   ```
+   El atlas debe ser **disperso** y el frame debe mostrar “NOW
+   INITIALIZING” legible en `(448,480)-(832,536)`.
+
+### Paso 2 — Desatascar el boot/attract manager (logo real)
+
+El state machine `0x4547E0` se queda en `state=1 sub=8` (`0x454A74`).
+Ese bloque hace:
+
+```
+push 0xc; push 0x5e1f28; call 0x4142b0   ; alloc 12 bytes
+cmp eax, edi; je 0x454a9a                ; if alloc failed, skip ctor
+mov esi, eax; call 0x429210              ; ctor, registers at 0x5DE258
+add byte [ebp+0xd], 1                    ; -> sub-state 9
+```
+
+Investigar con `OTO_BOOTDBG=1` (print temporal en `.work/gen/rc_017.c`):
+
+1. ¿`0x4142B0` devuelve 0?  Si sí, el heap local está agotado o el
+   descriptor `0x5E1F28` está corrupto.
+2. ¿`0x429210` registra en `0x5DE258`?  El constructor comprueba
+   `[0x5DE258] == 0`; si no, llama a `0x403DB0` con
+   `"1044 Overlap create manager ID:%d"` y pone la máscara a
+   `0xFFFFFFFF`.  Nuestro parche limpia `0x5DE258` solo en
+   `state=1 sub=1`; puede que en `sub=8` vuelva a estar ocupado.
+3. Si el constructor registra, el sub-estado debería pasar a 9 y luego
+   a 10/11, que crean los managers de la escena y cargan
+   `KonamiLogo.pak`.  Verificar con
+   `OTOMEDIUS_WATCH="439a8c,4397c0,41e280,4395b0"`.
+
+### Paso 3 — Validar el logo y la escena real
+
+Con el boot desatascado:
 
 ```sh
-bash build-game-flatpak.sh "/ruta/al/Otomedius (2008-04-18)(JPN)[Konami PC][TP].zip"
-flatpak run io.github.nicobm.OtomediusRecomp
-```
-
-Comprobar en la salida:
-
-```
-font: using /usr/share/fonts/dejavu/DejaVuSans.ttf
-d3d9: tex LockRect(60040490) 512x64 -> ...
-render: frame 360: ... tex0=60040490 bbox=(448,480)-(832,536)
-```
-
-Si no aparece `font: using`, revisar que el SDK tenga
-`pkg-config --modversion freetype2` (26.7.20) y que el manifiesto pase
-`$(pkg-config --cflags freetype2)` y `$(pkg-config --libs freetype2)`.
-
-### Paso 2 — Resolver el layout/UV del atlas (bloqueo real)
-
-1. Instrumentar el packer `0x409C00`/`0x409D20` (watch + memoria) y volcar,
-   por carácter: `[edi+0x28]` (pen X), `[edi+0x2C]` (pen Y),
-   `[edi+0x4C]`/`[edi+0x50]` (ancho/alto), y las UVs del glyph record.
-2. Comparar con la tabla de fuente (`0x5BE7CC`, entrada 1): `+0x10=0.09375`,
-   `+0x14=0.09375`; decidir si la celda es 48×6 o 6×6.
-3. Probar variantes controladas:
-   - `FT_Set_Pixel_Sizes` a `h/4`, `h`, `h*2` (ya está `h/4`).
-   - `LINE_CHUNK=8` (líneas cortas; ya está) frente a `QSPLINE`.
-   - desactivar/activar el remapeo de celdas de `render.c`.
-   - `OTOMEDIUS_TEXDBG=1` para volcar `tex_60040490.pgm` y analizar
-     componentes/ocupación de celdas.
-4. Objetivo de aceptación: el atlas debe ser **disperso** (glifos separados)
-   y el frame debe mostrar “NOW INITIALIZING” legible en
-   `(448,480)-(832,536)`. Si el packer no se puede domar, alternativa:
-   **bypass** del atlas: generar un atlas 512×64 con FreeType en la rejilla
-   exacta que espera el juego y sustituir la textura tras `LockRect`.
-
-### Paso 3 — Primera escena real
-
-Con el texto legible, seguir la carga de escena:
-
-```sh
-OTOMEDIUS_LOG=1 OTOMEDIUS_WATCH="45eb20:2,45ff10:2,439a8c:2" \
+OTOMEDIUS_LOG=1 OTOMEDIUS_WATCH="439a8c,45eb20,45ff10" \
+  OTOMEDIUS_DUMP_FB=/tmp/opencode/logo.ppm OTOMEDIUS_DUMP_AT=600 \
   ../obj/otomedius-recomp .
 ```
 
-Buscar `CreateFileA(./Data/Title.pak)`, `Warning.pak`, `KonamiLogo.pak`.
-Revisar el manager `0x42D3D0` (sub-estado `[manager+8]`, tabla `0x42DBA4`) y
-la creación de escena `0x42D9F8`. Cuando se entienda el vector de packages,
-retirar el guard de `0x418190` y el de `0x414920` y validar el commit real.
+Buscar `CreateFileA(./Data/KonamiLogo.pak)`, `Title.pak`, `Warning.pak`.
+El logo real es una textura de `KonamiLogo.pak`; el quad ya se dibuja
+(`bbox=(0,0)-(2312,1024)`), pero `tex0=00000000`.  Cuando la textura se
+cargue, el frame debe mostrar el logo de Konami, no un rectángulo blanco.
 
-Después de esos 3 pasos: renderer de sprites reales
-(`0x40F780`/`0x40FA44`), audio (`dsound` → PulseAudio), y carga de pak más
-rápida (buffer de lectura en `k_ReadFile`).
+Después: renderer de sprites reales (`0x40F780`/`0x40FA44`), audio
+(`dsound` → PulseAudio), y carga de pak más rápida (buffer de lectura en
+`k_ReadFile`).
 
 ---
 
@@ -928,13 +1036,27 @@ entero antes de tocar nada.
 
 Estado: el juego arranca y es estable 30 s (exit 124, 0 crashes). x87
 corregido (fxch/pop), CreateDevice 1280x1024, texturas reales por defecto,
-atlas 512x64 se construye y sube, FreeType integrado (DejaVu, h/4, mutex).
-BLOQUEO: el atlas de CTexFont se llena de glifos solapados; los quads de
-texto en (448,480)-(832,536) muestrean 48 px de U (0.09375) mientras el
-atlas empaqueta a ~6 px -> ruido. Plan: instrumentar 0x409C00/0x409D20 y
-la tabla 0x5BE7CC, ajustar face size/UV, validar con OTOMEDIUS_TEXDBG.
-Después: escena real (0x45EB20, 0x45FF10, 0x439A8C) y retirar los guards de
-0x418040/0x418190/0x414920.
+FreeType integrado (DejaVu, h/4, mutex). El boot de Konami ya corre: los
+managers 0x439550 (KonamiLogo) y 0x4547E0 (boot/attract) se actualizan y el
+quad del logo se dibuja, pero la textura real de KonamiLogo.pak aun no se
+carga (state=1 sub=8 atascado en 0x454A74).
+
+BLOQUEO 1 (texto): el juego pide GetGlyphOutlineA con fmt=6 =
+GGO_GRAY8_BITMAP, NO GGO_NATIVE. font.c devuelve un outline y el
+rasterizador 0x409D20 lo lee como bitmap 8bpp -> ruido. Plan: implementar
+GGO_GRAY8_BITMAP (stride (w+3)&~3, 0..255) y GGO_BITMAP (1bpp) en font.c,
+enrutar por format exacto en win32_misc.c, escribir el avance tambien en
+gm+0x10, validar con OTOMEDIUS_TEXDBG.
+
+BLOQUEO 2 (logo): 0x4547E0 se queda en state=1 sub=8 (0x454A74); el
+constructor 0x429210 no registra en 0x5DE258. Investigar 0x4142B0 y el
+registro; luego cargar KonamiLogo.pak y validar el logo real.
+
+No reescribas el HANDOVER sin pedirlo. No hagas commits sin pedirlo.
+Build local: sh /tmp/opencode/build.sh <archivo.c ...>; gen:
+PYTHONPATH=../.work/pylib python3 tools/recomp/recomp.py --exe
+../.work/oto/otomedius.exe --out ../.work/gen --chunk 60; run:
+cd ../.work/oto && ../obj/otomedius-recomp .
 
 No reescribas el HANDOVER sin pedirlo. No hagas commits sin pedirlo.
 Build local: sh /tmp/opencode/build.sh <archivo.c ...>; gen:

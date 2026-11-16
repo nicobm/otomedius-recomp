@@ -13,6 +13,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 
 static int g_boot_done;
 
@@ -147,7 +148,11 @@ static void io_coin_blocker_on(void) { RET32(0); }
 static void io_coin_blocker_off(void) { RET32(0); }
 static void io_lamp_mode(void) { RET32(0); }
 static void io_lock_counter(void) { RET32(0); }
-static void io_unlock_counter(void) { RET32(0); }
+/* 0x413D3F treats 0 as a hard error: it logs "1183
+ * ac_io_pjei_unlock_coincounter" through 0x403DB0, which sets the manager
+ * enable mask (0x5DE220) to 0xFFFFFFFF and suspends every manager.  The
+ * counter unlock is a cabinet bookkeeping call; report success. */
+static void io_unlock_counter(void) { RET32(1); }
 /* Both IDs must come back non-zero: 0x41341C/0x413446 give up (I/O mode 7) if
  * the getters fail.  The literal strings are the defaults already present in
  * the game's .data at 0x5BCA6C / 0x5BCAA0. */
@@ -236,11 +241,26 @@ static void bms_init(void) { AVS_TRACE("bms_init", 0); RET32(0); }
 static void bms_init_wait(void) { AVS_TRACE("bms_init_wait", 0); RET32(0); }
 static void bms_eventlog_init(void) { AVS_TRACE("bms_eventlog_request_init", 0); RET32(0); }
 static void bms_ok(void) { RET32(0); }
+/* The boot/attract manager (0x44D400) reads this 64-bit clock and divides a
+ * delta by a frequency.  Returning a constant 0 made the divisor zero and the
+ * game raised a divide-by-zero exception, which the CRT turned into an
+ * unhandled exception before the Konami logo could be shown.  Report a real
+ * monotonic millisecond counter instead. */
 static void bms_time_clock(void)
 {
-    uint32_t p = arg32(0);
-    if (p)
-        M32(p) = (uint32_t)(0);
+    /* bms_time_get_clock_blocking(int type, uint64_t *out): the out pointer is
+     * the *second* argument.  Reading arg0 as the pointer wrote to address 0/1
+     * and left the caller's frequency at zero, which made 0x44D400 divide by
+     * zero. */
+    uint32_t p = arg32(1);
+    struct timespec ts;
+    uint64_t ms = 0;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+        ms = (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+    if (p) {
+        M32(p) = (uint32_t)(ms & 0xFFFFFFFFu);
+        M32(p + 4) = (uint32_t)(ms >> 32);
+    }
     RET32(0);
 }
 

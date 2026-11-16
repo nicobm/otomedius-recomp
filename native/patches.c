@@ -84,6 +84,70 @@ int x86_patch_call(uint32_t addr)
             cpu->esp += 4;
             return 1;
         }
+    case 0x4547E0u:                  /* boot/attract manager update */
+        /* Its state machine crashes in the CRT while building a path before
+         * it reaches the KonamiLogo hand-off.  The logo manager itself is
+         * alive and is driven by the OTOMEDIUS_KONAMI hook in render.c, so
+         * keep this manager alive but do not run its state machine. */
+        if (!getenv("OTOMEDIUS_KONAMI")) {
+            /* The state machine waits for the cabinet I/O board to report
+             * ready ([0x5E2136] == 1) before it advances to the logo.  Our
+             * AVS stubs never set that bit, so force it. */
+            M8(0x5E2136u) = 1;
+            {
+                uint32_t mgr = M32(0x5DE24Cu);
+                if (mgr && M8(mgr + 0xCu) == 0)
+                    M8(mgr + 0xCu) = 1;   /* skip the "wait for I/O" state */
+                /* State 1 sub-state 1 waits for the boot/attract manager slot
+                 * (0x5DE258) to be empty before creating it.  Our scene
+                 * manager pointer ends up there, so clear it. */
+                if (M8(mgr + 0xCu) == 1 && M8(mgr + 0xDu) == 1)
+                    M32(0x5DE258u) = 0;
+            }
+            return 0;
+        }
+        cpu->eax = 1;
+        cpu->eip = M32(cpu->esp);
+        cpu->esp += 4;
+        return 1;
+    case 0x402840u:                  /* save bookkeep.bin */
+        /* The save path builds "E:\nvmem\bookkeep.bin" and then converts it to
+         * a host path.  The conversion corrupts the name in our emulation and
+         * the following CreateFileA gets a garbage string, which ends in an
+         * unhandled exception before the boot sequence can show the logo.
+         * Bookkeeping is not needed to reach the logo, so skip the save. */
+        {
+            static int fired;
+            if (!fired++)
+                fprintf(stderr, "config: skipping the bookkeep save\n");
+            cpu->eax = 0;
+            cpu->eip = M32(cpu->esp);
+            cpu->esp += 4;
+            return 1;
+        }
+    case 0x403DB0u:                  /* log an error and suspend all managers */
+        /* The asset loader compiles its shaders with D3DXCreateEffect.  We do
+         * not implement the effect compiler, so it returns E_FAIL and the game
+         * logs "2302:Failed Create Shader" through this function, which also
+         * sets the manager enable mask (0x5DE220) to 0xFFFFFFFF.  That
+         * suspends every manager, including the KonamiLogo one, so the boot
+         * never shows.  The shader is only used by the 3D scene renderer; the
+         * logo path uses the font atlas, so ignore this particular error and
+         * let the managers keep running. */
+        {
+            uint32_t fmt = M32(cpu->esp + 8u);
+            if (fmt == 0x559580u || fmt == 0x5594C4u) {
+                static int fired;
+                if (!fired++)
+                    fprintf(stderr, "config: ignoring the shader compile "
+                            "failure (D3DXCreateEffect is a stub)\n");
+                cpu->eax = 0;
+                cpu->eip = M32(cpu->esp);
+                cpu->esp += 4;
+                return 1;
+            }
+        }
+        return 0;
     case 0x419E30u:                  /* "may the job executor run?" gate */
         /* The executor (0x418040) only proceeds when this returns non-zero,
          * and this returns 1 only while a job thread exists *and*

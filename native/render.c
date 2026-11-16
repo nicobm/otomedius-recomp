@@ -321,8 +321,38 @@ static void draw_up_vertices(uint32_t prim, uint32_t prim_count, uint32_t data,
     free(vt);
 }
 
+/* Experimental: drive the KonamiLogo manager directly.
+ *
+ * The boot/attract manager (0x4547E0) is supposed to call 0x439920 to set the
+ * logo string and then 0x4395B0 to draw it, but its state machine crashes in
+ * the CRT before it gets there.  The KonamiLogo manager itself (0x4393A0) is
+ * created by the scene manager and is alive at [0x5DE23C], so call its load
+ * and draw entry points from here.  OTOMEDIUS_KONAMI=1 enables it. */
+static void konami_logo_tick(void)
+{
+    extern uint32_t x86_call_stdcall(uint32_t, const uint32_t *, int);
+    cpu_t *cpu = x86_cpu();
+    uint32_t mgr = M32(0x5DE23Cu);
+    static int loaded;
+    if (!getenv("OTOMEDIUS_KONAMI") || !mgr)
+        return;
+    if (!loaded) {
+        loaded = 1;
+        cpu->eax = 0;                 /* logo index 0 */
+        x86_call_stdcall(0x439920u, NULL, 0);
+        /* 0x439920 leaves the countdown at 0, and 0x439550 only calls the
+         * atlas builder (0x4397C0) when the countdown reaches 0 *after* a
+         * decrement.  Arm it so the next update builds the atlas. */
+        M8(mgr + 0x28u) = 1;
+        fprintf(stderr, "konami: logo string set\n");
+    }
+    cpu->eax = mgr;
+    x86_call_stdcall(0x4395B0u, NULL, 0);
+}
+
 void render_present(void)
 {
+    konami_logo_tick();
     /* Renderer smoke test: OTOMEDIUS_TEST_QUAD=1 draws a full-screen quad with
      * the currently bound texture, through the same software path the game
      * uses.  It proves texture decode + raster + blend work without waiting for
