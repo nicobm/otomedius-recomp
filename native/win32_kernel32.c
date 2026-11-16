@@ -433,7 +433,29 @@ static void k_SetUnhandledExceptionFilter(void) { RET32(0); }
 
 static void k_UnhandledExceptionFilter(void)
 {
-    fprintf(stderr, "kernel32: unhandled exception\n");
+    cpu_t *c = x86_cpu();
+    uint32_t ep = arg32(0), er = ep ? M32(ep) : 0, ctx = ep ? M32(ep + 4) : 0;
+    fprintf(stderr, "kernel32: unhandled exception (caller %08x", M32(c->esp));
+    if (er)
+        fprintf(stderr, ", code %08x at %08x", M32(er), M32(er + 12));
+    if (ctx)
+        fprintf(stderr, ", ctx eip %08x esp %08x ebp %08x", M32(ctx + 0xB8),
+                M32(ctx + 0xC4), M32(ctx + 0xB4));
+    fprintf(stderr, ")\n  stack:");
+    for (int i = 0; i < 48; i++) {
+        uint32_t v = M32(c->esp + 4u * (uint32_t)i);
+        if (v >= 0x401000 && v < 0x54d000)
+            fprintf(stderr, " [%d]%08x", i, v);
+    }
+    fprintf(stderr, "\n  ebp chain:");
+    for (uint32_t bp = c->ebp, i = 0; bp > 0x10000 && bp < 0x7FFF0000 && i < 24; i++) {
+        fprintf(stderr, " %08x", M32(bp + 4));
+        uint32_t nb = M32(bp);
+        if (nb <= bp)
+            break;
+        bp = nb;
+    }
+    fprintf(stderr, "\n");
     RET32(1);
 }
 
@@ -1299,7 +1321,7 @@ static void *thread_trampoline(void *p)
 static void k_CreateThread(void)
 {
     uint32_t start = arg32(2), param = arg32(3), idp = arg32(5);
-    thread_arg_t *ta = malloc(sizeof(*ta));
+    thread_arg_t *ta = calloc(1, sizeof(*ta));
     ta->start = start;
     ta->param = param;
     unsigned slot = g_thread_slots++;

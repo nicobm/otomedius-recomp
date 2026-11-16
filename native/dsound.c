@@ -285,9 +285,12 @@ static uint32_t dsbuffer_create(uint32_t bytes)
  * buffer, exactly what the sound engine uses it for. */
 static uint32_t dsbuffer_clone(uint32_t src_obj)
 {
-    uint32_t obj = com_create_named("IDirectSoundBuffer8", dsbuffer_methods,
-                              (int)(sizeof(dsbuffer_methods) / sizeof(method_t)),
-                              sizeof(dsbuffer_t));
+    /* share the source's vtable: registering a second set of method thunks
+     * for every voice would burn the thunk table and race with the mixer */
+    extern uint32_t emu_alloc(uint32_t size);
+    uint32_t obj = emu_alloc(8u + sizeof(dsbuffer_t));
+    M32(obj) = M32(src_obj);
+    M32(obj + 4) = 1;
     dsbuffer_t *d = dsb(obj), *s = dsb(src_obj);
     d->cap = s->cap;
     d->data = s->data;

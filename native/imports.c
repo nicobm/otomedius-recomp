@@ -1,6 +1,7 @@
 /* imports.c - binds PE imports and creates native call thunks. */
 
 #define _GNU_SOURCE
+#include <pthread.h>
 #include "win32.h"
 #include "d3d9.h"
 
@@ -35,24 +36,30 @@ typedef struct {
     const char *name;
 } nthunk_t;
 
-static nthunk_t *g_thunks;
+/* Fixed-size table: the audio/loader threads dispatch through it while other
+ * threads register new COM method thunks, so it must never be reallocated. */
+#define MAX_NTHUNKS 0x10000u
+static nthunk_t g_thunks[MAX_NTHUNKS];
 static uint32_t g_nthunks;
+static pthread_mutex_t g_thunks_lock = PTHREAD_MUTEX_INITIALIZER;
 
 extern int g_verbose;
 
 uint32_t x86_native_register(void (*fn)(void), int nargs)
 {
-    if (g_nthunks >= 0x10000u) {
+    pthread_mutex_lock(&g_thunks_lock);
+    if (g_nthunks >= MAX_NTHUNKS) {
         fprintf(stderr, "imports: too many native thunks\n");
         abort();
     }
-    g_thunks = (nthunk_t *)realloc(g_thunks, (g_nthunks + 1) * sizeof(nthunk_t));
-    g_thunks[g_nthunks].fn = fn;
-    g_thunks[g_nthunks].nargs = nargs;
-    g_thunks[g_nthunks].used = 1;
-    g_thunks[g_nthunks].name = "";
-    uint32_t addr = THUNK_BASE + g_nthunks * THUNK_STEP;
-    g_nthunks++;
+    uint32_t n = g_nthunks;
+    g_thunks[n].fn = fn;
+    g_thunks[n].nargs = nargs;
+    g_thunks[n].used = 1;
+    g_thunks[n].name = "";
+    uint32_t addr = THUNK_BASE + n * THUNK_STEP;
+    __atomic_store_n(&g_nthunks, n + 1, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&g_thunks_lock);
     return addr;
 }
 

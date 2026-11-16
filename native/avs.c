@@ -255,7 +255,10 @@ static void bms_time_clock(void)
     uint32_t p = arg32(1);
     struct timespec ts;
     uint64_t ms = 0;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+    /* wall-clock ms: the game adds the signed offset stored in testmode.bin
+     * (0x5DB710) and feeds the sum to ctime_s, so a small monotonic value
+     * becomes a negative time64 and the CRT rejects it. */
+    if (clock_gettime(CLOCK_REALTIME, &ts) == 0)
         ms = (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
     if (p) {
         M32(p) = (uint32_t)(ms & 0xFFFFFFFFu);

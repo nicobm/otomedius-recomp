@@ -9,6 +9,7 @@
  */
 
 #define _GNU_SOURCE
+unsigned render_presents(void);
 #include "win32.h"
 
 #include <time.h>
@@ -49,8 +50,8 @@ int x86_patch_call(uint32_t addr)
             if (mgr) {
                 int st = M8(mgr + 0xCu), sb = M8(mgr + 0xDu);
                 if (st != last_state || sb != last_sub) {
-                    fprintf(stderr, "bootdbg: update #%u state=%u sub=%u io=%u "
-                            "slot258=%08x mask220=%08x mask224=%08x\n", calls,
+                    fprintf(stderr, "bootdbg: [present %u] update #%u state=%u sub=%u io=%u "
+                            "slot258=%08x mask220=%08x mask224=%08x\n", render_presents(), calls,
                             st, sb, M8(0x5E2136u),
                             M32(0x5DE258u), M32(0x5DE220u), M32(0x5DE224u));
                     last_state = st;
@@ -58,6 +59,13 @@ int x86_patch_call(uint32_t addr)
                 }
                 calls++;
             }
+        } else if (addr == 0x419170u || addr == 0x419330u || addr == 0x4193A0u ||
+                   addr == 0x418040u || addr == 0x419D00u || addr == 0x418190u) {
+            fprintf(stderr, "bootdbg: [present %u] LOADER %05x esi=%x ebx=%x arg0=%x "
+                    "h=%x curid=%x state=%u head=%u tail=%u\n",
+                    render_presents(), (unsigned)addr, cpu->esi, cpu->ebx,
+                    M32(cpu->esp + 4u), M32(0x5BC914u), M32(0x5BC918u),
+                    M32(0x5BC91Cu), M32(0x5DCF90u), M32(0x5DCF94u));
         } else if (addr == 0x4142B0u) {
             uint32_t desc = M32(cpu->esp + 4u), size = M32(cpu->esp + 8u);
             fprintf(stderr, "bootdbg: MallocLocal(%u) desc=%08x first=%08x "
@@ -66,17 +74,19 @@ int x86_patch_call(uint32_t addr)
         } else if (addr == 0x429210u) {
             fprintf(stderr, "bootdbg: manager ctor this=%08x slot258=%08x\n",
                     cpu->esi, M32(0x5DE258u));
-        } else if (addr == 0x439BB0u) {
+        } else if (addr == 0x439550u || addr == 0x439BB0u) {
             uint32_t pkg = M32(0x5DE0BCu);
-            static int n;
-            if (n++ < 6) {
-                uint32_t beg = pkg ? M32(pkg + 4u) : 0;
-                uint32_t end = pkg ? M32(pkg + 8u) : 0;
-                uint32_t rec = (beg && beg < end) ? M32(beg) : 0;
-                uint32_t objs = rec ? M32(rec) : 0;
-                uint32_t tex = (rec && objs) ? M32(rec + 4u) : 0;
-                fprintf(stderr, "bootdbg: konami logo pkg=%08x vec=%08x..%08x "
-                        "rec=%08x n=%u tex=%08x\n", pkg, beg, end, rec, objs,
+            static uint32_t last[4];
+            uint32_t beg = pkg ? M32(pkg + 4u) : 0;
+            uint32_t end = pkg ? M32(pkg + 8u) : 0;
+            uint32_t rec = (beg && beg < end) ? M32(beg) : 0;
+            uint32_t objs = rec ? M32(rec) : 0;
+            uint32_t tex = (rec && objs) ? M32(rec + 4u) : 0;
+            if (addr == 0x439BB0u || pkg != last[0] || beg != last[1] ||
+                end != last[2] || tex != last[3]) {
+                last[0] = pkg; last[1] = beg; last[2] = end; last[3] = tex;
+                fprintf(stderr, "bootdbg: [present %u] logo@%x pkg=%08x vec=%08x..%08x "
+                        "rec=%08x n=%u tex=%08x\n", render_presents(), (unsigned)addr, pkg, beg, end, rec, objs,
                         tex);
             }
         } else if (addr == 0x417750u) {
@@ -372,7 +382,7 @@ int x86_patch_call(uint32_t addr)
          * arrives under our thread emulation.  The queue itself is the ground
          * truth: when head == tail every entry has been consumed, which is
          * exactly the condition the pump uses to write state 0. */
-        if (!getenv("OTOMEDIUS_NO_LOADER_GUARD") &&
+        if (getenv("OTOMEDIUS_LOADER_GUARD") &&
             M32(0x5DCF90u) == M32(0x5DCF94u)) {
             static int fired;
             if (!fired++)
@@ -382,8 +392,9 @@ int x86_patch_call(uint32_t addr)
             cpu->esp += 4;
             return 1;
         }
-        /* Default on: without it the scene manager waits forever and nothing
-         * is ever loaded.  OTOMEDIUS_NO_LOADER_GUARD=1 restores waiting. */
+        /* Opt-in since thread_arg_t.done is initialised: the worker now really
+         * finishes, so the pump reports completion on its own.
+         * OTOMEDIUS_LOADER_GUARD=1 restores the old forced completion. */
         {
             static unsigned stalled, calls;
             static uint32_t last;
@@ -400,7 +411,8 @@ int x86_patch_call(uint32_t addr)
                         calls, st, stalled);
             /* ~10 polls/s (the poll itself Sleep(16)), so 70 is ~7 s without
              * the loader making any progress at all. */
-            if (calls > 70 || (stalled > 50 && st != 0 && st != 2)) {
+            if (getenv("OTOMEDIUS_LOADER_GUARD") &&
+                (calls > 70 || (stalled > 50 && st != 0 && st != 2))) {
                 static int fired;
                 if (!fired++)
                     fprintf(stderr, "config: loader stalled in state %u after "

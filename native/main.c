@@ -47,6 +47,17 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx)
     }
     if (n > 0)
         write(2, buf, (size_t)n);
+    {
+        extern __thread int x86_cpu_idx;
+        extern const char *x86_import_name[];
+        char b3[160];
+        int n3 = snprintf(b3, sizeof(b3), "    last import: %s\n",
+                          (x86_cpu_idx >= 0 && x86_cpu_idx < 64 &&
+                           x86_import_name[x86_cpu_idx])
+                              ? x86_import_name[x86_cpu_idx] : "-");
+        if (n3 > 0)
+            write(2, b3, (size_t)n3);
+    }
     if (ctx) {
         ucontext_t *uc = (ucontext_t *)ctx;
         char b3[160];
