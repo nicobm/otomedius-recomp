@@ -92,6 +92,12 @@ int      dshow_create_filter_graph(uint32_t rclsid, uint32_t riid, uint32_t ppv)
 void     texture_upload(uint32_t tex, const void *data, uint32_t size, int fmt);
 uint32_t texture_data_of(uint32_t tex);
 
+/* dsound.c: stop the mixer thread before the platform closes SDL audio */
+void     dsound_shutdown(void);
+
+/* render.c: dump the current software framebuffer (PPM) on demand */
+void     render_dump_fb(const char *path);
+
 /* verbose logging switch (OTOMEDIUS_LOG=1) */
 void  log_printf(const char *fmt, ...);
 extern int g_verbose;

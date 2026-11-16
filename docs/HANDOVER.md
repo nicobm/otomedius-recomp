@@ -30,6 +30,10 @@
 > **Última sesión: ver §9** (loader sin carreras, logo de Konami visible,
 > tabla de thunks fija, rasterizador con estados D3D, fondo del Title roto).
 > Donde §3–§8 contradigan a §9, manda §9.
+>
+> **Sesión más reciente: ver §10** (fondo del Title y attract resueltos:
+> DDS RGB24/R5G6B5/A1R5G5B5, mezclador dsound→SDL, ventana configurable y
+> dump al pulsar Esc). Donde §1–§9 contradigan a §10, manda §10.
 
 ---
 
@@ -1617,6 +1621,171 @@ d3dx9.c, falta correrlo (background, ~150 s, present ~3400, con
 OTOMEDIUS_DRAWDBG=3400 y OTOMEDIUS_DUMP_FB/DUMP_AT). Luego attract casi en
 blanco, audio dsound mudo, quad nativo del vídeo.
 ```
+
+---
+
+## 10. Sesión 2026-11-16 (cuarta parte): formatos DDS reales, fondo del Title y mezclador dsound
+
+Esta sección **manda** sobre §1–§9 donde haya contradicción.
+
+### 10.1 Fondo del Title: el DDS es RGB24 (24 bpp), no A8R8G8B8
+
+El quad de 1024×1024 con `tex=…9500` y alfa 50 % era `main_visual.dds`, y
+el de 2048×512 era `t_logo.dds`. Cabeceras reales (extraídas de `Title.pak`
+con `gcab`; el `.pak` es un CAB con un `.bin` que contiene nombre + DDS):
+
+| Textura | Tamaño | `pf_flags` | `bits` | Máscaras | Formato |
+|---|---|---|---|---|---|
+| `main_visual.dds` | 1024×1024 | `0x40` | **24** | `ff0000/ff00/ff/0` | **R8G8B8** |
+| `t_logo.dds` | 2048×512 | `0x41` | 32 | `ff0000/ff00/ff/ff000000` | A8R8G8B8 |
+| `konami_logo.dds` | 1024×256 | `0x40` | 16 | `f800/7e0/1f/0` | **R5G6B5** (no A1R5G5B5) |
+| `Player02*.dds` | 6 texturas | `0x41` | 16 | `7c00/3e0/1f/8000` | A1R5G5B5 |
+| `catch_demo02` | 2048×1024 | `0x40` | **24** | `ff0000/ff00/ff/0` | **R8G8B8** |
+
+`decode_dds()` sólo entendía DXT1/3/5 y los 16 bpp de fuente, y **todo lo
+demás caía a `FMT_ARGB`**: un RGB24 leído como 32 bpp toma como alfa el canal
+azul del píxel siguiente. Medido sobre `main_visual.dds`: el 12,4 % de los
+píxeles quedaba con alfa < 128 → el fondo se dibujaba como puntos sueltos
+(el resto, con colores desplazados). `catch_demo02.pak` (fondo del attract)
+es también RGB24, así que el mismo bug afectaba al attract.
+
+Arreglo (`native/d3dx9.c`, `native/d3d9_objects.c`):
+
+* `decode_dds()` clasifica por `dwRGBBitCount` + máscaras, no por suposición:
+  `R8G8B8` (24 bpp), `X8R8G8B8` (32 bpp sin `DDPF_ALPHAPIXELS`),
+  `R5G6B5`, `A1R5G5B5` y `X1R5G5B5` (máscaras `7c00/3e0/1f`), además de los
+  formatos ya existentes.
+* Enums nuevos al final (`FMT_R8G8B8`, `FMT_X8R8G8B8`, `FMT_X1R5G5B5` y sus
+  `TF_*` equivalentes) para no cambiar los valores ya usados.
+* `texture_argb()` decodifica los tres: 24 bpp a `0xFFRRGGBB`; X8 fuerza alfa
+  255; X1R5G5B5 no usa el bit 15 como alfa.
+* **R5G6B5 tenía además el verde mal**: se decodificaba como 5-5-5
+  (`r=(v>>10)&31`). Ahora es 5-6-5 (`r=(v>>11)&31`, `g=(v>>5)&63`).
+
+Verificación: `OTOMEDIUS_TEXFMT=1` muestra
+`texture 1024x1024 fmt=9 ... bits=24 masks=00ff0000/...` y el dump del
+present 3400 (`/tmp/opencode/fix3400.png`) tiene el fondo continuo, con
+`t_logo.dds` encima.
+
+### 10.2 Mezclador `dsound` → SDL (`native/dsound.c`)
+
+`0x41B2A0` **no mezcla PCM**: recorre 14 voces de `0x48` bytes en
+`0x5DE0F0+4i`, y para cada una cuyo `[voz+8]` (buffer) está vivo y
+`[voz+0x14]&9 == 0` consulta `GetCurrentPosition` y llama `Stop` cuando la
+posición supera la longitud (`[voz+0x10]+0xC`). Es decir, el juego delega la
+mezcla en DirectSound. El port ahora la hace:
+
+* `dsbuffer_t` guarda `WAVEFORMATEX` (canales, rate, bits), `freq` de
+  reproducción, `play_flags`, `is_primary`, `position` y una fase fraccionaria.
+* Registro de objetos (4096) protegido por mutex; los clones comparten
+  `data`/formato (siguen compartiendo la vtable).
+* Hilo mezclador → `platform_audio_open(48000, 2)`; mezcla todas las voces
+  con volumen en centibelios (`10^(v/2000)`), pan, 8/16 bits, mono/estéreo,
+  resampleo por fase, `DSBPLAY_LOOPING`, y **avanza `position`** (sin eso el
+  hilo del juego nunca para las voces; `GetCurrentPosition` la devuelve).
+* `Lock` divide correctamente los bloqueos que dan la vuelta al buffer.
+  `SetFormat`/`CreateSoundBuffer` leen el `WAVEFORMATEX`; `SetFrequency`
+  cambia el rate de reproducción; `GetStatus` informa `PLAYING|LOOPING`.
+* `platform_audio_*` usa un mutex (el mezclador y el decodificador del vídeo
+  escriben el mismo stream SDL); `dsound_shutdown()` se llama antes de
+  `platform_shutdown()`.
+* Diagnóstico: `OTOMEDIUS_DSDBG=1` (CreateSoundBuffer/Play/Stop/SetVolume/
+  SetFrequency/Lock) y `OTOMEDIUS_AUDIO_DUMP=file.raw` (S16LE 48 kHz estéreo).
+  `OTOMEDIUS_AUDIO_STREAM_DUMP=file.raw` captura el **stream final** (vídeo +
+  juego) tal como se envía a SDL.
+* El mezclador y el decodificador del vídeo comparten el stream.  Para que la
+  canción del vídeo no salga entrecortada, `platform_audio_write()` **suelta
+  el mutex mientras espera cola** y el mezclador de dsound **no escribe**
+  mientras `movie_active()` (sigue avanzando `position` para que el hilo del
+  juego pare las voces).  Antes, el mezclador retenía el mutex durante la
+  espera y ahogaba al vídeo.
+* **Causa real del choppy**: el segundo ffmpeg (audio) llevaba `-re`, así que
+  entregaba justo a tiempo real y la cola de SDL quedaba casi vacía; cualquier
+  jitter del rasterizador producía underruns.  Ahora el proceso de **audio no
+  usa `-re`** (decodifica por delante y llena la cola, que hace de colchón);
+  el de vídeo sí lo conserva.  Verificado de oído por el usuario: la canción
+  del intro suena limpia.
+
+Medido en el boot/Title: el juego crea un buffer de 894 976 B (44,1 kHz
+estéreo 16 bits), tres de 22 050 Hz mono 8 bits y uno de 352 800 B; pone
+volúmenes de −36/−45 dB. El dump tiene ráfagas con pico ~380 y RMS ~33 (el
+resto es silencio porque el propio juego no pide más sonido). El mezclador
+entrega esos datos a SDL; el audio del juego ya no es "mudo por falta de
+mezclador".
+
+### 10.3 Ergonomía de pruebas
+
+* `OTOMEDIUS_WINDOWED=1` + **`OTOMEDIUS_WINDOW_SIZE=WxH`** (por ejemplo
+  `800x450`, 16:9) arranca en ventana pequeña. Fullscreen sigue siendo el
+  default de producción; `F11` vuelve a la ventana configurada.
+* **El ESC se registra**: `platform: Esc pressed` y, si `OTOMEDIUS_DUMP_FB`
+  está definido, se escribe también `<DUMP_FB>.quit` con el frame exacto en
+  que se pulsó (`dump_on_exit()`). El resto del log queda en el fichero de
+  la corrida.
+* Para corridas automáticas largas (llegar al present 5000+ sin que nadie
+  cierre la ventana) usar `SDL_VIDEODRIVER=offscreen`; el modo windowed se
+  reserva para comprobaciones visuales.
+
+### 10.4 Attract: qué se ha verificado y qué queda
+
+* Present 4600: el tutorial (`catch_demo02`, 2048×1024 RGB24) **ya se ve**
+  (dump `att.04600` → `att4600.png`); antes era blanco porque era RGB24.
+* Present 5000–6200: pantalla blanca estática con la consola de depuración
+  (cuadro rojo/negro) y dos quads de texto reales; los otros 28 quads de
+  texto van a `y=319040` (fuera de pantalla). El quad blanco a pantalla
+  completa es `fvf=44` sin textura y alfa `0xFFFFFFFF`: es un **fade**, no
+  una textura que falte.
+* En los frames de 48 `DrawPrimitiveUP` sólo 35 llegan al rasterizador
+  (`drawdbg`); los 13 restantes se investigan con los diagnósticos nuevos
+  `SKIP(...)`/`DISCARD` (motivo, FVF, `v0`, y matrices WORLD/VIEW/PROJ).
+  En el present 5000 exacto no aparece ninguno: pertenecen a la pantalla del
+  tutorial, no a la blanca.  De hecho, con `OTOMEDIUS_DRAWDBG=1` en toda la
+  corrida hasta 5203 **no hay ningún SKIP/DISCARD**: las 48 son calls de
+  frames distintos (el contador de stats agrupa 120 presents), no draws
+  perdidos ese frame.
+* `draw=0` en todo el attract: el juego no usa `DrawPrimitive`/
+  `DrawIndexedPrimitive`.
+* El manager del attract es **`CDemoPlayMan` (`0x429210`, vtable
+  `0x55AE88`)**: estado 0 encola `Data/replay000.pak` (id `[0x5E2024]`,
+  rota 0..3), 1 espera `0x419530`, 2 crea `CEyeCatchMan` (`0x42CE60`, slot
+  `0x5DE25C`), 3 espera a que termine, 4 crea `CGameMan` (`0x42E1F0`, slot
+  `0x5DE260`, alloc `0x44`) y 5 corre `0xCE4` = 3300 frames.  `CGameMan`
+  exige los paks PLAYER/POWERUP/STAGE (errores 1034–1036).
+* **Medido con el log nuevo de `CDemoPlayMan`** (`bootdbg: ... DEMO`):
+  state 0→1→2→3 en los presents 4298–4301, state 4 en el 4416 y **nunca
+  llega a 5** hasta el 9000; el boot manager sigue en sub 9 y la pantalla
+  blanca se mantiene.  El estado 4 es el que aloja y llama a `CGameMan`
+  (`0x4142B0(0x5E1F28,0x44)` + `0x42E1F0`): hay que ver si esa llamada no
+  retorna (SEH), si `CGameMan` deja `mask220=0xFFFFFFFF` (algún 1034–1036)
+  o si el manager deja de actualizarse.  `OTOMEDIUS_BOOTDBG=1` ya imprime
+  `DEMO state`, `slot25c`, `slot260`, `io` y `mask220` en cada cambio.
+* El boot manager (`0x4547E0`) está en **state=0 sub=9** desde el present
+  4299 esperando a que `CDemoPlayMan` libere `0x5DE258`.  Por tanto la
+  pantalla blanca no es un draw perdido: es el fade mientras el demo carga
+  y arranca.
+
+### 10.5 Ficheros de esta sesión
+
+```
+M native/d3dx9.c          decode_dds por bits/máscaras; R8G8B8/X8/X1
+M native/d3d9_objects.c   TF_R8G8B8/TF_X8R8G8B8/TF_X1R5G5B5; R5G6B5 real
+M native/dsound.c         mezclador dsound→SDL, formato/posición/loop, dump
+M native/movie.c          el ffmpeg de audio ya no usa -re (cola llena, sin choppy)
+M native/platform_sdl.c   OTOMEDIUS_WINDOW_SIZE; mutex de audio; dump al salir
+M native/platform.h       (sin cambios de API; se usa platform_audio_*)
+M native/main.c           dsound_shutdown() antes de platform_shutdown()
+M native/win32.h          prototypes dsound_shutdown / render_dump_fb
+M native/render.c         render_dump_fb(); diagnósticos DISCARD/SKIP y
+                          matrices WORLD/VIEW/PROJ
+M docs/HANDOVER.md        esta sección
+A docs/HANDOVER_PROMPT.md documento de transferencia de 6 secciones para la
+                          sesión siguiente (copiar/pegar como prompt inicial)
+```
+
+Pendiente tras esta sesión: dejar correr el attract más allá del fade de
+carga (present > 6200) para ver el eye-catch y el demo (`CGameMan`), añadir
+el camino XYZ + transforms + z-buffer si el demo usa 3D, y subir el mezclador
+al Flatpak (el hilo de audio necesita el dispositivo PulseAudio del sandbox).
 
 ---
 

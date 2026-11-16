@@ -24,12 +24,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 
 static SDL_Window *g_win;
 static SDL_Renderer *g_ren;
 static SDL_Texture *g_tex;
 static int g_ready;
 static int g_w = 1024, g_h = 768;
+static int g_win_w = 1366, g_win_h = 768;
 static uint32_t g_clear = 0xFF000000u;
 static SDL_Gamepad *g_pad;
 static int g_quit;
@@ -325,11 +327,24 @@ void platform_set_size(int w, int h)
 int platform_init(void)
 {
     const char *bezel_path;
+    const char *ws;
     SDL_Surface *bezel_surface = NULL;
     int win_w = 1366, win_h = 768;      /* windowed size (16:9) */
 
     if (g_ready)
         return 0;
+    /* OTOMEDIUS_WINDOW_SIZE=WxH overrides the windowed size (tests use a
+     * small 16:9 window instead of the fullscreen production default). */
+    ws = getenv("OTOMEDIUS_WINDOW_SIZE");
+    if (ws) {
+        int w = 0, h = 0;
+        if (sscanf(ws, "%dx%d", &w, &h) == 2 && w >= 320 && h >= 180) {
+            win_w = w;
+            win_h = h;
+        }
+    }
+    g_win_w = win_w;
+    g_win_h = win_h;
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         fprintf(stderr, "platform: SDL_Init failed: %s\n", SDL_GetError());
         return -1;
@@ -404,6 +419,18 @@ void platform_clear(uint32_t flags, uint32_t color)
         g_clear = 0xFF000000u | (color & 0x00FFFFFFu);
 }
 
+/* When the user closes the window (or presses Esc) before the target present,
+ * keep the last frame so it can still be analysed: <OTOMEDIUS_DUMP_FB>.quit */
+static void dump_on_exit(void)
+{
+    const char *p = getenv("OTOMEDIUS_DUMP_FB");
+    char name[600];
+    if (!p || !*p)
+        return;
+    snprintf(name, sizeof name, "%s.quit", p);
+    render_dump_fb(name);
+}
+
 void platform_present(void)
 {
     int fw = 0, fh = 0, ww = 0, wh = 0, lw = 0, lh = 0;
@@ -426,10 +453,12 @@ void platform_present(void)
     while (SDL_PollEvent(&ev)) {
         if (ev.type == SDL_EVENT_QUIT) {
             log_printf("platform: SDL_EVENT_QUIT");
+            dump_on_exit();
             movie_close();          /* stop the decoder threads before exit */
             win_request_quit();
         } else if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_ESCAPE) {
             log_printf("platform: Esc pressed");
+            dump_on_exit();
             movie_close();
             win_request_quit();
         } else if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_F11) {
@@ -438,7 +467,7 @@ void platform_present(void)
                 SDL_SetWindowFullscreen(g_win, true);
             } else {
                 SDL_SetWindowFullscreen(g_win, false);
-                SDL_SetWindowSize(g_win, 1366, 768);
+                SDL_SetWindowSize(g_win, g_win_w, g_win_h);
                 SDL_SetWindowPosition(g_win, SDL_WINDOWPOS_CENTERED,
                                       SDL_WINDOWPOS_CENTERED);
             }
@@ -526,15 +555,48 @@ void platform_wait(void)
 }
 
 /* ---------------------------------------------------------------- audio */
+/* The movie decoder and the dsound mixer both feed the same SDL stream from
+ * their own threads, so every access to g_astream is serialised. */
+static pthread_mutex_t g_audio_lock = PTHREAD_MUTEX_INITIALIZER;
+static FILE *g_adump;
+
+static void audio_stream_dump_locked(const void *data, int len)
+{
+    const char *p = getenv("OTOMEDIUS_AUDIO_STREAM_DUMP");
+    if (!p || !*p)
+        return;
+    if (!g_adump)
+        g_adump = fopen(p, "wb");
+    if (g_adump)
+        fwrite(data, 1, (size_t)len, g_adump);
+}
+
+static void audio_close_locked(void)
+{
+    if (g_adump) {
+        fclose(g_adump);
+        g_adump = NULL;
+    }
+    if (g_astream) {
+        SDL_DestroyAudioStream(g_astream);
+        g_astream = NULL;
+    }
+    g_arate = g_achannels = 0;
+}
+
 int platform_audio_open(int rate, int channels)
 {
     SDL_AudioSpec spec;
+    int rc = -1;
 
     if (rate <= 0 || channels <= 0)
         return -1;
-    if (g_astream && g_arate == rate && g_achannels == channels)
+    pthread_mutex_lock(&g_audio_lock);
+    if (g_astream && g_arate == rate && g_achannels == channels) {
+        pthread_mutex_unlock(&g_audio_lock);
         return 0;
-    platform_audio_close();
+    }
+    audio_close_locked();
     SDL_zero(spec);
     spec.format = SDL_AUDIO_S16LE;
     spec.channels = channels;
@@ -543,41 +605,54 @@ int platform_audio_open(int rate, int channels)
                                           &spec, NULL, NULL);
     if (!g_astream) {
         log_printf("platform: audio device failed: %s", SDL_GetError());
-        return -1;
+    } else {
+        g_arate = rate;
+        g_achannels = channels;
+        SDL_ResumeAudioStreamDevice(g_astream);
+        log_printf("platform: audio %d Hz %d ch", rate, channels);
+        rc = 0;
     }
-    g_arate = rate;
-    g_achannels = channels;
-    SDL_ResumeAudioStreamDevice(g_astream);
-    log_printf("platform: audio %d Hz %d ch", rate, channels);
-    return 0;
+    pthread_mutex_unlock(&g_audio_lock);
+    return rc;
 }
 
 void platform_audio_write(const void *data, int len)
 {
-    if (!g_astream || !data || len <= 0)
+    int spins = 0;
+
+    if (!data || len <= 0)
         return;
     /* Do not drift ahead of the video: ~200 ms of queued audio is plenty.
      * The wait is bounded (and the chunk is dropped when the device stops
-     * consuming) so a stalled audio device can never block shutdown. */
-    {
-        int spins = 0;
-        while (SDL_GetAudioStreamQueued(g_astream) >
-               g_arate * g_achannels * 2 / 5) {
-            if (++spins > 100)
-                return;             /* device stalled: drop this chunk */
-            SDL_Delay(5);
+     * consuming) and the lock is released while sleeping, otherwise the
+     * other producer (movie decoder vs. dsound mixer) starves and the sound
+     * turns choppy. */
+    for (;;) {
+        int queued;
+        pthread_mutex_lock(&g_audio_lock);
+        if (!g_astream) {
+            pthread_mutex_unlock(&g_audio_lock);
+            return;
         }
+        queued = SDL_GetAudioStreamQueued(g_astream);
+        if (queued <= g_arate * g_achannels * 2 / 5) {
+            SDL_PutAudioStreamData(g_astream, data, len);
+            audio_stream_dump_locked(data, len);
+            pthread_mutex_unlock(&g_audio_lock);
+            return;
+        }
+        pthread_mutex_unlock(&g_audio_lock);
+        if (++spins > 100)
+            return;             /* device stalled: drop this chunk */
+        SDL_Delay(5);
     }
-    SDL_PutAudioStreamData(g_astream, data, len);
 }
 
 void platform_audio_close(void)
 {
-    if (g_astream) {
-        SDL_DestroyAudioStream(g_astream);
-        g_astream = NULL;
-    }
-    g_arate = g_achannels = 0;
+    pthread_mutex_lock(&g_audio_lock);
+    audio_close_locked();
+    pthread_mutex_unlock(&g_audio_lock);
 }
 
 void platform_viewport(int x, int y, int w, int h) { (void)x; (void)y; (void)w; (void)h; }

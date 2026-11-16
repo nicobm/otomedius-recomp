@@ -196,6 +196,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "otomedius-recomp: the game stopped at %08x\n", c->eip);
     }
 
+    dsound_shutdown();
     platform_shutdown();
     return 0;
 }

@@ -44,11 +44,11 @@ Version: see [`VERSION`](VERSION).
 | Konami AVS layer (`libacio`, `libbms`, `libtouchpanel`) | offline/free-play cabinet emulation |
 | `user32` window + message loop | minimal |
 | `d3d9`/`d3dx9` objects, math, DDS textures | interfaces verified against `d3d9.h`; texture `LockRect`/upload works by default |
-| `dsound` (device, buffers, lock/play) | interfaces working, silent |
+| `dsound` (device, buffers, lock/play) | working; voices are mixed to SDL3 (volume/pan/rate/loop) |
 | `dshow` (opening movie: graph, filter, pin) | interfaces working; the WMV3 intro is decoded with the runtime's ffmpeg and uploaded into the game's own video texture |
 | Fonts / text | working: `GGO_GRAY8_BITMAP`/`GGO_BITMAP` implemented; the game's `SysFont.dds`/`gradius_font.dds` atlases are loaded through a real `D3DXCreateTextureFromFileExA` and text is legible |
 | Renderer (2D, sprites, playfield) | 2D path working (signed-area fix in `draw_tri`); the game runs its main loop, creates a 1280×1024 device and draws every frame (`BeginScene`/`EndScene`/`Present`), including the console overlay; the 3D playfield path is still pending |
-| Audio | `dsound` still silent; the intro movie track (WMAv2) plays through SDL3 |
+| Audio | `dsound` voices are mixed to SDL3 (volume/pan/rate/loop); the intro movie track (WMAv2) plays cleanly through the same stream |
 
 Today the recompiled game boots completely: the MSVC CRT runs, the window is
 created, a Direct3D 9 device is created with valid caps at **1280×1024**,
@@ -58,7 +58,9 @@ x87 emulation was corrected (`fxch`/pop arithmetic), the software rasteriser
 draws the 2D console overlay, and the real font atlas is generated with
 FreeType and uploaded.  When the dump ships the cabinet art (`bezel.png`), the
 game opens fullscreen with the arcade bezel on the sides and the frame fitted
-into its transparent screen hole (`F11` goes to a 1366×768 window).  The
+into its transparent screen hole (`F11` goes to the configured window,
+1366×768 by default; `OTOMEDIUS_WINDOW_SIZE=800x450` for a small 16:9 test
+window).  The
 opening WMV3 movie is decoded by the runtime's `ffmpeg` (the `codecs-extra`
 runtime extension supplies the WMV3 decoder) and uploaded into the video
 texture the game's own DirectShow renderer creates, with its WMAv2 audio
@@ -81,11 +83,22 @@ the audio mixer thread and crashed the attract).  The software rasteriser now
 honours the real FVF, render states (alpha blend/test), stage-0 texture-stage
 operations and the sampler's address/filter modes.
 
-What is still missing: the `Title` background is drawn as scattered dots (a
-texture decoding problem), the attract screen is almost blank after that, the
+The `Title` background is now continuous: `main_visual.dds` is 24 bpp RGB
+(not 32 bpp ARGB), so `decode_dds` now classifies by pixel format and
+`texture_argb` understands `R8G8B8`, `X8R8G8B8`, `R5G6B5`, `A1R5G5B5` and
+`X1R5G5B5`.  The same fix makes the attract tutorial (`catch_demo02`, also
+RGB24) visible.  The `dsound` engine is no longer silent: each voice buffer is
+mixed into one 48 kHz stereo stream with volume/pan/rate/loop, and the intro
+audio no longer stutters (the audio ffmpeg decodes ahead instead of running
+with `-re`).
+
+What is still missing: after the attract tutorial the screen stays on a white
+fade while `CDemoPlayMan` is stuck in its state 4 (creating `CGameMan`), the
 native movie quad still doubles its X scale (the port composites the video
-instead), and the game's `dsound` audio is silent.  The detailed state and the
-next three steps are in [`docs/HANDOVER.md`](docs/HANDOVER.md) (section 9).
+instead), and the software rasteriser runs at ~26–36 fps.  The detailed state
+and the next three steps are in [`docs/HANDOVER.md`](docs/HANDOVER.md)
+(section 10); the ready-to-paste next-session prompt is
+[`docs/HANDOVER_PROMPT.md`](docs/HANDOVER_PROMPT.md).
 
 ## Requirements
 
@@ -188,7 +201,7 @@ AZERTY, QWERTZ and other layouts.
 | `OTOMEDIUS_WATCH="addr[:n],…"` | trace entries to code addresses (hex) |
 | `OTOMEDIUS_WATCHMEM="addr,…"` | dump those globals on every watch hit |
 | `OTOMEDIUS_PEEKARGS=1` | also dump the stack arguments at watch hits |
-| `OTOMEDIUS_DUMP_FB=frame.ppm` | write one software frame (headless verification) |
+| `OTOMEDIUS_DUMP_FB=frame.ppm` | write one software frame (headless verification); Esc/window close also writes `frame.ppm.quit` |
 | `OTOMEDIUS_DUMP_AT=n` | which frame to dump (default 200) |
 | `OTOMEDIUS_TEST_QUAD=1\|2` | renderer self-test / texture preview |
 | `OTOMEDIUS_TEXTURES=1` | real `LockRect`/surface uploads (see HANDOVER §7.6) |
@@ -198,6 +211,7 @@ AZERTY, QWERTZ and other layouts.
 | `OTOMEDIUS_BEZEL=path` | cabinet artwork (default: `bezel.png` next to the game) |
 | `OTOMEDIUS_BEZEL=0` | disable the cabinet artwork |
 | `OTOMEDIUS_WINDOWED=1` | start in a window instead of fullscreen |
+| `OTOMEDIUS_WINDOW_SIZE=WxH` | windowed size (default 1366x768; tests use e.g. `800x450`) |
 | `OTOMEDIUS_FULLSCREEN=1` | force fullscreen when there is no bezel |
 | `OTOMEDIUS_MOVIE=1` | create the game's movie-player manager and show the intro video |
 | `OTOMEDIUS_MOVIE_PREVIEW=1` | play the intro video on top of the frame, without the game's manager |
@@ -207,8 +221,11 @@ AZERTY, QWERTZ and other layouts.
 | `OTOMEDIUS_LOADER_GUARD=1` | force the async loader to report "done" after ~7 s (old workaround, off by default) |
 | `OTOMEDIUS_BOOTDBG=1` | trace the boot/attract state machine, the loader (`LOADER` lines) and the logo package |
 | `OTOMEDIUS_DUMP_EVERY=n` | with `OTOMEDIUS_DUMP_FB`, dump a frame every `n` presents starting at `OTOMEDIUS_DUMP_AT` (files get a `.NNNNN` suffix) |
-| `OTOMEDIUS_DRAWDBG=n` | print every 2D draw (FVF, texture, render/sampler state, first vertices) of present `n` |
+| `OTOMEDIUS_DRAWDBG=n` | print every 2D draw (FVF, texture, render/sampler state, first vertices) of present `n`; also prints `SKIP`/`DISCARD` draws and the WORLD/VIEW/PROJ matrices |
 | `OTOMEDIUS_TEXFMT=1` | print the DDS format/size of textures created from memory |
+| `OTOMEDIUS_DSDBG=1` | log DirectSound buffer creation, Play/Stop, volume, frequency and Lock calls |
+| `OTOMEDIUS_AUDIO_DUMP=file.raw` | dump the mixed dsound output (S16LE 48 kHz stereo) for analysis |
+| `OTOMEDIUS_AUDIO_STREAM_DUMP=file.raw` | dump the final SDL audio stream (movie + dsound) |
 
 ## License
 

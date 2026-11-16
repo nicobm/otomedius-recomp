@@ -74,6 +74,20 @@ int x86_patch_call(uint32_t addr)
         } else if (addr == 0x429210u) {
             fprintf(stderr, "bootdbg: manager ctor this=%08x slot258=%08x\n",
                     cpu->esi, M32(0x5DE258u));
+        } else if (addr == 0x429340u) {
+            /* CDemoPlayMan::Update: state in this+0xA; waits for the replay
+             * pak loader, the eye-catch manager (0x5DE25C) and creates
+             * CGameMan in 0x5DE260. */
+            uint32_t self = cpu->ecx;
+            static int last = -1;
+            int st = self ? M8(self + 0xAu) : -1;
+            if (st != last) {
+                fprintf(stderr, "bootdbg: [present %u] DEMO state=%d "
+                        "slot25c=%08x slot260=%08x io=%u mask220=%08x\n",
+                        render_presents(), st, M32(0x5DE25Cu),
+                        M32(0x5DE260u), M8(0x5E2136u), M32(0x5DE220u));
+                last = st;
+            }
         } else if (addr == 0x439550u || addr == 0x439BB0u) {
             uint32_t pkg = M32(0x5DE0BCu);
             static uint32_t last[4];

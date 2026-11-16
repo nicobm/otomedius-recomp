@@ -431,7 +431,8 @@ static void d3dx_QuaternionSlerp(void)
 
 /* ------------------------------------------------------- textures (DDS) */
 enum { FMT_ARGB = 0, FMT_DXT1, FMT_DXT3, FMT_DXT5, FMT_L8, FMT_A8,
-       FMT_A4R4G4B4, FMT_A1R5G5B5, FMT_R5G6B5 };
+       FMT_A4R4G4B4, FMT_A1R5G5B5, FMT_R5G6B5,
+       FMT_R8G8B8, FMT_X8R8G8B8, FMT_X1R5G5B5 };
 
 static void d3dx_GetImageInfoFromFileInMemory(void)
 {
@@ -481,17 +482,30 @@ static int decode_dds(const uint8_t *d, uint32_t size, image_t *out)
         else
             return -1;
     } else {
-        /* SysFont.dds is a 16bpp A4R4G4B4 texture (masks f00/f0/f/f000). */
+        /* SysFont.dds is a 16bpp A4R4G4B4 texture (masks f00/f0/f/f000), the
+         * Konami logo is 16bpp R5G6B5 and the Title background
+         * (main_visual.dds) is 24bpp RGB with no alpha.  Match the pixel
+         * format from the header instead of assuming 32bpp ARGB: reading an
+         * RGB24 image as A8R8G8B8 turns the next pixel's blue channel into
+         * alpha, so the Title background was rendered as sparse dots. */
         uint32_t bits = d[88] | (d[89] << 8) | (d[90] << 16) | ((uint32_t)d[91] << 24);
         uint32_t rm = d[92] | (d[93] << 8) | (d[94] << 16) | ((uint32_t)d[95] << 24);
         uint32_t gm = d[96] | (d[97] << 8) | (d[98] << 16) | ((uint32_t)d[99] << 24);
         uint32_t bm = d[100] | (d[101] << 8) | (d[102] << 16) | ((uint32_t)d[103] << 24);
         uint32_t am = d[104] | (d[105] << 8) | (d[106] << 16) | ((uint32_t)d[107] << 24);
+        int has_alpha = (pf_flags & 0x1) != 0 && am != 0;
+
         if (bits == 16 && rm == 0xF00 && gm == 0xF0 && bm == 0xF &&
             am == 0xF000)
             out->fmt = FMT_A4R4G4B4;
         else if (bits == 16 && rm == 0xF800 && gm == 0x7E0 && bm == 0x1F)
-            out->fmt = am ? FMT_A1R5G5B5 : FMT_R5G6B5;
+            out->fmt = FMT_R5G6B5;
+        else if (bits == 16 && rm == 0x7C00 && gm == 0x3E0 && bm == 0x1F)
+            out->fmt = has_alpha ? FMT_A1R5G5B5 : FMT_X1R5G5B5;
+        else if (bits == 24 && rm == 0xFF0000 && gm == 0xFF00 && bm == 0xFF)
+            out->fmt = FMT_R8G8B8;
+        else if (bits == 32 && rm == 0xFF0000 && gm == 0xFF00 && bm == 0xFF)
+            out->fmt = has_alpha ? FMT_ARGB : FMT_X8R8G8B8;
         else
             out->fmt = FMT_ARGB;
     }

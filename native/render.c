@@ -76,6 +76,28 @@ const uint8_t *render_framebuffer(int *w, int *h)
     return g_fb;
 }
 
+void render_dump_fb(const char *path)
+{
+    FILE *f;
+    if (!path || !*path || !g_fb || g_fb_w <= 0 || g_fb_h <= 0)
+        return;
+    f = fopen(path, "wb");
+    if (!f) {
+        log_printf("render: cannot write dump %s", path);
+        return;
+    }
+    log_printf("render: dumped frame %u (%dx%d) to %s", g_stat.presents,
+               g_fb_w, g_fb_h, path);
+    fprintf(f, "P6\n%d %d\n255\n", g_fb_w, g_fb_h);
+    for (size_t i = 0, n = (size_t)g_fb_w * g_fb_h; i < n; i++) {
+        uint32_t c = ((uint32_t *)g_fb)[i];
+        fputc((c >> 16) & 0xFF, f);
+        fputc((c >> 8) & 0xFF, f);
+        fputc(c & 0xFF, f);
+    }
+    fclose(f);
+}
+
 static void fb_fill(uint32_t color)
 {
     if (!g_fb)
@@ -116,6 +138,8 @@ typedef struct {
 static uint32_t g_rs[256];
 static uint32_t g_tss[32];
 static uint32_t g_ss[16];
+/* WORLD / VIEW / PROJECTION as last set by SetTransform (D3D row-major). */
+static float g_xform[3][16];
 enum { RS_ALPHATESTENABLE = 15, RS_SRCBLEND = 19, RS_DESTBLEND = 20,
        RS_ALPHAREF = 24, RS_ALPHAFUNC = 25, RS_ALPHABLENDENABLE = 27,
        RS_TEXTUREFACTOR = 60 };
@@ -377,6 +401,21 @@ static void draw_tri(const svtx_t *a, const svtx_t *b, const svtx_t *c,
 }
 
 /* Rasterise an immediate vertex array (DrawPrimitiveUP). */
+static void drawdbg_skip(const char *why, uint32_t prim, uint32_t count,
+                         uint32_t data, uint32_t stride, uint32_t nverts)
+{
+    static int on = -1;
+    static unsigned n;
+    if (on < 0)
+        on = getenv("OTOMEDIUS_DRAWDBG") != NULL;
+    if (on && n < 40) {
+        n++;
+        fprintf(stderr, "drawdbg[%u]: SKIP(%s) prim=%u count=%u n=%u "
+                "data=%08x stride=%u fvf=%06x\n", g_stat.presents, why, prim,
+                count, nverts, data, stride, g_fvf);
+    }
+}
+
 static void draw_up_vertices(uint32_t prim, uint32_t prim_count, uint32_t data,
                              uint32_t stride)
 {
@@ -385,22 +424,28 @@ static void draw_up_vertices(uint32_t prim, uint32_t prim_count, uint32_t data,
     uint32_t tw = 0, th = 0;
     svtx_t *vt;
 
-    if (!g_fb || !data || !stride)
+    if (!g_fb || !data || !stride) {
+        drawdbg_skip("no-data", prim, prim_count, data, stride, 0);
         return;
+    }
     switch (prim) {
     case 2: nverts = prim_count * 2; break;            /* line list */
     case 3: nverts = prim_count + 1; break;            /* line strip */
     case 4: nverts = prim_count * 3; break;            /* triangle list */
     case 5: nverts = prim_count + 2; break;            /* triangle strip */
     case 6: nverts = prim_count + 2; break;            /* triangle fan */
-    default: return;                                   /* points: ignore */
+    default: drawdbg_skip("prim", prim, prim_count, data, stride, 0); return;
     }
-    if (nverts < 3 || nverts > 4096)
+    if (nverts < 3 || nverts > 4096) {
+        drawdbg_skip("nverts", prim, prim_count, data, stride, nverts);
         return;
+    }
 
     vt = (svtx_t *)calloc(nverts, sizeof(*vt));
-    if (!vt)
+    if (!vt) {
+        drawdbg_skip("calloc", prim, prim_count, data, stride, nverts);
         return;
+    }
     base = MEM + data;
     {
         /* FVF layout: XYZRHW (x,y,z,rhw) | DIFFUSE | SPECULAR | TEXn */
@@ -410,6 +455,32 @@ static void draw_up_vertices(uint32_t prim, uint32_t prim_count, uint32_t data,
         if (has_diff) off_tex += 4;
         if (fvf & 0x80) off_tex += 4;
         if (!(fvf & 4) || (ntex == 0 && stride < 20)) {
+            static int dbg = -2;
+            static unsigned nd;
+            if (dbg == -2)
+                dbg = getenv("OTOMEDIUS_DRAWDBG") ? 1 : 0;
+            if (dbg && nd < 40) {
+                const float *f = (const float *)(base);
+                nd++;
+                fprintf(stderr, "drawdbg[%u]: DISCARD prim=%u n=%u fvf=%x "
+                        "stride=%u v0=(%.3f,%.3f,%.3f,%.3f) v1=(%.3f,%.3f,%.3f,%.3f)\n",
+                        g_stat.presents, prim, nverts, fvf, stride,
+                        f[0], f[1], f[2], f[3],
+                        f[stride / 4], f[stride / 4 + 1], f[stride / 4 + 2],
+                        f[stride / 4 + 3]);
+                if (nd <= 2) {
+                    static const char *nm[3] = { "WORLD", "VIEW", "PROJ" };
+                    for (int s = 0; s < 3; s++) {
+                        const float *m = g_xform[s];
+                        fprintf(stderr, "  %s [%.4f %.4f %.4f %.4f | "
+                                "%.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | "
+                                "%.4f %.4f %.4f %.4f]\n", nm[s],
+                                m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7],
+                                m[8], m[9], m[10], m[11], m[12], m[13], m[14],
+                                m[15]);
+                    }
+                }
+            }
             free(vt);
             return;
         }
@@ -549,6 +620,8 @@ static void draw_up_vertices(uint32_t prim, uint32_t prim_count, uint32_t data,
     } else if (prim == 6) {
         for (uint32_t i = 1; i + 1 < nverts; i++)
             draw_tri(&vt[0], &vt[i], &vt[i + 1], tex, tw, th);
+    } else {
+        drawdbg_skip("prim-draw", prim, prim_count, data, stride, nverts);
     }
     free(vt);
 }
@@ -807,21 +880,8 @@ test_done:
             dump = dname;
             hit = 1;
         }
-        if (dump && *dump && g_fb && hit) {
-            FILE *f = fopen(dump, "wb");
-            if (f) {
-                log_printf("render: dumped frame %u (%dx%d)", g_stat.presents,
-                           g_fb_w, g_fb_h);
-                fprintf(f, "P6\n%d %d\n255\n", g_fb_w, g_fb_h);
-                for (size_t i = 0, n = (size_t)g_fb_w * g_fb_h; i < n; i++) {
-                    uint32_t c = ((uint32_t *)g_fb)[i];
-                    fputc((c >> 16) & 0xFF, f);
-                    fputc((c >> 8) & 0xFF, f);
-                    fputc(c & 0xFF, f);
-                }
-                fclose(f);
-            }
-        }
+        if (dump && *dump && hit)
+            render_dump_fb(dump);
     }
     platform_present();
 }
@@ -847,6 +907,11 @@ void render_set_viewport(int x, int y, int w, int h)
 
 void render_set_transform(uint32_t state, const void *matrix)
 {
+    /* Keep the fixed-function transforms: D3DTS_VIEW=2, PROJECTION=3,
+     * WORLD=256.  They are needed by the XYZ (non-RHW) vertex path. */
+    int slot = state == 2 ? 0 : state == 3 ? 1 : state == 256 ? 2 : -1;
+    if (slot >= 0 && matrix)
+        memcpy(g_xform[slot], matrix, 16 * sizeof(float));
     platform_transform(state, matrix);
 }
 

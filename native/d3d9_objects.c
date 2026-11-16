@@ -447,7 +447,8 @@ uint32_t texture_height(uint32_t o) { return tex(o)->h; }
  * software rasteriser needs linear ARGB, so decode on first use and keep the
  * result in a small side cache keyed by the emulated texture object. */
 enum { TF_ARGB = 0, TF_DXT1, TF_DXT3, TF_DXT5, TF_L8, TF_A8,
-       TF_A4R4G4B4, TF_A1R5G5B5, TF_R5G6B5 };
+       TF_A4R4G4B4, TF_A1R5G5B5, TF_R5G6B5,
+       TF_R8G8B8, TF_X8R8G8B8, TF_X1R5G5B5 };
 
 #define TEX_CACHE 64
 static struct {
@@ -630,20 +631,54 @@ const uint32_t *texture_argb(uint32_t obj, uint32_t *w, uint32_t *h)
         return px;
     }
     case TF_A1R5G5B5:
+    case TF_X1R5G5B5:
     case TF_R5G6B5: {
         uint32_t *px = tex_cache_slot(obj, t->w, t->h);
         const uint8_t *s8 = MEM + t->data;
-        int a1 = t->fmt == TF_A1R5G5B5;
+        int fmt = (int)t->fmt;
         if (!px)
             return NULL;
         for (uint32_t i = 0; i < t->w * t->h; i++) {
             uint32_t v = (uint32_t)s8[i * 2] | ((uint32_t)s8[i * 2 + 1] << 8);
-            uint32_t r = (v >> 10) & 0x1F, g = (v >> 5) & 0x1F;
-            uint32_t b = v & 0x1F;
-            uint32_t a = a1 ? ((v & 0x8000u) ? 0xFFu : 0u) : 0xFFu;
-            px[i] = (a << 24) | ((r * 255u / 31u) << 16) |
-                    ((g * 255u / 31u) << 8) | (b * 255u / 31u);
+            uint32_t r, g, b, a;
+            if (fmt == TF_R5G6B5) {          /* 5-6-5, no alpha */
+                r = (v >> 11) & 0x1F;
+                g = (v >> 5) & 0x3F;
+                b = v & 0x1F;
+                a = 0xFF;
+                px[i] = (a << 24) | ((r * 255u / 31u) << 16) |
+                        ((g * 255u / 63u) << 8) | (b * 255u / 31u);
+            } else {                          /* A1R5G5B5 / X1R5G5B5 */
+                r = (v >> 10) & 0x1F;
+                g = (v >> 5) & 0x1F;
+                b = v & 0x1F;
+                a = fmt == TF_A1R5G5B5 ? ((v & 0x8000u) ? 0xFFu : 0u)
+                                       : 0xFFu;
+                px[i] = (a << 24) | ((r * 255u / 31u) << 16) |
+                        ((g * 255u / 31u) << 8) | (b * 255u / 31u);
+            }
         }
+        return px;
+    }
+    case TF_R8G8B8: {
+        uint32_t *px = tex_cache_slot(obj, t->w, t->h);
+        const uint8_t *s8 = MEM + t->data;
+        if (!px)
+            return NULL;
+        for (uint32_t i = 0; i < t->w * t->h; i++) {
+            const uint8_t *p = s8 + (size_t)i * 3u;
+            px[i] = 0xFF000000u | ((uint32_t)p[2] << 16) |
+                    ((uint32_t)p[1] << 8) | p[0];
+        }
+        return px;
+    }
+    case TF_X8R8G8B8: {
+        uint32_t *px = tex_cache_slot(obj, t->w, t->h);
+        const uint32_t *s32 = (const uint32_t *)(MEM + t->data);
+        if (!px)
+            return NULL;
+        for (uint32_t i = 0; i < t->w * t->h; i++)
+            px[i] = s32[i] | 0xFF000000u;
         return px;
     }
     case TF_DXT1:

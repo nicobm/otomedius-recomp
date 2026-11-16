@@ -125,7 +125,7 @@ static int movie_audio_start(const char *path)
         if (dup2(fds[1], 1) < 0)
             _exit(126);
         close(fds[1]);
-        execlp("ffmpeg", "ffmpeg", "-v", "error", "-nostdin", "-re",
+        execlp("ffmpeg", "ffmpeg", "-v", "error", "-nostdin",
                "-i", path, "-vn", "-f", "s16le", "-ar", "48000", "-ac", "2",
                "-", (char *)NULL);
         _exit(127);
