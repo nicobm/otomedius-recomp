@@ -32,14 +32,18 @@ static struct {
     int minx, miny, maxx, maxy;   /* bounding box of the submitted quads */
     unsigned onscreen;
 } g_stat;
+static int g_cur_ntex;
 static uint32_t g_fvf, g_stream_stride, g_stream_vb, g_tex0;
 static uint32_t g_first_draw_logged;
 
 int render_width(void) { return g_width; }
 int render_height(void) { return g_height; }
 
+static void render_state_defaults(void);
+
 void render_init(int w, int h)
 {
+    render_state_defaults();
     if (w > 0 && h > 0) {
         g_width = (int)w;
         g_height = (int)h;
@@ -106,6 +110,182 @@ typedef struct {
     uint32_t color;
 } svtx_t;
 
+/* ---- fixed-function state the software rasteriser honours ---------------
+ * Render states (D3DRS_*), stage-0 texture stage states (D3DTSS_*) and
+ * stage-0 sampler states (D3DSAMP_*).  Defaults follow the D3D9 documentation. */
+static uint32_t g_rs[256];
+static uint32_t g_tss[32];
+static uint32_t g_ss[16];
+enum { RS_ALPHATESTENABLE = 15, RS_SRCBLEND = 19, RS_DESTBLEND = 20,
+       RS_ALPHAREF = 24, RS_ALPHAFUNC = 25, RS_ALPHABLENDENABLE = 27,
+       RS_TEXTUREFACTOR = 60 };
+
+static void render_state_defaults(void)
+{
+    memset(g_rs, 0, sizeof g_rs);
+    g_rs[RS_SRCBLEND] = 2;           /* ONE */
+    g_rs[RS_DESTBLEND] = 1;          /* ZERO */
+    g_rs[RS_ALPHAFUNC] = 8;          /* ALWAYS */
+    g_rs[RS_TEXTUREFACTOR] = 0xFFFFFFFFu;
+    memset(g_tss, 0, sizeof g_tss);
+    g_tss[1] = 4;                    /* COLOROP   = MODULATE */
+    g_tss[2] = 2;                    /* COLORARG1 = TEXTURE */
+    g_tss[3] = 1;                    /* COLORARG2 = CURRENT */
+    g_tss[4] = 2;                    /* ALPHAOP   = SELECTARG1 */
+    g_tss[5] = 2;                    /* ALPHAARG1 = TEXTURE */
+    g_tss[6] = 1;                    /* ALPHAARG2 = CURRENT */
+    memset(g_ss, 0, sizeof g_ss);
+    g_ss[1] = g_ss[2] = 1;           /* ADDRESSU/V = WRAP */
+    g_ss[5] = g_ss[6] = 1;           /* MAG/MINFILTER = POINT */
+}
+
+void render_set_texture_stage_state(uint32_t stage, uint32_t type, uint32_t value)
+{
+    if (stage == 0 && type < 32)
+        g_tss[type] = value;
+}
+
+static inline uint32_t clamp255(int v) { return v < 0 ? 0 : v > 255 ? 255 : (uint32_t)v; }
+
+static uint32_t tex_texel(const uint32_t *tex, int tw, int th, int tx, int ty,
+                          uint32_t modeu, uint32_t modev)
+{
+    if ((unsigned)tx >= (unsigned)tw) {
+        if (modeu == 3) { tx = tx < 0 ? 0 : tw - 1; }
+        else if (modeu == 2) { tx %= 2 * tw; if (tx < 0) tx += 2 * tw; if (tx >= tw) tx = 2 * tw - 1 - tx; }
+        else { tx %= tw; if (tx < 0) tx += tw; }
+    }
+    if ((unsigned)ty >= (unsigned)th) {
+        if (modev == 3) { ty = ty < 0 ? 0 : th - 1; }
+        else if (modev == 2) { ty %= 2 * th; if (ty < 0) ty += 2 * th; if (ty >= th) ty = 2 * th - 1 - ty; }
+        else { ty %= th; if (ty < 0) ty += th; }
+    }
+    return tex[(size_t)ty * (size_t)tw + (size_t)tx];
+}
+
+static uint32_t tex_sample(const uint32_t *tex, uint32_t tw, uint32_t th,
+                           float u, float v)
+{
+    uint32_t mu = g_ss[1], mv = g_ss[2];
+    if (g_ss[5] == 2 || g_ss[6] == 2) {          /* LINEAR */
+        float fx = u * (float)tw - 0.5f, fy = v * (float)th - 0.5f;
+        int x0 = (int)floorf(fx), y0 = (int)floorf(fy);
+        float ax = fx - (float)x0, ay = fy - (float)y0;
+        uint32_t c00 = tex_texel(tex, (int)tw, (int)th, x0, y0, mu, mv);
+        uint32_t c10 = tex_texel(tex, (int)tw, (int)th, x0 + 1, y0, mu, mv);
+        uint32_t c01 = tex_texel(tex, (int)tw, (int)th, x0, y0 + 1, mu, mv);
+        uint32_t c11 = tex_texel(tex, (int)tw, (int)th, x0 + 1, y0 + 1, mu, mv);
+        uint32_t out = 0;
+        for (int sh = 0; sh < 32; sh += 8) {
+            float t0 = (float)((c00 >> sh) & 255) * (1 - ax) + (float)((c10 >> sh) & 255) * ax;
+            float t1 = (float)((c01 >> sh) & 255) * (1 - ax) + (float)((c11 >> sh) & 255) * ax;
+            out |= clamp255((int)(t0 * (1 - ay) + t1 * ay + 0.5f)) << sh;
+        }
+        return out;
+    }
+    return tex_texel(tex, (int)tw, (int)th, (int)floorf(u * (float)tw),
+                     (int)floorf(v * (float)th), mu, mv);
+}
+
+/* D3DTA_*: DIFFUSE 0, CURRENT 1, TEXTURE 2, TFACTOR 3; flags 0x10 complement,
+ * 0x20 alpha replicate */
+static uint32_t tss_arg(uint32_t a, uint32_t diffuse, uint32_t current,
+                        uint32_t texel)
+{
+    uint32_t c;
+    switch (a & 15) {
+    case 0: c = diffuse; break;
+    case 1: c = current; break;
+    case 2: c = texel; break;
+    case 3: c = g_rs[RS_TEXTUREFACTOR]; break;
+    default: c = 0xFFFFFFFFu; break;
+    }
+    if (a & 0x20) c = (c & 0xFF000000u) | ((c >> 24) * 0x010101u);
+    if (a & 0x10) c ^= 0x00FFFFFFu;
+    return c;
+}
+
+static uint32_t tss_op(uint32_t op, uint32_t a1, uint32_t a2, int shift_from,
+                       int is_alpha)
+{
+    uint32_t out = 0;
+    int lo = is_alpha ? 24 : 0, hi = is_alpha ? 32 : 24;
+    (void)shift_from;
+    for (int sh = lo; sh < hi; sh += 8) {
+        int x = (int)((a1 >> sh) & 255), y = (int)((a2 >> sh) & 255), r;
+        switch (op) {
+        case 2: r = x; break;
+        case 3: r = y; break;
+        case 4: r = x * y / 255; break;
+        case 5: r = x * y * 2 / 255; break;
+        case 6: r = x * y * 4 / 255; break;
+        case 7: r = x + y; break;
+        case 8: r = x + y - 128; break;
+        case 10: r = x - y; break;
+        default: r = x; break;
+        }
+        out |= clamp255(r) << sh;
+    }
+    return out;
+}
+
+static uint32_t blend_factor(uint32_t f, uint32_t src, uint32_t dst, int sh)
+{
+    uint32_t sa = src >> 24, da = dst >> 24, c;
+    switch (f) {
+    case 1: return 0;
+    case 2: return 255;
+    case 3: c = (src >> sh) & 255; return c;
+    case 4: c = (src >> sh) & 255; return 255 - c;
+    case 5: return sa;
+    case 6: return 255 - sa;
+    case 7: return da;
+    case 8: return 255 - da;
+    case 9: return (dst >> sh) & 255;
+    case 10: return 255 - ((dst >> sh) & 255);
+    default: return 255;
+    }
+}
+
+static void fb_write(int x, int y, uint32_t src)
+{
+    uint32_t *d;
+    if (x < 0 || y < 0 || x >= g_fb_w || y >= g_fb_h)
+        return;
+    if (g_rs[RS_ALPHATESTENABLE]) {
+        uint32_t a = src >> 24, ref = g_rs[RS_ALPHAREF] & 255;
+        int pass;
+        switch (g_rs[RS_ALPHAFUNC]) {
+        case 1: pass = 0; break;
+        case 2: pass = a < ref; break;
+        case 3: pass = a == ref; break;
+        case 4: pass = a <= ref; break;
+        case 5: pass = a > ref; break;
+        case 6: pass = a != ref; break;
+        case 7: pass = a >= ref; break;
+        default: pass = 1; break;
+        }
+        if (!pass)
+            return;
+    }
+    d = &((uint32_t *)g_fb)[(size_t)y * g_fb_w + x];
+    if (!g_rs[RS_ALPHABLENDENABLE]) {
+        *d = src | 0xFF000000u;
+        return;
+    }
+    {
+        uint32_t dd = *d, out = 0xFF000000u;
+        for (int sh = 0; sh < 24; sh += 8) {
+            uint32_t sf = blend_factor(g_rs[RS_SRCBLEND], src, dd, sh);
+            uint32_t df = blend_factor(g_rs[RS_DESTBLEND], src, dd, sh);
+            uint32_t v = ((((src >> sh) & 255) * sf) + (((dd >> sh) & 255) * df)) / 255;
+            out |= clamp255((int)v) << sh;
+        }
+        *d = out;
+    }
+}
+
+
 static void draw_tri(const svtx_t *a, const svtx_t *b, const svtx_t *c,
                      const uint32_t *tex, uint32_t tw, uint32_t th)
 {
@@ -138,6 +318,8 @@ static void draw_tri(const svtx_t *a, const svtx_t *b, const svtx_t *c,
     if (x1 > g_fb_w) x1 = g_fb_w;
     if (y1 > g_fb_h) y1 = g_fb_h;
 
+    int flat = a->color == b->color && b->color == c->color;
+    uint32_t flat_diff = a->color;
     for (int y = y0; y < y1; y++) {
         for (int x = x0; x < x1; x++) {
             float px = (float)x + 0.5f, py = (float)y + 0.5f;
@@ -155,29 +337,40 @@ static void draw_tri(const svtx_t *a, const svtx_t *b, const svtx_t *c,
             u = a->u * l0 + b->u * l1 + c->u * l2;
             v = a->v * l0 + b->v * l1 + c->v * l2;
 
-            col = 0xFFFFFFFFu;
-            if (tex && tw && th) {
-                /* default address mode is WRAP: u = 6.0 samples texel 0 */
-                float uu = u - floorf(u);
-                float vv = v - floorf(v);
-                int tx = (int)(uu * (float)tw);
-                int ty = (int)(vv * (float)th);
-                if (tx < 0) tx = 0;
-                if (ty < 0) ty = 0;
-                if (tx >= (int)tw) tx = (int)tw - 1;
-                if (ty >= (int)th) ty = (int)th - 1;
-                col = tex[(size_t)ty * tw + tx];
-            }
             {
-                /* diffuse modulate */
-                uint32_t dc = a->color;
-                uint32_t dr = (dc >> 16) & 0xFF, dg = (dc >> 8) & 0xFF,
-                         db = dc & 0xFF, da = (dc >> 24) & 0xFF;
-                uint32_t r = (((col >> 16) & 0xFF) * dr) / 255;
-                uint32_t g = (((col >> 8) & 0xFF) * dg) / 255;
-                uint32_t b = ((col & 0xFF) * db) / 255;
-                uint32_t al = (((col >> 24) & 0xFF) * da) / 255;
-                fb_blend(x, y, (al << 24) | (r << 16) | (g << 8) | b);
+                uint32_t texel = 0xFFFFFFFFu, diff, cur, res, ares;
+                uint32_t dA, dR, dG, dB;
+                if (tex && tw && th)
+                    texel = tex_sample(tex, tw, th, u, v);
+                if (flat) {
+                    diff = flat_diff;
+                } else {
+                dA = clamp255((int)(((a->color >> 24) & 255) * l0 + ((b->color >> 24) & 255) * l1 + ((c->color >> 24) & 255) * l2 + 0.5f));
+                dR = clamp255((int)(((a->color >> 16) & 255) * l0 + ((b->color >> 16) & 255) * l1 + ((c->color >> 16) & 255) * l2 + 0.5f));
+                dG = clamp255((int)(((a->color >> 8) & 255) * l0 + ((b->color >> 8) & 255) * l1 + ((c->color >> 8) & 255) * l2 + 0.5f));
+                dB = clamp255((int)((a->color & 255) * l0 + (b->color & 255) * l1 + (c->color & 255) * l2 + 0.5f));
+                diff = (dA << 24) | (dR << 16) | (dG << 8) | dB;
+                }
+                cur = diff;
+                col = texel;
+                if (!(tex && tw && th)) {
+                    res = cur;
+                    ares = cur;
+                } else if (g_tss[1] == 1) {
+                    res = cur;
+                } else {
+                    res = tss_op(g_tss[1], tss_arg(g_tss[2], diff, cur, texel),
+                                 tss_arg(g_tss[3], diff, cur, texel), 0, 0);
+                }
+                if (!(tex && tw && th)) {
+                    /* untextured: diffuse alpha already in ares */
+                } else if (g_tss[4] == 1) {
+                    ares = cur;
+                } else {
+                    ares = tss_op(g_tss[4], tss_arg(g_tss[5], diff, cur, texel),
+                                  tss_arg(g_tss[6], diff, cur, texel), 0, 1);
+                }
+                fb_write(x, y, (ares & 0xFF000000u) | (res & 0x00FFFFFFu));
             }
         }
     }
@@ -209,15 +402,30 @@ static void draw_up_vertices(uint32_t prim, uint32_t prim_count, uint32_t data,
     if (!vt)
         return;
     base = MEM + data;
-    for (uint32_t i = 0; i < nverts; i++) {
-        const uint8_t *v = base + (size_t)i * stride;
-        const float *f = (const float *)v;
-        /* XYZRHW: x, y, z, rhw | DIFFUSE | TEX1: u, v  (stride 28) */
-        vt[i].x = f[0];
-        vt[i].y = f[1];
-        vt[i].u = f[5];
-        vt[i].v = f[6];
-        vt[i].color = M32(data + i * stride + 16);
+    {
+        /* FVF layout: XYZRHW (x,y,z,rhw) | DIFFUSE | SPECULAR | TEXn */
+        uint32_t fvf = g_fvf ? g_fvf : 0x144u;
+        uint32_t off_diff = 16, off_tex = 16;
+        int has_diff = (fvf & 0x40) != 0, ntex = (int)((fvf >> 8) & 15);
+        if (has_diff) off_tex += 4;
+        if (fvf & 0x80) off_tex += 4;
+        if (!(fvf & 4) || (ntex == 0 && stride < 20)) {
+            free(vt);
+            return;
+        }
+        for (uint32_t i = 0; i < nverts; i++) {
+            const uint8_t *v = base + (size_t)i * stride;
+            const float *f = (const float *)v;
+            vt[i].x = f[0];
+            vt[i].y = f[1];
+            vt[i].color = has_diff ? M32(data + i * stride + off_diff) : 0xFFFFFFFFu;
+            if (ntex > 0) {
+                const float *t = (const float *)(v + off_tex);
+                vt[i].u = t[0];
+                vt[i].v = t[1];
+            }
+        }
+        g_cur_ntex = ntex;
     }
     if (getenv("OTOMEDIUS_VERTDBG")) {
         /* print the first draw of every 120th frame so the coordinates can be
@@ -281,13 +489,33 @@ static void draw_up_vertices(uint32_t prim, uint32_t prim_count, uint32_t data,
 
     tex = NULL;
     tw = th = 0;
-    if (g_tex0) {
+    if (g_tex0 && g_cur_ntex > 0) {
         uint32_t w = 0, h = 0;
         const uint32_t *px = texture_argb(g_tex0, &w, &h);
         if (px) {
             tex = (uint32_t *)px;
             tw = w;
             th = h;
+        }
+    }
+
+    {
+        static int dbg_at = -2;
+        if (dbg_at == -2) {
+            const char *e = getenv("OTOMEDIUS_DRAWDBG");
+            dbg_at = e ? atoi(e) : -1;
+        }
+        if (dbg_at >= 0 && g_stat.presents == (unsigned)dbg_at) {
+            fprintf(stderr, "drawdbg[%u]: prim=%u n=%u fvf=%x stride=%u tex=%08x %ux%u "
+                    "rs(ab=%u src=%u dst=%u at=%u) tss(cop=%u c1=%u c2=%u aop=%u) "
+                    "ss(u=%u v=%u mag=%u) v0=(%.0f,%.0f uv %.3f,%.3f c=%08x) "
+                    "v2=(%.0f,%.0f uv %.3f,%.3f)\n",
+                    g_stat.presents, prim, nverts, g_fvf, stride, g_tex0, tw, th,
+                    g_rs[RS_ALPHABLENDENABLE], g_rs[RS_SRCBLEND], g_rs[RS_DESTBLEND],
+                    g_rs[RS_ALPHATESTENABLE], g_tss[1], g_tss[2], g_tss[3], g_tss[4],
+                    g_ss[1], g_ss[2], g_ss[5], vt[0].x, vt[0].y, vt[0].u, vt[0].v,
+                    vt[0].color, vt[nverts > 2 ? 2 : 0].x, vt[nverts > 2 ? 2 : 0].y,
+                    vt[nverts > 2 ? 2 : 0].u, vt[nverts > 2 ? 2 : 0].v);
         }
     }
 
@@ -570,7 +798,16 @@ test_done:
         const char *dump = getenv("OTOMEDIUS_DUMP_FB");
         const char *at_s = getenv("OTOMEDIUS_DUMP_AT");
         unsigned at = at_s ? (unsigned)atoi(at_s) : 200u;
-        if (dump && *dump && g_fb && g_stat.presents == at) {
+        const char *ev_s = getenv("OTOMEDIUS_DUMP_EVERY");
+        unsigned ev = ev_s ? (unsigned)atoi(ev_s) : 0u;
+        char dname[512];
+        int hit = g_stat.presents == at;
+        if (ev && g_stat.presents >= at && ((g_stat.presents - at) % ev) == 0) {
+            snprintf(dname, sizeof dname, "%s.%05u", dump ? dump : "", g_stat.presents);
+            dump = dname;
+            hit = 1;
+        }
+        if (dump && *dump && g_fb && hit) {
             FILE *f = fopen(dump, "wb");
             if (f) {
                 log_printf("render: dumped frame %u (%dx%d)", g_stat.presents,
@@ -615,11 +852,15 @@ void render_set_transform(uint32_t state, const void *matrix)
 
 void render_set_state(uint32_t state, uint32_t value)
 {
+    if (state < 256)
+        g_rs[state] = value;
     platform_state(state, value);
 }
 
 void render_set_sampler(uint32_t stage, uint32_t type, uint32_t value)
 {
+    if (stage == 0 && type < 16)
+        g_ss[type] = value;
     platform_sampler(stage, type, value);
 }
 
@@ -688,3 +929,5 @@ void render_draw_up(uint32_t prim, uint32_t count, uint32_t data, uint32_t strid
     draw_up_vertices(prim, count, data, stride);
     platform_draw_up(prim, count, data, stride, fvf);
 }
+
+unsigned render_presents(void) { return g_stat.presents; }

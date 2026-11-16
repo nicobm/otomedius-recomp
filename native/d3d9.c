@@ -387,12 +387,33 @@ static void dev_CreateDepthStencilSurface(void)
     RET32(0);
 }
 
-static void dev_UpdateSurface(void) { RET32(0); }
+static void dev_UpdateSurface(void)
+{
+    static unsigned n;
+    if (n++ < 3)
+        fprintf(stderr, "d3d9: UNIMPLEMENTED dev_UpdateSurface called (#%u) args %08x %08x %08x %08x\n", n,
+                arg32(1), arg32(2), arg32(3), arg32(4));
+    RET32(0);
+}
 static void dev_UpdateTexture(void) { RET32(0); }
 static void dev_GetRenderTargetData(void) { RET32(0); }
 static void dev_GetFrontBufferData(void) { RET32(0); }
-static void dev_StretchRect(void) { RET32(0); }
-static void dev_ColorFill(void) { RET32(0); }
+static void dev_StretchRect(void)
+{
+    static unsigned n;
+    if (n++ < 3)
+        fprintf(stderr, "d3d9: UNIMPLEMENTED dev_StretchRect called (#%u) args %08x %08x %08x %08x\n", n,
+                arg32(1), arg32(2), arg32(3), arg32(4));
+    RET32(0);
+}
+static void dev_ColorFill(void)
+{
+    static unsigned n;
+    if (n++ < 3)
+        fprintf(stderr, "d3d9: UNIMPLEMENTED dev_ColorFill called (#%u) args %08x %08x %08x %08x\n", n,
+                arg32(1), arg32(2), arg32(3), arg32(4));
+    RET32(0);
+}
 
 static void dev_CreateOffscreenPlainSurface(void)
 {
@@ -528,6 +549,10 @@ static void dev_SetTexture(void)
 static void dev_GetTextureStageState(void) { RET32(0); }
 static void dev_SetTextureStageState(void)
 {
+    {
+        extern void render_set_texture_stage_state(uint32_t, uint32_t, uint32_t);
+        render_set_texture_stage_state(arg32(1), arg32(2), arg32(3));
+    }
     if (g_verbose > 1) {
         static int n;
         if (n++ < 24)
@@ -551,7 +576,14 @@ static void dev_GetPaletteEntries(void) { RET32(0); }
 static void dev_SetCurrentTexturePalette(void) { RET32(0); }
 static void dev_GetCurrentTexturePalette(void) { RET32(0); }
 
-static void dev_SetScissorRect(void) { RET32(0); }
+static void dev_SetScissorRect(void)
+{
+    static unsigned n;
+    if (n++ < 3)
+        fprintf(stderr, "d3d9: UNIMPLEMENTED dev_SetScissorRect called (#%u) args %08x %08x %08x %08x\n", n,
+                arg32(1), arg32(2), arg32(3), arg32(4));
+    RET32(0);
+}
 static void dev_GetScissorRect(void) { RET32(0); }
 
 static void dev_SetSoftwareVertexProcessing(void) { RET32(0); }
@@ -577,9 +609,23 @@ static void dev_DrawPrimitiveUP(void)
     RET32(0);
 }
 
-static void dev_DrawIndexedPrimitiveUP(void) { RET32(0); }
+static void dev_DrawIndexedPrimitiveUP(void)
+{
+    static unsigned n;
+    if (n++ < 3)
+        fprintf(stderr, "d3d9: UNIMPLEMENTED dev_DrawIndexedPrimitiveUP called (#%u) args %08x %08x %08x %08x\n", n,
+                arg32(1), arg32(2), arg32(3), arg32(4));
+    RET32(0);
+}
 
-static void dev_ProcessVertices(void) { RET32(0); }
+static void dev_ProcessVertices(void)
+{
+    static unsigned n;
+    if (n++ < 3)
+        fprintf(stderr, "d3d9: UNIMPLEMENTED dev_ProcessVertices called (#%u) args %08x %08x %08x %08x\n", n,
+                arg32(1), arg32(2), arg32(3), arg32(4));
+    RET32(0);
+}
 
 static void dev_CreateVertexDeclaration(void) { RET32(0); }
 static void dev_SetVertexDeclaration(void) { RET32(0); }
@@ -652,8 +698,22 @@ static void dev_GetPixelShaderConstantI(void) { RET32(0); }
 static void dev_SetPixelShaderConstantB(void) { RET32(0); }
 static void dev_GetPixelShaderConstantB(void) { RET32(0); }
 
-static void dev_DrawRectPatch(void) { RET32(0); }
-static void dev_DrawTriPatch(void) { RET32(0); }
+static void dev_DrawRectPatch(void)
+{
+    static unsigned n;
+    if (n++ < 3)
+        fprintf(stderr, "d3d9: UNIMPLEMENTED dev_DrawRectPatch called (#%u) args %08x %08x %08x %08x\n", n,
+                arg32(1), arg32(2), arg32(3), arg32(4));
+    RET32(0);
+}
+static void dev_DrawTriPatch(void)
+{
+    static unsigned n;
+    if (n++ < 3)
+        fprintf(stderr, "d3d9: UNIMPLEMENTED dev_DrawTriPatch called (#%u) args %08x %08x %08x %08x\n", n,
+                arg32(1), arg32(2), arg32(3), arg32(4));
+    RET32(0);
+}
 static void dev_DeletePatch(void) { RET32(0); }
 
 static void dev_CreateQuery(void) { RET32(0x8876086Au); }

@@ -509,8 +509,17 @@ static void d3dx_CreateTextureFromFileInMemoryEx(void)
         const uint8_t *d = MEM + src;
         image_t img;
         if (decode_dds(d, size, &img) == 0) {
+            if (getenv("OTOMEDIUS_TEXFMT"))
+                fprintf(stderr, "d3dx9: texture %ux%u fmt=%u size=%u mips=%u "
+                        "pf_flags=%08x fourcc=%.4s bits=%u masks=%08x/%08x/%08x/%08x\n",
+                        img.w, img.h, img.fmt, size, M32(src + 28) , M32(src + 80),
+                        (const char *)(d + 84), M32(src + 88), M32(src + 92),
+                        M32(src + 96), M32(src + 100), M32(src + 104));
             tex = texture_create(img.w, img.h, 1, 0, 0x15 /* A8R8G8B8 */, 0);
             texture_upload(tex, img.pixels, size - 128, img.fmt);
+        } else if (getenv("OTOMEDIUS_TEXFMT")) {
+            fprintf(stderr, "d3dx9: UNSUPPORTED texture magic=%.4s size=%u pf=%08x fourcc=%.4s\n",
+                    (const char *)d, size, M32(src + 80), (const char *)(d + 84));
         }
     }
     if (pp)
