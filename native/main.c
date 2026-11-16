@@ -12,6 +12,8 @@
 #include <signal.h>
 #include <setjmp.h>
 #include <pthread.h>
+#include <execinfo.h>
+#include <ucontext.h>
 
 int  x86_mem_init(void);
 int  x86_load_image(const char *exe_path);
@@ -45,6 +47,23 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx)
     }
     if (n > 0)
         write(2, buf, (size_t)n);
+    if (ctx) {
+        ucontext_t *uc = (ucontext_t *)ctx;
+        char b3[160];
+        int n3 = snprintf(b3, sizeof(b3), "    native rip=%llx rsp=%llx\n",
+                          (unsigned long long)uc->uc_mcontext.gregs[REG_RIP],
+                          (unsigned long long)uc->uc_mcontext.gregs[REG_RSP]);
+        if (n3 > 0)
+            write(2, b3, (size_t)n3);
+    }
+    /* Native backtrace (addresses resolved with `nm`/`addr2line`), so a fault
+     * inside a recompiled function can be traced to the generated block. */
+    {
+        void *bt[24];
+        int nb = backtrace(bt, 24);
+        if (nb > 0)
+            backtrace_symbols_fd(bt, nb, 2);
+    }
     x86_trace_dump();
     _exit(139);
 }
@@ -238,15 +257,34 @@ int x86_thread_begin(uint32_t start, uint32_t param, uint32_t stack_top, uint32_
     return 0;
 }
 
+/* The emulator's TEBs live in 0x7FF00000..0x7FFFFFFF.  A stale/garbage TEB
+ * pointer turned a TlsGetValue from the audio thread into a segfault at a low
+ * address; treat an out-of-range TEB as "no TLS" and report it once. */
+static int teb_ok(uint32_t teb)
+{
+    return teb >= 0x7FF00000u && teb < 0x80000000u;
+}
+
 void x86_tls_set(uint32_t idx, uint32_t v)
 {
-    if (idx < 64)
-        M32(x86_cpu()->teb + 0x1000 + idx * 4) = v;
+    cpu_t *c = x86_cpu();
+    if (idx < 64 && teb_ok(c->teb))
+        M32(c->teb + 0x1000 + idx * 4) = v;
 }
 
 uint32_t x86_tls_get(uint32_t idx)
 {
-    return idx < 64 ? M32(x86_cpu()->teb + 0x1000 + idx * 4) : 0;
+    cpu_t *c = x86_cpu();
+    if (idx >= 64)
+        return 0;
+    if (!teb_ok(c->teb)) {
+        static int fired;
+        if (!fired++)
+            fprintf(stderr, "x86: TlsGetValue with invalid TEB %08x "
+                    "(thread eip=%08x), returning 0\n", c->teb, c->eip);
+        return 0;
+    }
+    return M32(c->teb + 0x1000 + idx * 4);
 }
 
 void win_tick(uint32_t *lo)

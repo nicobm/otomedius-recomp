@@ -629,7 +629,7 @@ int font_glyph_outline(uint32_t handle, uint32_t ch, uint32_t format,
 
     FONT_LOCK();
     f = current_face(handle);
-    if (!f || !out_size || !(format & 2))   /* GGO_NATIVE */
+    if (!f || !out_size || format != 2u)     /* GGO_NATIVE only */
         goto done;
     gi = FT_Get_Char_Index(f, ch);
     if (FT_Load_Glyph(f, gi, FT_LOAD_NO_BITMAP | FT_LOAD_NO_HINTING) != 0)
@@ -643,6 +643,9 @@ int font_glyph_outline(uint32_t handle, uint32_t ch, uint32_t format,
         M32(gm + 8)  = (uint32_t)(int32_t)(s->metrics.horiBearingY >> 6);
         M16(gm + 12) = (uint16_t)((s->advance.x + 32) >> 6);
         M16(gm + 14) = 0;
+        /* CTexFont reads the advance from the padding word at +0x10. */
+        M16(gm + 16) = M16(gm + 12);
+        M16(gm + 18) = 0;
     }
 
     memset(&b, 0, sizeof(b));
@@ -674,6 +677,101 @@ int font_glyph_outline(uint32_t handle, uint32_t ch, uint32_t format,
             memcpy(MEM + buf, b.p, size);
     }
     free(b.p);
+    ret = 1;
+done:
+    FONT_UNLOCK();
+    return ret;
+}
+
+/* -------------------------------------------------------------- bitmaps */
+/* GDI renders anti-aliased glyphs with GetGlyphOutlineA:
+ *
+ *   GGO_BITMAP (1)       1 bpp, MSB first, stride ((w+31)/32)*4
+ *   GGO_GRAY8_BITMAP (6) 8 bpp coverage, stride (w+3)&~3, values 0..64
+ *
+ * CTexFont asks for GGO_GRAY8 when its antialias flag is set (0x409B61 picks
+ * fmt 6/1 from CTexFont+0x38) and then indexes its 256-entry palette
+ * (CTexFont+0x58) with every source byte.  That palette only maps 0..64
+ * (0,3,63,...251,255,255), so the FreeType 0..255 coverage must be scaled to
+ * GDI's 0..64 range; feeding 0..255 made most pixels hit palette entries that
+ * are 0 and produced the "noise" atlas.
+ */
+int font_glyph_bitmap(uint32_t handle, uint32_t ch, uint32_t format,
+                      uint32_t gm, uint32_t cb, uint32_t buf,
+                      uint32_t *out_size)
+{
+    FT_Face f;
+    FT_UInt gi;
+    FT_GlyphSlot s;
+    FT_Bitmap *bm;
+    int w, h, stride, size, adv, ret = 0;
+
+    FONT_LOCK();
+    f = current_face(handle);
+    if (!f || !out_size || (format != 1u && format != 6u))
+        goto done;
+    gi = FT_Get_Char_Index(f, ch);
+    if (FT_Load_Glyph(f, gi, FT_LOAD_RENDER | FT_LOAD_NO_BITMAP |
+                               FT_LOAD_TARGET_NORMAL) != 0)
+        goto done;
+    s = f->glyph;
+    bm = &s->bitmap;
+    w = (int)bm->width;
+    h = (int)bm->rows;
+    if (w < 0) w = 0;
+    if (h < 0) h = 0;
+    stride = (format == 6u) ? ((w + 3) & ~3) : (((w + 31) / 32) * 4);
+    size = stride * h;
+    adv = (int)((s->advance.x + 32) >> 6);
+
+    if (gm) {
+        M16(gm + 0)  = (uint16_t)w;                  /* gmBlackBoxX */
+        M16(gm + 2)  = (uint16_t)h;                  /* gmBlackBoxY */
+        M32(gm + 4)  = (uint32_t)(int32_t)s->bitmap_left; /* gmptGlyphOrigin.x */
+        M32(gm + 8)  = (uint32_t)(int32_t)s->bitmap_top;  /* +y upwards */
+        M16(gm + 12) = (uint16_t)adv;                /* gmCellIncX */
+        M16(gm + 14) = 0;
+        M16(gm + 16) = (uint16_t)adv;                /* read at 0x409F5E */
+        M16(gm + 18) = 0;
+    }
+
+    *out_size = (uint32_t)size;
+    if (cb && buf) {
+        if (cb < (uint32_t)size) {
+            ret = 2;
+            goto done;
+        }
+        memset(MEM + buf, 0, (size_t)size);
+        for (int y = 0; y < h; y++) {
+            const uint8_t *src = bm->buffer + (size_t)y * bm->pitch;
+            uint8_t *dst = MEM + buf + (size_t)y * stride;
+            for (int x = 0; x < w; x++) {
+                unsigned cov;
+                switch (bm->pixel_mode) {
+                case FT_PIXEL_MODE_MONO:
+                    cov = (src[x >> 3] & (0x80u >> (x & 7))) ? 255u : 0u;
+                    break;
+                case FT_PIXEL_MODE_GRAY2:
+                    cov = ((src[x >> 2] >> (6 - 2 * (x & 3))) & 3u) * 85u;
+                    break;
+                case FT_PIXEL_MODE_GRAY4:
+                    cov = ((src[x >> 1] >> (4 - 4 * (x & 1))) & 15u) * 17u;
+                    break;
+                case FT_PIXEL_MODE_BGRA:
+                    cov = ((unsigned)src[x * 4 + 3] + src[x * 4 + 2] +
+                           src[x * 4 + 1]) / 3u;
+                    break;
+                default:                        /* FT_PIXEL_MODE_GRAY */
+                    cov = src[x];
+                    break;
+                }
+                if (format == 6u)
+                    dst[x] = (uint8_t)((cov * 64u + 127u) / 255u);
+                else if (cov >= 128u)
+                    dst[x >> 3] |= (uint8_t)(0x80u >> (x & 7));
+            }
+        }
+    }
     ret = 1;
 done:
     FONT_UNLOCK();

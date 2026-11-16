@@ -446,7 +446,8 @@ uint32_t texture_height(uint32_t o) { return tex(o)->h; }
  * blocks (that is what decode_dds() records - it only parses the header).  The
  * software rasteriser needs linear ARGB, so decode on first use and keep the
  * result in a small side cache keyed by the emulated texture object. */
-enum { TF_ARGB = 0, TF_DXT1, TF_DXT3, TF_DXT5, TF_L8, TF_A8 };
+enum { TF_ARGB = 0, TF_DXT1, TF_DXT3, TF_DXT5, TF_L8, TF_A8,
+       TF_A4R4G4B4, TF_A1R5G5B5, TF_R5G6B5 };
 
 #define TEX_CACHE 64
 static struct {
@@ -612,6 +613,37 @@ const uint32_t *texture_argb(uint32_t obj, uint32_t *w, uint32_t *h)
             return NULL;
         for (uint32_t i = 0; i < t->w * t->h; i++)
             px[i] = (uint32_t)s[i] << 24;
+        return px;
+    }
+    case TF_A4R4G4B4: {
+        uint32_t *px = tex_cache_slot(obj, t->w, t->h);
+        const uint8_t *s8 = MEM + t->data;
+        if (!px)
+            return NULL;
+        for (uint32_t i = 0; i < t->w * t->h; i++) {
+            uint32_t v = (uint32_t)s8[i * 2] | ((uint32_t)s8[i * 2 + 1] << 8);
+            uint32_t r = (v >> 8) & 0xF, g = (v >> 4) & 0xF;
+            uint32_t b = v & 0xF, a = (v >> 12) & 0xF;
+            px[i] = ((a * 17u) << 24) | ((r * 17u) << 16) |
+                    ((g * 17u) << 8) | (b * 17u);
+        }
+        return px;
+    }
+    case TF_A1R5G5B5:
+    case TF_R5G6B5: {
+        uint32_t *px = tex_cache_slot(obj, t->w, t->h);
+        const uint8_t *s8 = MEM + t->data;
+        int a1 = t->fmt == TF_A1R5G5B5;
+        if (!px)
+            return NULL;
+        for (uint32_t i = 0; i < t->w * t->h; i++) {
+            uint32_t v = (uint32_t)s8[i * 2] | ((uint32_t)s8[i * 2 + 1] << 8);
+            uint32_t r = (v >> 10) & 0x1F, g = (v >> 5) & 0x1F;
+            uint32_t b = v & 0x1F;
+            uint32_t a = a1 ? ((v & 0x8000u) ? 0xFFu : 0u) : 0xFFu;
+            px[i] = (a << 24) | ((r * 255u / 31u) << 16) |
+                    ((g * 255u / 31u) << 8) | (b * 255u / 31u);
+        }
         return px;
     }
     case TF_DXT1:

@@ -25,6 +25,7 @@ typedef struct {
 
 static dsbuffer_t *dsb(uint32_t o) { return (dsbuffer_t *)(MEM + o); }
 static uint32_t dsbuffer_create(uint32_t bytes);
+static uint32_t dsbuffer_clone(uint32_t src);
 
 /* ------------------------------------------------------- IDirectSound8 */
 static void ds_QueryInterface(void) { RET32(0); }
@@ -48,7 +49,20 @@ static void ds_CreateSoundBuffer(void)
 }
 
 static void ds_GetCaps(void) { RET32(0); }
-static void ds_DuplicateSoundBuffer(void) { RET32(0x80004001u); }
+static void ds_DuplicateSoundBuffer(void)
+{
+    /* The sound engine duplicates a wave's buffer for each voice (0x41BE20
+     * calls this through vtbl+0x14) and expects the duplicate in the third
+     * argument.  Returning E_NOTIMPL left the voice's buffer pointer at NULL
+     * while the voice was still linked and queued, so the mixer then called
+     * through a NULL vtable (0x41BFB8).  The clone shares the sample memory;
+     * volume/pan/position stay per object. */
+    uint32_t src = arg32(1), ppbuf = arg32(2);
+    uint32_t obj = src ? dsbuffer_clone(src) : dsbuffer_create(0);
+    if (ppbuf)
+        M32(ppbuf) = obj;
+    RET32(0);
+}
 static void ds_SetCooperativeLevel(void) { RET32(0); }
 static void ds_Compact(void) { }
 static void ds_GetSpeakerConfig(void)
@@ -84,7 +98,37 @@ static const method_t dsound_methods[] = {
 };
 
 /* --------------------------------------------------- IDirectSoundBuffer8 */
-static void b_QueryInterface(void) { RET32(0); }
+static int guid_eq(uint32_t p, const uint8_t *g)
+{
+    return p && memcmp(MEM + p, g, 16) == 0;
+}
+static const uint8_t guid_iunknown[16] = {
+    0x00,0x00,0x00,0x00, 0x00,0x00, 0x00,0x00,
+    0xc0,0x00,0x00,0x00,0x00,0x00,0x00,0x46 };
+static const uint8_t guid_dsbuffer[16] = {
+    0x85,0xfa,0x9a,0x27, 0x81,0x49, 0xce,0x11,
+    0xa5,0x21,0x00,0x20,0xaf,0x0b,0xe5,0x60 };
+static const uint8_t guid_dsbuffer8[16] = {
+    0x49,0xa4,0x25,0x68, 0x24,0x75, 0x82,0x4d,
+    0x92,0x00,0x50,0xdc,0x6c,0x4b,0x66,0xe7 };
+
+static void b_QueryInterface(void)
+{
+    uint32_t this_ = arg32(0), riid = arg32(1), ppv = arg32(2);
+    if (ppv)
+        M32(ppv) = 0;
+    if (guid_eq(riid, guid_iunknown) || guid_eq(riid, guid_dsbuffer) ||
+        guid_eq(riid, guid_dsbuffer8)) {
+        if (ppv)
+            M32(ppv) = this_;
+        M32(this_ + 4)++;
+        RET32(0);
+        return;
+    }
+    /* IDirectSoundNotify needs an extra method; the game degrades cleanly
+     * when it is not offered. */
+    RET32(0x80004002u);        /* E_NOINTERFACE */
+}
 static void b_AddRef(void) { M32(arg32(0) + 4)++; RET32(M32(arg32(0) + 4)); }
 static void b_Release(void) { RET32(1); }
 static void b_GetCaps(void) { RET32(0); }
@@ -234,6 +278,22 @@ static uint32_t dsbuffer_create(uint32_t bytes)
     b->data = emu_alloc(b->cap + 64);
     b->volume = 0;
     b->freq = 44100;
+    return obj;
+}
+
+/* Duplicate without allocating sample memory: the clone shares the source's
+ * buffer, exactly what the sound engine uses it for. */
+static uint32_t dsbuffer_clone(uint32_t src_obj)
+{
+    uint32_t obj = com_create_named("IDirectSoundBuffer8", dsbuffer_methods,
+                              (int)(sizeof(dsbuffer_methods) / sizeof(method_t)),
+                              sizeof(dsbuffer_t));
+    dsbuffer_t *d = dsb(obj), *s = dsb(src_obj);
+    d->cap = s->cap;
+    d->data = s->data;
+    d->volume = s->volume;
+    d->pan = s->pan;
+    d->freq = s->freq;
     return obj;
 }
 

@@ -75,6 +75,7 @@ static void g_SelectObject(void)
 
 #define GGO_BITMAP 1u
 #define GGO_NATIVE 2u
+#define GGO_GRAY8_BITMAP 6u
 
 /* One closed rectangle contour, in GDI's native outline format:
  *   TTPOLYGONHEADER { DWORD cb; DWORD dwType = TT_POLYGON_TYPE; POINTFX pfxStart; }
@@ -135,7 +136,7 @@ static void g_GetGlyphOutlineA(void)
     if (w < 2)
         w = 2;
 
-    if (format & GGO_NATIVE) {
+    if (format == GGO_NATIVE) {
         /* Prefer the real font: the game rasterises these outlines into its
          * atlas, so a genuine glyph shape is what makes text readable. */
         uint32_t fsize = 0;
@@ -159,6 +160,8 @@ static void g_GetGlyphOutlineA(void)
             M32(gm + 8) = 0;                    /* gmptGlyphOrigin.y */
             M16(gm + 12) = (uint16_t)(w + 1);   /* gmCellIncX */
             M16(gm + 14) = 0;
+            M16(gm + 16) = (uint16_t)(w + 1);   /* CTexFont advance at +0x10 */
+            M16(gm + 18) = 0;
         }
         gm_mirror(gm, gm2);
         if (!cb || !buf)
@@ -172,7 +175,27 @@ static void g_GetGlyphOutlineA(void)
         return;
     }
 
-    stride = ((w + 31) / 32) * 4;
+    /* GGO_BITMAP (1) and GGO_GRAY8_BITMAP (6): the game's CTexFont asks for
+     * both.  GGO_GRAY8 is the antialiased path (CTexFont+0x38 == 1) and its
+     * buffer is indexed through a palette that only covers 0..64. */
+    if (format == GGO_BITMAP || format == GGO_GRAY8_BITMAP) {
+        uint32_t bsize = 0;
+        int fr = font_glyph_bitmap(0, ch, format, gm, cb, buf, &bsize);
+        if (fr == 1) {
+            gm_mirror(gm, gm2);
+            RET32(bsize);
+            return;
+        }
+        if (fr == 2) {
+            gm_mirror(gm, gm2);
+            RET32(0xFFFFFFFFu);          /* GDI_ERROR: buffer too small */
+            return;
+        }
+        /* no FreeType/font: fall back to the synthetic box below */
+    }
+
+    stride = (format == GGO_GRAY8_BITMAP) ? ((w + 3) & ~3)
+                                         : ((w + 31) / 32) * 4;
     size = stride * h;
 
     if (gm) {
@@ -182,9 +205,11 @@ static void g_GetGlyphOutlineA(void)
         M32(gm + 8) = (uint32_t)(h - 2);    /* gmptGlyphOrigin.y (baseline) */
         M16(gm + 12) = (uint16_t)(w + 1);   /* gmCellIncX */
         M16(gm + 14) = 0;
+        M16(gm + 16) = (uint16_t)(w + 1);   /* CTexFont advance at +0x10 */
+        M16(gm + 18) = 0;
     }
     gm_mirror(gm, gm2);
-    if (format != GGO_BITMAP) {
+    if (format != GGO_BITMAP && format != GGO_GRAY8_BITMAP) {
         RET32(0xFFFFFFFFu);                 /* GDI_ERROR */
         return;
     }
@@ -197,16 +222,25 @@ static void g_GetGlyphOutlineA(void)
         return;
     }
     memset(MEM + buf, 0, (size_t)size);
-    /* 1bpp, MSB first: a box outline so the layout is readable */
-    for (int y = 0; y < h; y++) {
-        uint8_t *row = MEM + buf + (size_t)y * stride;
-        row[0] |= 0x80;
-        row[(w - 1) >> 3] |= (uint8_t)(0x80 >> ((w - 1) & 7));
-    }
-    for (int x = 0; x < w; x++) {
-        MEM[buf + (x >> 3)] |= (uint8_t)(0x80 >> (x & 7));
-        MEM[buf + (size_t)(h - 1) * stride + (x >> 3)] |=
-            (uint8_t)(0x80 >> (x & 7));
+    if (format == GGO_GRAY8_BITMAP) {
+        /* a filled box of GDI's maximum coverage (64 = opaque) */
+        for (int y = 0; y < h; y++) {
+            uint8_t *row = MEM + buf + (size_t)y * stride;
+            for (int x = 0; x < w; x++)
+                row[x] = 64;
+        }
+    } else {
+        /* 1bpp, MSB first: a box outline so the layout is readable */
+        for (int y = 0; y < h; y++) {
+            uint8_t *row = MEM + buf + (size_t)y * stride;
+            row[0] |= 0x80;
+            row[(w - 1) >> 3] |= (uint8_t)(0x80 >> ((w - 1) & 7));
+        }
+        for (int x = 0; x < w; x++) {
+            MEM[buf + (x >> 3)] |= (uint8_t)(0x80 >> (x & 7));
+            MEM[buf + (size_t)(h - 1) * stride + (x >> 3)] |=
+                (uint8_t)(0x80 >> (x & 7));
+        }
     }
     if (g_verbose > 1) {
         static int n;

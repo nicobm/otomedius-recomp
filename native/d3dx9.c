@@ -13,6 +13,7 @@
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #define F(x) M32(x)
 
@@ -429,7 +430,8 @@ static void d3dx_QuaternionSlerp(void)
 }
 
 /* ------------------------------------------------------- textures (DDS) */
-enum { FMT_ARGB = 0, FMT_DXT1, FMT_DXT3, FMT_DXT5, FMT_L8, FMT_A8 };
+enum { FMT_ARGB = 0, FMT_DXT1, FMT_DXT3, FMT_DXT5, FMT_L8, FMT_A8,
+       FMT_A4R4G4B4, FMT_A1R5G5B5, FMT_R5G6B5 };
 
 static void d3dx_GetImageInfoFromFileInMemory(void)
 {
@@ -479,7 +481,19 @@ static int decode_dds(const uint8_t *d, uint32_t size, image_t *out)
         else
             return -1;
     } else {
-        out->fmt = FMT_ARGB;
+        /* SysFont.dds is a 16bpp A4R4G4B4 texture (masks f00/f0/f/f000). */
+        uint32_t bits = d[88] | (d[89] << 8) | (d[90] << 16) | ((uint32_t)d[91] << 24);
+        uint32_t rm = d[92] | (d[93] << 8) | (d[94] << 16) | ((uint32_t)d[95] << 24);
+        uint32_t gm = d[96] | (d[97] << 8) | (d[98] << 16) | ((uint32_t)d[99] << 24);
+        uint32_t bm = d[100] | (d[101] << 8) | (d[102] << 16) | ((uint32_t)d[103] << 24);
+        uint32_t am = d[104] | (d[105] << 8) | (d[106] << 16) | ((uint32_t)d[107] << 24);
+        if (bits == 16 && rm == 0xF00 && gm == 0xF0 && bm == 0xF &&
+            am == 0xF000)
+            out->fmt = FMT_A4R4G4B4;
+        else if (bits == 16 && rm == 0xF800 && gm == 0x7E0 && bm == 0x1F)
+            out->fmt = am ? FMT_A1R5G5B5 : FMT_R5G6B5;
+        else
+            out->fmt = FMT_ARGB;
     }
     return 0;
 }
@@ -506,10 +520,46 @@ static void d3dx_CreateTextureFromFileInMemoryEx(void)
 
 static void d3dx_CreateTextureFromFileExA(void)
 {
-    uint32_t pp = arg32(13);
+    /* D3DXCreateTextureFromFileExA(pDevice, pSrcFile, Width, Height, MipLevels,
+     * Usage, Format, Pool, Filter, MipFilter, ColorKey, pSrcInfo, pPalette,
+     * ppTexture).  The game uses it for the two font atlases
+     * (Data/SysFont.dds and Data/gradius_font.dds); returning S_OK with a NULL
+     * texture left CTexFont with no texels, so all text was drawn untextured. */
+    uint32_t src = arg32(1), pp = arg32(13);
+    uint32_t tex = 0;
     if (pp)
         M32(pp) = 0;
-    RET32(0);
+    if (src && pp) {
+        char *host = win_host_path((const char *)(MEM + src));
+        FILE *fp = host ? fopen(host, "rb") : NULL;
+        free(host);
+        if (fp) {
+            long sz;
+            uint8_t *buf = NULL;
+            fseek(fp, 0, SEEK_END);
+            sz = ftell(fp);
+            fseek(fp, 0, SEEK_SET);
+            if (sz > 0)
+                buf = malloc((size_t)sz);
+            if (buf && fread(buf, 1, (size_t)sz, fp) == (size_t)sz) {
+                image_t img;
+                if (decode_dds(buf, (uint32_t)sz, &img) == 0) {
+                    tex = texture_create(img.w, img.h, 1, 0,
+                                         0x15 /* A8R8G8B8 */, 0);
+                    texture_upload(tex, img.pixels, (uint32_t)sz - 128,
+                                   img.fmt);
+                }
+            }
+            free(buf);
+            fclose(fp);
+            if (!tex)
+                log_printf("d3dx9: D3DXCreateTextureFromFileExA(%s) failed",
+                           (const char *)(MEM + src));
+        }
+    }
+    if (pp)
+        M32(pp) = tex;
+    RET32(tex ? 0 : 0x80004005u);      /* E_FAIL when the file is unusable */
 }
 
 static void d3dx_CreateTexture(void)

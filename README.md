@@ -46,8 +46,8 @@ Version: see [`VERSION`](VERSION).
 | `d3d9`/`d3dx9` objects, math, DDS textures | interfaces verified against `d3d9.h`; texture `LockRect`/upload works by default |
 | `dsound` (device, buffers, lock/play) | interfaces working, silent |
 | `dshow` (opening movie: graph, filter, pin) | interfaces working; the WMV3 intro is decoded with the runtime's ffmpeg and uploaded into the game's own video texture |
-| Fonts / text | **in progress**: FreeType GDI backend (DejaVu Sans by default); the 512×64 font atlas is built and uploaded, but its layout/UV still needs work |
-| Renderer (2D, sprites, playfield) | **in progress**: the game runs its main loop, creates a 1280×1024 device and draws every frame (`BeginScene`/`EndScene`/`Present`), including the 2D console overlay; the sprite/playfield path is still pending |
+| Fonts / text | working: `GGO_GRAY8_BITMAP`/`GGO_BITMAP` implemented; the game's `SysFont.dds`/`gradius_font.dds` atlases are loaded through a real `D3DXCreateTextureFromFileExA` and text is legible |
+| Renderer (2D, sprites, playfield) | 2D path working (signed-area fix in `draw_tri`); the game runs its main loop, creates a 1280×1024 device and draws every frame (`BeginScene`/`EndScene`/`Present`), including the console overlay; the 3D playfield path is still pending |
 | Audio | `dsound` still silent; the intro movie track (WMAv2) plays through SDL3 |
 
 Today the recompiled game boots completely: the MSVC CRT runs, the window is
@@ -66,10 +66,18 @@ played through SDL3, so the intro can be shown (video + sound) with
 `OTOMEDIUS_MOVIE=1` even while the boot sequence is still stuck.
 `Esc` or the window button quits cleanly, also in the middle of the movie.
 
-What is still missing: the exact `CTexFont` atlas layout/UV convention (the
-text is currently rendered as noisy/striped glyphs), the first real scene
-(`Title`/`Warning`/`KonamiLogo` paks), the sprite/playfield renderer, and audio
-output.  The detailed state and the next three steps are in
+The boot/attract state machine now reaches every pre-game scene by itself
+(`KonamiLogo` → `eAMUSELogo` → `Warning` → intro movie → `Title` → attract),
+the intro movie advances on wall-clock time (~60 s), and the text uses the
+game's real font atlases (`SysFont.dds`, `gradius_font.dds`) — the 180°
+rotation that affected every textured quad was a rasteriser bug
+(`fabs(area)` in `draw_tri`), now fixed.
+
+What is still missing: the Konami logo texture does not survive the concurrent
+`KonamiLogoSnd.pak` load (package id 9), `Player02.pak` raises an unhandled SEH
+in the attract loader, the native movie quad still doubles its X scale (the
+port composites the video instead), and the game's `dsound` audio is silent.
+The detailed state and the next three steps are in
 [`docs/HANDOVER.md`](docs/HANDOVER.md).
 
 ## Requirements
@@ -188,6 +196,7 @@ AZERTY, QWERTZ and other layouts.
 | `OTOMEDIUS_MOVIE_PREVIEW=1` | play the intro video on top of the frame, without the game's manager |
 | `OTOMEDIUS_MOVIE_FILE=path` | override the movie file (host path) |
 | `OTOMEDIUS_MOVIE_SIZE=WxH` | override the movie size used by the decoder (default 640x512) |
+| `OTOMEDIUS_NATIVE_MOVIE=1` | leave the movie to the game's own `0x43F540` draw instead of compositing the texture (diagnostic) |
 
 ## License
 

@@ -38,4 +38,14 @@ int font_glyph_outline(uint32_t handle, uint32_t ch, uint32_t format,
                        uint32_t gm, uint32_t cb, uint32_t buf,
                        uint32_t *out_size);
 
+/* GGO_BITMAP (1) / GGO_GRAY8_BITMAP (6).  Renders the glyph with FreeType and
+ * returns the same buffer conventions as GetGlyphOutlineA: GGO_BITMAP is 1bpp
+ * MSB-first with stride ((w+31)/32)*4, GGO_GRAY8 is one byte per pixel with
+ * stride (w+3)&~3, in GDI's 0..64 range (the game maps it through its palette
+ * at CTexFont+0x58).  Returns 1 on success, 2 when the caller's buffer is too
+ * small, 0 when unavailable. */
+int font_glyph_bitmap(uint32_t handle, uint32_t ch, uint32_t format,
+                      uint32_t gm, uint32_t cb, uint32_t buf,
+                      uint32_t *out_size);
+
 #endif /* FONT_H */

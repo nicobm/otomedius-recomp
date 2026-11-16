@@ -190,6 +190,8 @@ OTOMEDIUS_MOVIE_PREVIEW=1        # show the intro over the frame (no manager)
 OTOMEDIUS_MOVIE_FILE=path        # override the movie file (host path)
 OTOMEDIUS_MOVIE_SIZE=WxH         # decoder size (default 640x512)
 OTOMEDIUS_MOVIE_DBG=1            # movie/dshow diagnostics
+OTOMEDIUS_NATIVE_MOVIE=1         # skip the port's video composition, draw the
+                                 # movie with the game's own 0x43F540 quad
 OTOMEDIUS_BOOTDBG=1              # boot/attract state machine + local heap trace
 OTOMEDIUS_QUIT_AT=n              # request quit at present n (shutdown testing)
 ```
@@ -1232,44 +1234,237 @@ M README.md, docs/HANDOVER.md
 
 ---
 
+## 8. Sesión 2026-11-16 (segunda parte): boot completo, texto real y rasterizador
+
+### 8.1 Boot: por qué se quedaba en `state=1 sub=8`
+
+La causa era **el propio workaround de §4.16**, no el juego. `patches.c` forzaba
+`[mgr+0xC] = 1` (state 0 → 1) y limpiaba `0x5DE258` en `state 1 / sub 1`. La
+secuencia real (tabla de estados `0x45598C`, tabla de sub-estados `0x4559A8`
+con 12 entradas) es:
+
+```
+state 0 (0x454893)  sub 0 0x454957  bms_eventlog_request_otdemo + bookkeep +
+                                   alloc 0xC + ctor 0x4399A0 (KonamiLogo)
+                    sub 1 0x4549BD  espera slot258 == 0
+                    sub 2 0x4549CF  alloc 0xC + ctor 0x429860 (eAMUSELogo)
+                    sub 3 0x4549BD  espera
+                    sub 4 0x4549FA  alloc 0xC + ctor 0x45FE40 (Warning)
+                    sub 5 0x4549BD  espera
+                    sub 6 0x454A29  alloc 0xC + ctor 0x43F280 (vídeo)
+                    sub 7 0x454A58  slot258==0 -> state=1, sub=0, io=0
+state 1 (0x454B51)  sub 0 0x454B8C  alloc 0x2C + ctor 0x45EA30 (Title)
+                    sub 1 0x454B62  si slot258==0:
+                                    [0x5E5F0C]==0 -> sub=8 y salta a 0x454DC0
+                                        (fade + state=0, sub=0)
+                                    [0x5E5F0C]!=0 -> state=2, sub=0
+state 2 (0x454BE4)  card entry / eAMUSE / network (sub 0..5)
+state 3 (0x454D95)  warning -> 0x454DC0 -> state=0 sub=0
+state 4 (0x454E43)  resultado de card entry -> state 5 o 6
+state 5 (0x454F1C)  boot del juego / juego; puede ir a state=3 (warning)
+state 6 (0x4553C4)
+```
+
+El dispatch de sub-estados (`0x454950`, `jmp [edx*4+0x4559A8]`) se ejecuta
+**siempre** que `slot258 != 0`, o cuando `[0x5E2136] != 1` (ruta `0x45493B`).
+El parche forzaba `state=1` en la entrada, saltándose el dispatch del estado 0;
+luego `state 1 sub 1` ponía `sub=8` y saltaba a `0x454DC0` (que pone
+`state=0`), y en el frame siguiente el parche volvía a forzar `state=1` con
+`sub=8` → **estado muerto**. Solución: eliminar todos los forzados; el estado
+0 crea KonamiLogo/eAMUSELogo/Warning/vídeo, el 7 pasa a Title, y luego a
+`state=0 sub=8` (manager `0x429210`) y `sub=9..11` (escena/attract).
+
+### 8.2 Loader: tabla de 16 paquetes y commit del id 9
+
+`0x418040` recibe `slot[+4]` como **id de asset/paquete**, no como índice de
+una tabla de 4. `0x4186F0` usa `[esi*4 + 0x5DE098]`; la tabla tiene **16
+entradas** (igual que los 16 slots del ring `0x5DCF98`), y los logos piden el
+id **9**. El guard anterior (`id >= 4 → skip`) tiraba todos los jobs de logo:
+por eso `KonamiLogo.pak` nunca se abría. Corregido a `id >= 16`.
+
+`0x418190` (commit/limpieza del paquete) recorre `vector1` (`pkg+4/+8`), y por
+cada grupo `[grupo]=count` con elementos de **0x44 bytes** (`+0` puntero a
+objeto, `+4` nombre de 0x40) llama `[[obj]+8]` (destructor) y libera. Con
+`Title.pak` hay un record con objeto/vtable NULL → `call [[0]+8]` =
+`no recompiled code at 00000000`. Añadido un escaneo previo en `0x418190` que
+salta el commit sólo si encuentra un record muerto. Para el **paquete 9**
+(assets compartidos de boot/attract: KonamiLogo, eAMUSELogo, Warning, Title)
+el commit se **difiere**: se saltan siempre los commits del id 9 y en la
+entrada de `0x4186F0` se hace `pkg+8 = pkg+4` (descarta el grupo anterior; el
+bloque se deja leakado) **sólo si el stream no es un banco de sonido
+`"SDBK"`**. Esto evita el crash y conserva el grupo para el draw.
+
+### 8.3 Texto: `GGO_GRAY8_BITMAP` + DDS de fuente + bug del rasterizador
+
+Lo implementado en `font.c`:
+
+* `GGO_GRAY8_BITMAP` (6): `FT_Load_Glyph(FT_LOAD_RENDER|FT_LOAD_NO_BITMAP|
+  FT_LOAD_TARGET_NORMAL)`, `stride=(w+3)&~3`, un byte/píxel, cobertura 0..255
+  escalada a **0..64** (`(cov*64+127)/255`). Es obligatorio: `CTexFont+0x58`
+  es una paleta de 256 entradas que sólo define bien 0..64 (medido:
+  `pal[0]=0, pal[1]=3, pal[16]=63, pal[32]=127, pal[48]=191, pal[63]=251,
+  pal[64]=255, pal[65]=255, pal[80]=184, pal[128]=0`). Con 0..255 el atlas
+  salía como ruido.
+* `GGO_BITMAP` (1): 1bpp MSB-first, `stride=((w+31)/32)*4`.
+* `GGO_NATIVE` (2) sólo para `format == 2` (antes `format & 2` capturaba el 6).
+* `GLYPHMETRICS`: `gmBlackBoxX/Y`, `gmptGlyphOrigin`, `gmCellIncX/Y` y
+  **`gm+0x10` = avance** (lo lee `0x409F5E`; el gm local tiene 20 bytes).
+
+La causa de que el texto siguiera roto no era el atlas: **`draw_tri()` en
+`render.c` hacía `area = fabs(area)`**. Los quads del juego llegan en sentido
+horario (área negativa), así que los pesos baricéntricos sumaban −1 y las UV
+salían negadas; con WRAP eso muestrea la celda opuesta (texto roto) y gira
+180° cualquier textura (el logo de eAMUSEMENT). Conservar el signo del área
+arregla **las dos cosas**. Esto afecta a todo el pipeline 2D texturizado.
+
+Las dos texturas de fuente del juego no son el atlas FreeType: `0x401000`
+llama a `D3DXCreateTextureFromFileExA` para `Data/SysFont.dds` (128×128,
+16bpp **A4R4G4B4**, 8×8 por glifo) y `Data/gradius_font.dds` (256×256,
+**DXT5**, celdas 24×24, `cu=cv=0.09375=24/256`). El stub devolvía `S_OK` con
+`ppTexture = NULL` → `[0x5E1F64]/[0x5E1F68] = 0` → `0x5BE7CC/0x5BE7E8` con
+`tex=0` → texto sin textura. `d3dx_CreateTextureFromFileExA` ahora lee el
+fichero con `win_host_path()`, parsea DDS y crea/sube la textura.
+`decode_dds` entiende DXT1/3/5, A8R8G8B8, **A4R4G4B4** (f00/f0/f/f000),
+**A1R5G5B5/R5G6B5** (f800/7e0/1f) y `texture_argb` los decodifica.
+`D3DXGetImageInfoFromFileInMemory` sigue devolviendo w/h + 32 en `+8`; no se
+usa el `Format` para nada crítico.
+
+### 8.4 Vídeo: el `inf` de 0x43F540 y el temporizador de frames
+
+La secuencia x87 de `0x43F540` es realmente:
+
+```
+[esp+0xc]=w(frame) [esp+0x10]=h [esp+0x14]=tex_w [esp+0x18]=tex_h
+fld tex_h; fld st0; fdivr 1280      -> tex_h/...
+fld h;     fld st0; fdivr 1024
+fld tex_w; fld st0; fldz; fld st0
+fdivrp st(2)                        -> 0/tex_w = 0
+...
+fld tex_h; fld st0; fdivr st(2)     -> tex_h / 0 = +inf
+```
+
+El `+inf` entra en la coordenada Y del quad (se veía `(1,inf)-(2561,144)`).
+`patches.c` intercepta `0x41C620` (setup 2D) y convierte a 0 cualquier
+coordenada no finita del struct `[eax+0x10..0x1C]`. El draw nativo queda
+`(1,0)-(2561,1024)` (la X sigue duplicada por el escalado que la pila x87 deja
+para `0x41C500`), y se puede ver con `OTOMEDIUS_NATIVE_MOVIE=1`. Por defecto
+sigue la composición de `render.c` (`movie_draw_tick`), que es la que da el
+vídeo correcto.
+
+El manager de vídeo (`0x43F370`) cuenta 0xDF2 = 3570 *frames* (59.5 s a 60 Hz).
+El port va a ~34 fps (render software + mixer de sonido del juego), así que el
+intro tardaba ~107 s y el último frame quedaba congelado ~47 s. `patches.c`
+intercepta `0x43F370`: en `state 3` añade los ticks de 60 Hz transcurridos
+(`clock_gettime(CLOCK_MONOTONIC)`, redondeo) con clamp a `0xDF1` para que el
+`+1` del juego y su `cmp 0xDF2` sigan disparando. Ahora el intro dura ~60 s.
+
+### 8.5 Sonido: `DuplicateSoundBuffer` y TEB
+
+El motor de sonido duplica el buffer de una onda por voz (`0x41BE20` →
+`IDirectSound8::DuplicateSoundBuffer`, vtbl+0x14) y espera el duplicado en el
+3er argumento. Devolver `E_NOTIMPL` dejaba `[voz+8]=NULL` pero la voz se
+encolaba igualmente, y el mixer llamaba `[[voz+8]]+0x40` (vtable NULL) →
+`0x41BFB8`. Implementado `dsbuffer_clone()` (comparte los samples, sin
+realloc), y `b_QueryInterface` devuelve `this` para IUnknown/
+IDirectSoundBuffer/IDirectSoundBuffer8 y `E_NOINTERFACE` para
+IDirectSoundNotify. El audio del juego sigue mudo (no hay mixer dsound→SDL).
+
+El hilo de audio (`0x41B2A0`) llamaba `TlsGetValue` con TEB inválido y
+petaba en `x86_tls_get`. Añadido `teb_ok()` (rango 0x7FF00000..0x7FFFFFFF) y
+el fallo imprime `x86: TlsGetValue with invalid TEB ...` y devuelve 0.
+También se añadió `backtrace()` + RIP/RSP del `ucontext` al `fault_handler`.
+
+### 8.6 Estado verificado / pendientes
+
+Verificado en headless con `OTOMEDIUS_LOG=1 OTOMEDIUS_BOOTDBG=1`:
+
+* state 0 sub 0→7 (KonamiLogo, eAMUSELogo, Warning, vídeo), `state=1 sub=0`
+  sobre el update #2458, `Title.pak`/`TitleSnd.pak` abiertos, y `state=0
+  sub=8/9` (attract) cargando `Speed.pak`, `Player01.pak`, `Player02.pak`.
+  Sin `no recompiled code` en el tramo de logos/vídeo/Title.
+* `NOW INITIALIZING` y el aviso de “operating in local mode / eAMUSEMENT
+  cannot be used” se dibujan legibles con la fuente real.
+* eAMUSEMENT upright (el DDS `e_logo.dds`, 1024×1024 DXT1, es correcto).
+* Esc a mitad de vídeo / `OTOMEDIUS_QUIT_AT=900` → `exit=0`.
+* `OTOMEDIUS_NO_FREETYPE=1` sigue funcionando (fallback sintético).
+
+Pendiente:
+
+1. **KonamiLogo sigue sin verse en el flujo normal.** Su `konami_logo.dds`
+   (1024×256, **A1R5G5B5**) sí carga si se quita `KonamiLogoSnd.pak`:
+   verificado `pkg9=10069598 vec=169ccf60..169ccf64 rec=100695f8 n=1
+   tex=60930e20`. Con los dos paks, el vector queda `vec=0`: el job de sonido
+   (mismo id 9, stream `SDBK`/`WVBK`) corre concurrente con el del logo y el
+   grupo no llega a añadirse (posible mezcla del estado global de stream
+   `0x5DCF84` o del ring). Los dos `KonamiLogo*.pak` se abren, pero el grupo
+   no persiste. Próximo paso: serializar los jobs por id de paquete (el
+   juego ya intenta un solo worker vía `0x419170` + `WaitForSingleObject(h,0)`;
+   comprobar por qué llegan a arrancar dos `0x419D00` a la vez) **o** capturar
+   el grupo del logo en `0x4186F0`/`0x41DDA0` antes de que el job de sonido
+   lo pise.
+2. `Player02.pak` (attract) provoca `kernel32: unhandled exception` (SEH) y el
+   port sale con `exit=0`. Es el siguiente fallo del loader, no del boot.
+3. Draw nativo del vídeo: la X sigue duplicada por el escalado x87 que
+   `0x41C500` toma de la pila; la composición es el camino por defecto.
+4. El audio del juego (dsound) sigue mudo.
+
+### 8.7 Ficheros de esta sesión
+
+```
+M native/font.c/.h       GGO_GRAY8_BITMAP, GGO_BITMAP, avance en gm+0x10
+M native/win32_misc.c    ruteo por formato exacto + fallback gray8
+M native/d3dx9.c         D3DXCreateTextureFromFileExA real; DDS 16bpp
+M native/d3d9_objects.c  TF_A4R4G4B4, TF_A1R5G5B5, TF_R5G6B5
+M native/render.c        draw_tri: conservar el signo del área (fix 180°)
+                         OTOMEDIUS_NATIVE_MOVIE
+M native/dsound.c        DuplicateSoundBuffer (clone), b_QueryInterface
+M native/patches.c       boot sin forzados; id<16; commit id9 diferido;
+                         guard de records muertos; clamp ±inf en 0x41C620;
+                         temporizador real del vídeo; logs BOOTDBG
+M native/main.c          TEB check en TLS; backtrace + RIP/RSP al fallar
+M README.md, docs/HANDOVER.md
+```
+
 ### Prompt corto para pegar al abrir la sesión nueva
 
 ```
 Contexto: repo /var/home/vm/Proyectos/SALA DE TRABAJO/otomedius-recomp
 (recompilación estática de Otomedius, Flatpak + SDL3). Lee docs/HANDOVER.md
-entero antes de tocar nada (la sesión anterior está en §7).
+entero antes de tocar nada (lo último es §8).
 
-Estado: bezel de la cabina (bezel.png 1920x1080, hueco transparente
-(288,0)-(1631,1079)), fullscreen por defecto y F11 -> 1366x768. El vídeo de
-introducción (Data/OTOMEDIUS_OP_f.wmv, WMV3 640x512 30fps) ya se decodifica
-con el ffmpeg del runtime y se sube a la textura real del TextureRenderer del
-juego (1280x1024 X8R8G8B8); suena el audio (WMAv2 -> SDL3). Se ve con
-OTOMEDIUS_MOVIE=1 (crea el manager 0x43F280). Esc a mitad de vídeo cierra
-limpio. El juego sigue estable.
+Estado: el juego arranca y recorre el boot completo: KonamiLogo ->
+eAMUSELogo -> Warning -> vídeo -> Title -> attract (state 0 sub 8/9). Bezel
+1920x1080, fullscreen por defecto, F11 -> 1366x768. El vídeo de introducción
+(Wmv3 640x512, Data/OTOMEDIUS_OP_f.wmv) se decodifica con ffmpeg, se sube a la
+textura real del TextureRenderer (1280x1024) y suena por SDL3; el manager
+0x43F370 ahora avanza su contador con reloj real (~60 s). El texto se dibuja
+legible con las fuentes reales (SysFont.dds / gradius_font.dds) tras
+implementar D3DXCreateTextureFromFileExA y GGO_GRAY8_BITMAP; el bug que
+giraba todo 180° era fabs(area) en draw_tri() de render.c (ya corregido).
+El logo de eAMUSEMENT sale derecho. El audio del juego (dsound) sigue mudo.
 
-BLOQUEO 1 (boot): 0x4547E0 sigue en state=1 sub=8 con slot258=0. El dispatch
-de sub-estados (0x454950) está en el handler del estado 0 y el del estado 1
-(0x454B51) solo mira sub 0/1 => state=1 sub=8 es muerto. El estado 0 sub 6
-(0x454A29 -> 0x454A4A, ctor 0x43F280) crea el manager del vídeo; el sub 8
-(0x454A74 -> 0x454A95, ctor 0x429210) crea otro manager (vtable 0x55AE88).
-Entender por qué se quedó en state=1/sub=8 y hacer que el boot llegue solo a
-los logos, al warning y al vídeo.
+BLOQUEO ACTIVO: el logo de Konami no se ve en el flujo normal. Su pak
+(konami_logo.dds, 1024x256 A1R5G5B5) sí carga si se quita
+Data/KonamiLogoSnd.pak (verificado: vec=169ccf60..169ccf64, rec=100695f8,
+n=1, tex=60930e20). Con los dos, el job de sonido (mismo id 9, SDBK/WVBK)
+corre concurrente y el vector del paquete queda vacío. El commit del id 9 ya
+se difiere (patches.c 0x418190/0x4186F0); falta que el grupo del logo se
+añada/persista. Comprobar por qué arrancan dos workers 0x419D00 a la vez
+(0x419170 + WaitForSingleObject(h,0)) o capturar el grupo en
+0x41DDA0/0x4186F0. Siguiente fallo: Player02.pak -> unhandled exception SEH.
 
-BLOQUEO 2 (texto): GetGlyphOutlineA fmt=6 = GGO_GRAY8_BITMAP; implementar
-GGO_GRAY8_BITMAP (stride (w+3)&~3) y GGO_BITMAP (1bpp, stride
-((w+31)/32)*4) en font.c, enrutar por formato exacto en win32_misc.c y
-escribir el avance también en gm+0x10 (0x409F5E).
-
-BLOQUEO 3 (quad del vídeo): el draw 0x43F540 del juego genera vértices
-(1,inf)-(2561,1024) (fdiv a cero en x87); el port compone la textura. Revisar
-la secuencia x87/constantes 0x577528/0x577530 para usar el draw nativo.
-
-No reescribas el HANDOVER sin pedirlo. No hagas commits sin pedirlo.
 Build local: sh /tmp/opencode/build.sh <archivo.c ...>; gen:
 PYTHONPATH=../.work/pylib python3 tools/recomp/recomp.py --exe
 ../.work/oto/otomedius.exe --out ../.work/gen --chunk 60; run:
 cd ../.work/oto && ../obj/otomedius-recomp .
+Vídeo local: LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/codecs-extra/lib
+OTOMEDIUS_MOVIE=1 OTOMEDIUS_DUMP_FB=/tmp/opencode/v.ppm OTOMEDIUS_DUMP_AT=900
+../obj/otomedius-recomp .
+
+No reescribas el HANDOVER sin pedirlo. No hagas commits sin pedirlo.
 ```
+
+---
 
 ### Atribución
 

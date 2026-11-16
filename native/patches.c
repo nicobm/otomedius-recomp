@@ -8,7 +8,11 @@
  * Everything is documented individually so the list stays auditable.
  */
 
+#define _GNU_SOURCE
 #include "win32.h"
+
+#include <time.h>
+#include <string.h>
 
 /* 0x40ED00 - file integrity check.
  *
@@ -41,11 +45,19 @@ int x86_patch_call(uint32_t addr)
         if (addr == 0x4547E0u) {
             uint32_t mgr = M32(0x5DE24Cu);
             static unsigned calls;
-            if (mgr && (calls++ % 60) == 0)
-                fprintf(stderr, "bootdbg: update #%u state=%u sub=%u io=%u "
-                        "slot258=%08x mask220=%08x mask224=%08x\n", calls,
-                        M8(mgr + 0xCu), M8(mgr + 0xDu), M8(0x5E2136u),
-                        M32(0x5DE258u), M32(0x5DE220u), M32(0x5DE224u));
+            static int last_state = -1, last_sub = -1;
+            if (mgr) {
+                int st = M8(mgr + 0xCu), sb = M8(mgr + 0xDu);
+                if (st != last_state || sb != last_sub) {
+                    fprintf(stderr, "bootdbg: update #%u state=%u sub=%u io=%u "
+                            "slot258=%08x mask220=%08x mask224=%08x\n", calls,
+                            st, sb, M8(0x5E2136u),
+                            M32(0x5DE258u), M32(0x5DE220u), M32(0x5DE224u));
+                    last_state = st;
+                    last_sub = sb;
+                }
+                calls++;
+            }
         } else if (addr == 0x4142B0u) {
             uint32_t desc = M32(cpu->esp + 4u), size = M32(cpu->esp + 8u);
             fprintf(stderr, "bootdbg: MallocLocal(%u) desc=%08x first=%08x "
@@ -54,6 +66,19 @@ int x86_patch_call(uint32_t addr)
         } else if (addr == 0x429210u) {
             fprintf(stderr, "bootdbg: manager ctor this=%08x slot258=%08x\n",
                     cpu->esi, M32(0x5DE258u));
+        } else if (addr == 0x439BB0u) {
+            uint32_t pkg = M32(0x5DE0BCu);
+            static int n;
+            if (n++ < 6) {
+                uint32_t beg = pkg ? M32(pkg + 4u) : 0;
+                uint32_t end = pkg ? M32(pkg + 8u) : 0;
+                uint32_t rec = (beg && beg < end) ? M32(beg) : 0;
+                uint32_t objs = rec ? M32(rec) : 0;
+                uint32_t tex = (rec && objs) ? M32(rec + 4u) : 0;
+                fprintf(stderr, "bootdbg: konami logo pkg=%08x vec=%08x..%08x "
+                        "rec=%08x n=%u tex=%08x\n", pkg, beg, end, rec, objs,
+                        tex);
+            }
         } else if (addr == 0x417750u) {
             uint32_t pmt = M32(cpu->esp + 4u);
             uint32_t pb = pmt ? M32(pmt + 0x44u) : 0;
@@ -74,16 +99,14 @@ int x86_patch_call(uint32_t addr)
         cpu->esp += 4;
         return 1;
     case 0x418040u:                  /* load-job executor (cdecl, 2 args) */
-        /* The ring worker passes slot[+4] as the "job id", and downstream
-         * code uses it as an index into the 4-entry package registry
-         * (0x5DE098).  Our emulated ring occasionally hands it a value such
-         * as 16 (the slot count, not a package), which reads outside that
-         * table and ends in a call through an invalid vtable pointer in
-         * 0x418190.  Report "job not performed" (al = 0) for ids that cannot
-         * name a package; the worker then just frees the slot. */
+        /* The ring stores one asset/package id per slot (0x419170 writes it
+         * at slot+4 and 0x419D00 passes it here).  0x4186F0 uses that id as
+         * an index into the 16-entry package table at 0x5DE098 (the same
+         * count as the ring slots at 0x5DCF98).  The intro logos request
+         * ids such as 9, so only reject ids that fall outside the table. */
         {
             uint32_t id = M32(cpu->esp + 4u);
-            if (id >= 4u) {
+            if (id >= 16u) {
                 static int fired;
                 if (!fired++)
                     fprintf(stderr, "config: loader job id %u out of range, "
@@ -95,48 +118,81 @@ int x86_patch_call(uint32_t addr)
             }
         }
         return 0;
+    case 0x4186F0u:                  /* pak parse (cdecl: id, header/name, ...) */
+        /* Before a new package-9 asset is parsed, drop the pointer to the
+         * previous scene's group (the block itself is leaked on purpose; the
+         * vector keeps its capacity so the game's append path is unchanged).
+         * Sound banks ("SDBK") share the id and must not clear it. */
+        if (M32(cpu->esp + 4u) == 9u) {
+            uint32_t hdr = M32(cpu->esp + 8u);
+            uint32_t pkg = M32(0x5DE0BCu);
+            int snd = hdr && !memcmp(MEM + hdr, "SDBK", 4);
+            if (!snd && pkg && M32(pkg + 4u))
+                M32(pkg + 8u) = M32(pkg + 4u);
+        }
+        return 0;
     case 0x418190u:                  /* package lookup/commit (cdecl, 1 arg) */
-        /* arg = package index into the four-entry table at 0x5DE098.  When
-         * the emulated loader hands us an out-of-range value (e.g. 16) the
-         * lookup reads past the table and ends in a call through an invalid
-         * vtable pointer.  Do nothing for such an index. */
-        /* The commit walks the package's C++ record vector and eventually
-         * calls a virtual method; our emulated loader leaves that vector in a
-         * state the game's own code cannot walk (the same reason the later
-         * 0x414920 finalise is skipped).  The load itself (file mapping) has
-         * already happened in 0x418040, so skipping the commit is safe and
-         * keeps the worker from dereferencing a stale vtable. */
+        /* With the correct id range the package vector is the one the loader
+         * has just filled (0x4185B0/0x4186F0), so let the original commit run
+         * and register the loaded objects in the game's asset tables.  Some
+         * jobs (Title.pak) leave a record whose object/vtable is NULL; the
+         * release loop at 0x418228 then does `call [[obj]+8]` through NULL.
+         * Detect that shape first and skip only those commits. */
         {
-            static int fired;
-            if (!fired++)
-                fprintf(stderr, "config: skipping the package commit step\n");
-            cpu->eax = 0;
-            cpu->eip = M32(cpu->esp);
-            cpu->esp += 4;
-            return 1;
-        }
-    case 0x4547E0u:                  /* boot/attract manager update */
-        /* Its state machine crashes in the CRT while building a path before
-         * it reaches the KonamiLogo hand-off.  The logo manager itself is
-         * alive and is driven by the OTOMEDIUS_KONAMI hook in render.c, so
-         * keep this manager alive but do not run its state machine. */
-        if (!getenv("OTOMEDIUS_KONAMI")) {
-            /* The state machine waits for the cabinet I/O board to report
-             * ready ([0x5E2136] == 1) before it advances to the logo.  Our
-             * AVS stubs never set that bit, so force it. */
-            M8(0x5E2136u) = 1;
-            {
-                uint32_t mgr = M32(0x5DE24Cu);
-                if (mgr && M8(mgr + 0xCu) == 0)
-                    M8(mgr + 0xCu) = 1;   /* skip the "wait for I/O" state */
-                /* State 1 sub-state 1 waits for the boot/attract manager slot
-                 * (0x5DE258) to be empty before creating it.  Our scene
-                 * manager pointer ends up there, so clear it. */
-                if (M8(mgr + 0xCu) == 1 && M8(mgr + 0xDu) == 1)
-                    M32(0x5DE258u) = 0;
+            uint32_t id = M32(cpu->esp + 4u);
+            /* Package 9 is the shared "boot/attract" asset package: every
+             * logo/warning/title load appends a texture group and the commit
+             * at the end of the job would free it again before the manager
+             * draws (KonamiLogo.pak and KonamiLogoSnd.pak even run as two
+             * concurrent jobs on the same id, and the sound job's commit
+             * wiped the logo group).  Keep the group alive; the next load
+             * for id 9 drops the previous one at 0x4186F0. */
+            if (id == 9u) {
+                cpu->eax = 0;
+                cpu->eip = M32(cpu->esp);
+                cpu->esp += 4;
+                return 1;
             }
-            return 0;
+            uint32_t pkg = id < 16u ? M32(0x5DE098u + id * 4u) : 0;
+            uint32_t beg = pkg ? M32(pkg + 4u) : 0;
+            uint32_t end = pkg ? M32(pkg + 8u) : 0;
+            int bad = 0;
+            for (uint32_t q = beg; q && q + 4u <= end && !bad; q += 4u) {
+                uint32_t grp = M32(q);
+                uint32_t n = grp ? M32(grp) : 0;
+                if (!grp || n > 4096u) {
+                    bad = 1;
+                    break;
+                }
+                for (uint32_t i = 0; i < n; i++) {
+                    uint32_t obj = M32(grp + 4u + i * 0x44u);
+                    if (!obj || !M32(obj)) {
+                        bad = 1;
+                        break;
+                    }
+                }
+            }
+            if (bad) {
+                static int fired;
+                if (!fired++)
+                    fprintf(stderr, "config: package %u has a dead record, "
+                            "skipping the commit step\n", id);
+                cpu->eax = 0;
+                cpu->eip = M32(cpu->esp);
+                cpu->esp += 4;
+                return 1;
+            }
         }
+        return 0;
+    case 0x4547E0u:                  /* boot/attract manager update */
+        /* OTOMEDIUS_KONAMI=1 skips the real state machine and lets the
+         * OTOMEDIUS_KONAMI hook in render.c drive the logo manager directly
+         * (kept as a diagnostic).  Otherwise run the original state machine:
+         * its state 0 creates the pre-logo managers in sequence (KonamiLogo,
+         * eAMUSELogo, Warning, intro movie), state 1 creates the title scene
+         * and the later states handle card entry / the main game. */
+        if (!getenv("OTOMEDIUS_KONAMI"))
+            return 0;
         cpu->eax = 1;
         cpu->eip = M32(cpu->esp);
         cpu->esp += 4;
@@ -213,6 +269,59 @@ int x86_patch_call(uint32_t addr)
                 cpu->esp += 4;
                 return 1;
             }
+        }
+        return 0;
+    case 0x41C620u:                  /* 2D quad setup (source rect -> vertices) */
+        /* The movie callback (0x43F540) computes its source rectangle with an
+         * x87 sequence that divides by zero twice: it evaluates 0/scale and
+         * then scale2/0, so one of the four coordinates is +inf.  The result
+         * is the degenerate quad (1,inf)-(2561,144) documented in §7.2.
+         * Clamp the non-finite entries to 0 before the game builds its
+         * vertices, so the game's own draw produces a sane rectangle. */
+        {
+            uint32_t s = cpu->eax;
+            if (s) {
+                float *f = (float *)(MEM + s + 0x10u);
+                int fixed = 0;
+                for (int i = 0; i < 4; i++) {
+                    if (!__builtin_isfinite(f[i])) {
+                        f[i] = 0.0f;
+                        fixed = 1;
+                    }
+                }
+                if (fixed) {
+                    static int fired;
+                    if (g_verbose && !fired++)
+                        fprintf(stderr, "config: movie quad had a non-finite "
+                                "coordinate, clamped to 0\n");
+                }
+            }
+        }
+        return 0;
+    case 0x43F370u:                  /* movie player manager update */
+        /* State 3 counts 0xDF2 (3570) updates, i.e. 59.5 s at the arcade's
+         * 60 Hz.  This port runs the 2D software renderer plus the game's
+         * sound mixer at ~34 fps, so the counter would take ~107 s and the
+         * already-finished intro would stay on its last frame for another
+         * ~47 s.  Feed the counter the elapsed wall-clock ticks (in 1/60 s)
+         * so the movie closes in step with the 60 s WMV.  Clamp to 0xDF1 so
+         * the manager's own "+1 / cmp 0xDF2" still fires exactly. */
+        if (cpu->ecx && M8(cpu->ecx + 0xAu) == 3) {
+            static uint64_t last_ms;
+            struct timespec ts;
+            uint64_t now;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            now = (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+            if (last_ms && now > last_ms) {
+                uint32_t ticks = (uint32_t)(((now - last_ms) * 60u + 500u) / 1000u);
+                if (ticks > 1) {
+                    uint32_t t = (uint32_t)M16(cpu->ecx + 8u) + ticks - 1u;
+                    if (t >= 0xDF2u)
+                        t = 0xDF1u;
+                    M16(cpu->ecx + 8u) = (uint16_t)t;
+                }
+            }
+            last_ms = now;
         }
         return 0;
     case 0x419E30u:                  /* "may the job executor run?" gate */

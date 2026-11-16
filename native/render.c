@@ -125,8 +125,11 @@ static void draw_tri(const svtx_t *a, const svtx_t *b, const svtx_t *c,
     area = (b->x - a->x) * (c->y - a->y) - (b->y - a->y) * (c->x - a->x);
     if (area > -0.0001f && area < 0.0001f)
         return;                       /* degenerate */
-    if (area < 0)
-        area = -area;
+    /* Keep the SIGN.  The game submits clockwise quads (negative area); using
+     * fabs() made the barycentric weights sum to -1, so every interpolated
+     * UV/colour came out negated.  With WRAP addressing that flipped textured
+     * quads by 180 degrees (the eAMUSE logo) and sampled the wrong atlas cell
+     * for text. */
 
     x0 = (int)minx; y0 = (int)miny;
     x1 = (int)(maxx + 0.999f); y1 = (int)(maxy + 0.999f);
@@ -403,6 +406,10 @@ static void movie_draw_tick(void)
     const char *preview = getenv("OTOMEDIUS_MOVIE_PREVIEW");
 
     if (!g_fb)
+        return;
+    /* Diagnostic: OTOMEDIUS_NATIVE_MOVIE=1 leaves the movie to the game's own
+     * draw callback (0x43F540) instead of compositing the texture here. */
+    if (getenv("OTOMEDIUS_NATIVE_MOVIE"))
         return;
     if (preview) {
         if (!preview_started && M32(0x5E1F20u)) {
