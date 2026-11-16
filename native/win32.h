@@ -46,6 +46,8 @@ uint32_t win_last_error(void);
  * directory.  Returns a host malloc'd string. */
 char *win_host_path(const char *guest);
 const char *win_game_dir(void);
+/* CP932 (Shift-JIS) -> UTF-8 for log messages; returns dst. */
+const char *win_sjis_to_utf8(const char *src, char *dst, size_t cap);
 
 /* Window / message plumbing (user32.c) */
 void  win_request_quit(void);

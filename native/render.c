@@ -10,6 +10,7 @@
 #include "win32.h"
 #include "d3d9.h"
 #include "platform.h"
+#include "movie.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -350,8 +351,138 @@ static void konami_logo_tick(void)
     x86_call_stdcall(0x4395B0u, NULL, 0);
 }
 
+/* OTOMEDIUS_MOVIE=1 creates the game's movie-player manager - the object the
+ * boot state machine builds at 0x454A4A (alloc 0xC + ctor 0x43F280) - so the
+ * opening video can be exercised while the boot sequence is still stuck.  Its
+ * update opens the DirectShow graph and its draw callback (0x43F540) samples
+ * the video texture, which dshow_movie_tick() fills from the ffmpeg decoder. */
+void dshow_movie_tick(void);
+
+static void movie_manager_tick(void)
+{
+    extern uint32_t x86_call_stdcall(uint32_t, const uint32_t *, int);
+    cpu_t *cpu = x86_cpu();
+    static int done;
+    uint32_t args[2];
+
+    if (done || !getenv("OTOMEDIUS_MOVIE"))
+        return;
+    if (!M32(0x5E1F20u))            /* wait for the D3D device */
+        return;
+    done = 1;
+    if (M32(0x5DE258u)) {
+        fprintf(stderr, "movie: manager slot 0x5DE258 is busy (%08x)\n",
+                M32(0x5DE258u));
+        return;
+    }
+    args[0] = 0x5E1F28u;
+    args[1] = 0x0Cu;
+    cpu->eax = x86_call_stdcall(0x4142B0u, args, 2);
+    if (!cpu->eax) {
+        fprintf(stderr, "movie: local-heap alloc of the manager failed\n");
+        return;
+    }
+    cpu->esi = cpu->eax;
+    x86_call_stdcall(0x43F280u, NULL, 0);
+    fprintf(stderr, "movie: player manager %08x, slot 0x5DE258=%08x\n",
+            cpu->esi, M32(0x5DE258u));
+}
+
+/* Draw the movie the game's TextureRenderer produced.  Its own draw callback
+ * (0x43F540) builds a degenerate quad in this port - the computed vertices are
+ * (1,inf)-(2561,1024), i.e. the y scale divides by zero - so the port
+ * composites the already-uploaded video texture into the software framebuffer
+ * with the same fade colour the game uses ([0x5DE224], fully white during the
+ * fade-in/out).  OTOMEDIUS_MOVIE_PREVIEW=1 shows the movie on its own, without
+ * the game's manager. */
+static void movie_draw_tick(void)
+{
+    static int preview_started;
+    uint32_t wrap, filter, tex = 0, tw = 0, th = 0, fade, alpha, base;
+    const uint32_t *px = NULL;
+    const char *preview = getenv("OTOMEDIUS_MOVIE_PREVIEW");
+
+    if (!g_fb)
+        return;
+    if (preview) {
+        if (!preview_started && M32(0x5E1F20u)) {
+            char path[4096];
+            preview_started = 1;
+            snprintf(path, sizeof(path), "%s/Data/OTOMEDIUS_OP_f.wmv",
+                     win_game_dir());
+            if (movie_open(path, 640, 512, 30) != 0)
+                fprintf(stderr, "movie: preview could not start the decoder\n");
+        }
+        if (movie_active() && movie_frame(g_fb, g_fb_w, g_fb_h))
+            return;
+    }
+    /* Only while the game's movie-player manager owns slot 0x5DE258 (vtable
+     * 0x55E904).  The startup probe (0x417480) also builds a graph and a
+     * texture; without this check the video would flash during boot. */
+    {
+        uint32_t mgr = M32(0x5DE258u);
+        if (!mgr || M32(mgr) != 0x55E904u)
+            return;
+    }
+    if (!movie_active())
+        return;
+    wrap = M32(0x5DCF88u);
+    filter = wrap ? M32(wrap + 0x10u) : 0;
+    tex = filter ? M32(filter + 0x160u) : 0;
+    if (!tex)
+        return;
+    px = texture_argb(tex, &tw, &th);
+    if (!px || !tw || !th)
+        return;
+    fade = M32(0x5DE224u);
+    alpha = fade >> 24;
+    base = fade & 0x00FFFFFFu;
+    if (!alpha && tw == (uint32_t)g_fb_w && th == (uint32_t)g_fb_h) {
+        memcpy(g_fb, px, (size_t)g_fb_w * (size_t)g_fb_h * 4u);
+        return;
+    }
+    /* [0x5DE224] is shared with the attract manager, which sets it opaque
+     * white when it is constructed.  Only the movie player's own fade phases
+     * (state 2 = fade in, state 4 = fade out) should dim the picture. */
+    {
+        uint32_t mgr = M32(0x5DE258u);
+        uint32_t state = mgr ? M8(mgr + 0xAu) : 0;
+        if (state != 2 && state != 4)
+            alpha = 0;
+    }
+    for (int y = 0; y < g_fb_h; y++) {
+        uint32_t sy = (uint32_t)((uint64_t)y * th / (uint32_t)g_fb_h);
+        const uint32_t *s = px + (size_t)sy * tw;
+        uint32_t *d = (uint32_t *)g_fb + (size_t)y * g_fb_w;
+        for (int x = 0; x < g_fb_w; x++) {
+            uint32_t tx = (uint32_t)((uint64_t)x * tw / (uint32_t)g_fb_w);
+            uint32_t c = s[tx] | 0xFF000000u;
+            if (alpha) {
+                uint32_t r = (((c >> 16) & 0xFF) * (255 - alpha) +
+                              ((base >> 16) & 0xFF) * alpha) / 255u;
+                uint32_t g = (((c >> 8) & 0xFF) * (255 - alpha) +
+                              ((base >> 8) & 0xFF) * alpha) / 255u;
+                uint32_t b = ((c & 0xFF) * (255 - alpha) +
+                              (base & 0xFF) * alpha) / 255u;
+                c = 0xFF000000u | (r << 16) | (g << 8) | b;
+            }
+            d[x] = c;
+        }
+    }
+}
+
 void render_present(void)
 {
+    /* Diagnostic: OTOMEDIUS_QUIT_AT=n requests a clean quit at present n, so
+     * the shutdown path can be exercised without a window. */
+    if (getenv("OTOMEDIUS_QUIT_AT") &&
+        g_stat.presents == (unsigned)atoi(getenv("OTOMEDIUS_QUIT_AT"))) {
+        fprintf(stderr, "render: requesting quit at present %u\n",
+                g_stat.presents);
+        win_request_quit();
+    }
+    movie_manager_tick();
+    dshow_movie_tick();
     konami_logo_tick();
     /* Renderer smoke test: OTOMEDIUS_TEST_QUAD=1 draws a full-screen quad with
      * the currently bound texture, through the same software path the game
@@ -409,6 +540,7 @@ void render_present(void)
         draw_up_vertices(5, 2, buf, 28);
     }
 test_done:
+    movie_draw_tick();
     g_stat.presents++;
     if (g_verbose && (g_stat.presents % 120) == 0)
         fprintf(stderr,

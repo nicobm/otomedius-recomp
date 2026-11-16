@@ -13,7 +13,7 @@ static void misc_stub(void) { RET32(0); }
 /* Log helper: the game passes Shift-JIS face names, which look like garbage in
  * a UTF-8 terminal.  Convert CP932 -> UTF-8 for the message, fall back to a
  * plain marker when iconv cannot do it. */
-static const char *sjis_to_utf8(const char *src, char *dst, size_t cap)
+const char *win_sjis_to_utf8(const char *src, char *dst, size_t cap)
 {
     iconv_t cd = iconv_open("UTF-8", "CP932");
     char *in = (char *)src;
@@ -57,7 +57,7 @@ static void g_CreateFontA(void)
         char face[128];
         const char *f = arg_str(13);
         log_printf("gdi32: CreateFontA(h=%d face=%s)", h,
-                   f ? sjis_to_utf8(f, face, sizeof(face)) : "?");
+                   f ? win_sjis_to_utf8(f, face, sizeof(face)) : "?");
     }
     fh = font_create(g_font_h, arg_str(13));
     RET32(fh ? fh : 0x0F000001u);
@@ -299,7 +299,17 @@ static void o_CoCreateInstance(void)
 }
 static void o_CoInitialize(void) { RET32(0); }
 static void o_CoFreeUnusedLibraries(void) { }
-static void o_CoTaskMemAlloc(void) { RET32(0); }
+static void o_CoTaskMemAlloc(void)
+{
+    /* DirectShow copies every accepted media type with CoTaskMemAlloc
+     * (0x52DA30 in the game's filter).  Returning NULL here made the movie
+     * renderer fail with E_OUTOFMEMORY before it ever created its texture. */
+    extern uint32_t emu_alloc(uint32_t size);
+    uint32_t size = arg32(0);
+    if (!size)
+        size = 1;
+    RET32(emu_alloc(size));
+}
 static void o_CoUninitialize(void) { }
 static void o_SysAllocString(void) { RET32(0); }
 static void o_SysFreeString(void) { }

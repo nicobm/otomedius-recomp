@@ -45,10 +45,10 @@ Version: see [`VERSION`](VERSION).
 | `user32` window + message loop | minimal |
 | `d3d9`/`d3dx9` objects, math, DDS textures | interfaces verified against `d3d9.h`; texture `LockRect`/upload works by default |
 | `dsound` (device, buffers, lock/play) | interfaces working, silent |
-| `dshow` (opening movie: graph, filter, pin) | interfaces working, video skipped |
+| `dshow` (opening movie: graph, filter, pin) | interfaces working; the WMV3 intro is decoded with the runtime's ffmpeg and uploaded into the game's own video texture |
 | Fonts / text | **in progress**: FreeType GDI backend (DejaVu Sans by default); the 512×64 font atlas is built and uploaded, but its layout/UV still needs work |
 | Renderer (2D, sprites, playfield) | **in progress**: the game runs its main loop, creates a 1280×1024 device and draws every frame (`BeginScene`/`EndScene`/`Present`), including the 2D console overlay; the sprite/playfield path is still pending |
-| Audio (`dsound` → PulseAudio) | **not started** |
+| Audio | `dsound` still silent; the intro movie track (WMAv2) plays through SDL3 |
 
 Today the recompiled game boots completely: the MSVC CRT runs, the window is
 created, a Direct3D 9 device is created with valid caps at **1280×1024**,
@@ -56,7 +56,15 @@ DirectSound 8 comes up, the opening movie's filter graph is driven, the Konami
 I/O board answers its boot handshake and the game enters its main loop.  The
 x87 emulation was corrected (`fxch`/pop arithmetic), the software rasteriser
 draws the 2D console overlay, and the real font atlas is generated with
-FreeType and uploaded.  `Esc` or the window button quits cleanly.
+FreeType and uploaded.  When the dump ships the cabinet art (`bezel.png`), the
+game opens fullscreen with the arcade bezel on the sides and the frame fitted
+into its transparent screen hole (`F11` goes to a 1366×768 window).  The
+opening WMV3 movie is decoded by the runtime's `ffmpeg` (the `codecs-extra`
+runtime extension supplies the WMV3 decoder) and uploaded into the video
+texture the game's own DirectShow renderer creates, with its WMAv2 audio
+played through SDL3, so the intro can be shown (video + sound) with
+`OTOMEDIUS_MOVIE=1` even while the boot sequence is still stuck.
+`Esc` or the window button quits cleanly, also in the middle of the movie.
 
 What is still missing: the exact `CTexFont` atlas layout/UV convention (the
 text is currently rendered as noisy/striped glyphs), the first real scene
@@ -113,6 +121,7 @@ what the sandbox is allowed to access.
 | Special | V or I | Y (north) |
 | Start | Enter | Start |
 | Coin | 5 or 6 | Back |
+| Fullscreen | F11 | — |
 | Quit | Esc | — |
 
 Letter keys are read by physical position, so they stay in the same place on
@@ -171,6 +180,14 @@ AZERTY, QWERTZ and other layouts.
 | `OTOMEDIUS_CHKSUM=1` | keep the original `ChkSum.bin` integrity gate |
 | `OTOMEDIUS_AUTOCOIN=1` | pulse the coin line every 2 s (input testing) |
 | `OTOMEDIUS_BADTARGET=skip` | report missing functions instead of aborting |
+| `OTOMEDIUS_BEZEL=path` | cabinet artwork (default: `bezel.png` next to the game) |
+| `OTOMEDIUS_BEZEL=0` | disable the cabinet artwork |
+| `OTOMEDIUS_WINDOWED=1` | start in a window instead of fullscreen |
+| `OTOMEDIUS_FULLSCREEN=1` | force fullscreen when there is no bezel |
+| `OTOMEDIUS_MOVIE=1` | create the game's movie-player manager and show the intro video |
+| `OTOMEDIUS_MOVIE_PREVIEW=1` | play the intro video on top of the frame, without the game's manager |
+| `OTOMEDIUS_MOVIE_FILE=path` | override the movie file (host path) |
+| `OTOMEDIUS_MOVIE_SIZE=WxH` | override the movie size used by the decoder (default 640x512) |
 
 ## License
 

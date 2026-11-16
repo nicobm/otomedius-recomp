@@ -69,7 +69,32 @@ static void t_GetLevel(void)
     RET32(0);
 }
 
-static void t_GetLevelDesc(void) { RET32(0); }
+static void t_GetLevelDesc(void)
+{
+    /* IDirect3DTexture9::GetLevelDesc(Level, D3DSURFACE_DESC *desc).
+     * The movie renderer asks for the level description and only accepts a
+     * texture whose format is X8R8G8B8 (0x16) or A8R8G8B8 (0x19); a stub that
+     * left the structure zeroed made every video media type be rejected with
+     * VFW_E_TYPE_NOT_ACCEPTED. */
+    uint32_t self = arg32(0), desc = arg32(2);
+    texture_t *t = tex(self);
+    if (!t || !desc) {
+        RET32(0x8876086Au);
+        return;
+    }
+    M32(desc + 0) = t->format;      /* Format */
+    M32(desc + 4) = 1;              /* Type = D3DRTYPE_TEXTURE */
+    M32(desc + 8) = t->usage;       /* Usage */
+    M32(desc + 12) = t->pool;       /* Pool */
+    M32(desc + 16) = 0;             /* MultiSampleType */
+    M32(desc + 20) = 0;             /* MultiSampleQuality */
+    M32(desc + 24) = t->w;          /* Width */
+    M32(desc + 28) = t->h;          /* Height */
+    if (getenv("OTOMEDIUS_MOVIE_DBG"))
+        fprintf(stderr, "d3d9: GetLevelDesc(%08x) fmt=%x %ux%u -> %08x\n",
+                self, t->format, t->w, t->h, desc);
+    RET32(0);
+}
 /* IDirect3DTexture9::LockRect(Level, D3DLOCKED_RECT *locked, RECT *rect,
  * DWORD flags) - the game uploads every texture by locking it and copying its
  * decoded pixels in, so returning D3DERR_INVALIDCALL here left every texture

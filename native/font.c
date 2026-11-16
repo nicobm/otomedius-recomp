@@ -273,9 +273,12 @@ uint32_t font_create(int height, const char *face)
         g_fonts[i].face = f;
         g_fonts[i].height = height;
         g_fonts[i].handle = FONT_HANDLE_BASE + (uint32_t)i;
-        if (g_verbose)
+        if (g_verbose) {
+            char shown[128];
             fprintf(stderr, "font: CreateFontA(h=%d face=%s) -> %08x\n",
-                    height, face ? face : "?", g_fonts[i].handle);
+                    height, face ? win_sjis_to_utf8(face, shown, sizeof(shown))
+                                 : "?", g_fonts[i].handle);
+        }
         FONT_UNLOCK();
         return g_fonts[i].handle;
     }

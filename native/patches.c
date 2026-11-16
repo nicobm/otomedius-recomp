@@ -34,6 +34,37 @@ int x86_patch_call(uint32_t addr)
 {
     cpu_t *cpu = x86_cpu();
 
+    /* OTOMEDIUS_BOOTDBG=1 traces the boot/attract hand-off: the state and
+     * sub-state of the manager, the local-heap allocator and the manager
+     * constructor that registers in slot 0x5DE258. */
+    if (getenv("OTOMEDIUS_BOOTDBG")) {
+        if (addr == 0x4547E0u) {
+            uint32_t mgr = M32(0x5DE24Cu);
+            static unsigned calls;
+            if (mgr && (calls++ % 60) == 0)
+                fprintf(stderr, "bootdbg: update #%u state=%u sub=%u io=%u "
+                        "slot258=%08x mask220=%08x mask224=%08x\n", calls,
+                        M8(mgr + 0xCu), M8(mgr + 0xDu), M8(0x5E2136u),
+                        M32(0x5DE258u), M32(0x5DE220u), M32(0x5DE224u));
+        } else if (addr == 0x4142B0u) {
+            uint32_t desc = M32(cpu->esp + 4u), size = M32(cpu->esp + 8u);
+            fprintf(stderr, "bootdbg: MallocLocal(%u) desc=%08x first=%08x "
+                    "name=%08x\n", size, desc, desc ? M32(desc + 4u) : 0,
+                    desc ? M32(desc) : 0);
+        } else if (addr == 0x429210u) {
+            fprintf(stderr, "bootdbg: manager ctor this=%08x slot258=%08x\n",
+                    cpu->esi, M32(0x5DE258u));
+        } else if (addr == 0x417750u) {
+            uint32_t pmt = M32(cpu->esp + 4u);
+            uint32_t pb = pmt ? M32(pmt + 0x44u) : 0;
+            fprintf(stderr, "bootdbg: renderer SetMediaType(pmt=%08x pb=%08x "
+                    "%dx%d cb=%u)\n", pmt, pb,
+                    pb ? (int)M32(pb + 0x34u) : 0,
+                    pb ? (int)M32(pb + 0x38u) : 0,
+                    pmt ? M32(pmt + 0x40u) : 0);
+        }
+    }
+
     switch (addr) {
     case 0x40ED00u:                  /* verify one ChkSum.bin entry */
         if (!skip_chksum())
@@ -107,6 +138,42 @@ int x86_patch_call(uint32_t addr)
             return 0;
         }
         cpu->eax = 1;
+        cpu->eip = M32(cpu->esp);
+        cpu->esp += 4;
+        return 1;
+    case 0x4050B0u:                  /* release the two sound/texture slots */
+        /* The shutdown path releases the objects in 0x5E1F88 / 0x5E1F8C and
+         * then frees the holders.  When the intro movie is interrupted with
+         * Esc, the COM object behind one holder can already have a zeroed
+         * vtable, and the game calls through NULL (the "no recompiled code at
+         * 00000000" crash after the video).  Do the same teardown here, but
+         * tolerate a dead object. */
+        {
+            static const uint32_t slots[2] = { 0x5E1F88u, 0x5E1F8Cu };
+            for (int i = 0; i < 2; i++) {
+                uint32_t holder = M32(slots[i]);
+                if (!holder)
+                    continue;
+                uint32_t com = M32(holder);
+                if (com) {
+                    uint32_t vt = M32(com);
+                    if (!vt) {
+                        static int fired;
+                        if (!fired++)
+                            fprintf(stderr, "config: sound object %08x has no "
+                                    "vtable, skipping release\n", com);
+                    } else {
+                        uint32_t rel = M32(vt + 8u);
+                        if (rel)
+                            x86_call_stdcall(rel, &com, 1);
+                    }
+                    M32(holder) = 0;
+                }
+                x86_call_stdcall(0x414460u, &holder, 1);   /* game free */
+                M32(slots[i]) = 0;
+            }
+        }
+        cpu->eax = 0;
         cpu->eip = M32(cpu->esp);
         cpu->esp += 4;
         return 1;

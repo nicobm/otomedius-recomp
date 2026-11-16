@@ -24,6 +24,12 @@ void platform_draw_up(uint32_t prim, uint32_t count, uint32_t data, uint32_t str
 void platform_set_size(int w, int h);
 void platform_wait(void);
 
+/* Audio output for the opening movie (SDL backend; the headless backend
+ * accepts the calls and discards the samples). */
+int  platform_audio_open(int rate, int channels);
+void platform_audio_write(const void *data, int len);
+void platform_audio_close(void);
+
 /* keyboard state as arcade cabinet buttons */
 typedef struct {
     int coin, start, up, down, left, right;

@@ -10,6 +10,7 @@
 #define _GNU_SOURCE
 #include "win32.h"
 #include "d3d9.h"
+#include "movie.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -73,6 +74,8 @@ static int guid_eq(uint32_t ptr, const uint8_t *want)
 static uint32_t g_graph, g_control, g_event, g_eventex, g_video, g_audio;
 static uint32_t g_filter, g_pin, g_position, g_sink;
 static int g_state;             /* 0 stopped, 1 paused, 2 running */
+static char g_movie_path[4096]; /* the file the game asked to play (guest) */
+static char g_movie_host[4096]; /* the same file as a host path */
 
 uint32_t dshow_sink(void);
 #define MAX_GRAPH_FILTERS 8
@@ -143,6 +146,28 @@ static void mc_Run(void)
     g_state = 2;                    /* State_Running */
     if (g_nfilters)
         ensure_video_texture(g_filters[0]);
+    /* Real frames: ffmpeg decodes the WMV3 file into the renderer texture.
+     * The movie manager only counts frames, so the texture upload is driven
+     * from dshow_movie_tick() once per presented frame.  The startup probe
+     * (0x417480) drives the same graph for a few milliseconds just to check
+     * DirectShow; decoding there would flash a frame and a blip of sound, so
+     * only start the decoder when the movie manager owns slot 0x5DE258. */
+    if (g_movie_host[0] && !movie_active()) {
+        uint32_t owner = M32(0x5DE258u);
+        if (!owner || M32(owner) != 0x55E904u) {
+            log_printf("dshow: not the movie manager, skipping the decoder");
+            goto no_movie_decoder;
+        }
+        const char *video_size = getenv("OTOMEDIUS_MOVIE_SIZE");
+        int mw = 640, mh = 512;
+        if (video_size && sscanf(video_size, "%dx%d", &mw, &mh) != 2) {
+            mw = 640;
+            mh = 512;
+        }
+        if (movie_open(g_movie_host, mw, mh, 30) != 0)
+            log_printf("dshow: movie decoder failed to start");
+    }
+no_movie_decoder:
     /* DirectShow: SetSyncSource(NULL), then Pause, then Run */
     for (unsigned i = 0; i < g_nfilters; i++) {
         uint32_t f = g_filters[i];
@@ -166,6 +191,7 @@ static void mc_Pause(void)
 static void mc_Stop(void)
 {
     g_state = 0;
+    movie_close();
     call_filters(4, 1);         /* IMediaFilter::Stop */
     RET32(0);
 }
@@ -227,22 +253,27 @@ static void ds_AddRef(void) { RET32(2); }
 static void ds_Release(void) { RET32(1); }
 
 static void fg_AddFilter(void);
-/* Build a VIDEOINFOHEADER media type describing the arcade framebuffer and
- * offer it to the renderer filter's input pin. */
+/* Build a VIDEOINFOHEADER media type the way the game's TextureRenderer
+ * expects it.  0x4176E0 (its SetMediaType) rejects anything whose formattype
+ * is not FORMAT_VideoInfo, whose majortype is not MEDIATYPE_Video, or whose
+ * subtype is not MEDIASUBTYPE_RGB24 - it only ever handled the 24-bit BGR
+ * frames its WMV decoder produced.  The renderer then creates a 1280x1024
+ * X8R8G8B8 texture (we fill that texture with decoded BGRA frames, so the
+ * bit depth of the negotiated type does not affect the picture). */
 static uint32_t build_video_mediatype(uint32_t subtype)
 {
     /* GUIDs in memory order */
     static const uint8_t MEDIATYPE_Video[16] = { 0x76,0x69,0x64,0x73,0,0,0x10,0,0x80,0,0,0xaa,0,0x38,0x9b,0x71 };
     static const uint8_t FORMAT_VideoInfo[16] = { 0x80,0x9f,0x58,0x05,0x56,0xc3,0xce,0x11,0xbf,0x01,0,0xaa,0,0x55,0x59,0x5a };
-    static const uint8_t RGB32[16]  = { 0x7e,0xeb,0x36,0xe4,0x4f,0x52,0xce,0x11,0x9f,0x53,0,0x20,0xaf,0x0b,0xa7,0x70 };
-    static const uint8_t YUY2[16]   = { 0x22,0x00,0x00,0x00,0x00,0x00,0x10,0x00,0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71 };
+    static const uint8_t RGB24[16]  = { 0x7d,0xeb,0x36,0xe4,0x4f,0x52,0xce,0x11,0x9f,0x53,0,0x20,0xaf,0x0b,0xa7,0x70 };
     uint32_t mt = emu_alloc(80);
     uint32_t vih = emu_alloc(128);
+    (void)subtype;
     memcpy(MEM + mt, MEDIATYPE_Video, 16);
-    memcpy(MEM + mt + 16, subtype ? YUY2 : RGB32, 16);
+    memcpy(MEM + mt + 16, RGB24, 16);
     M32(mt + 32) = 1;                       /* bFixedSizeSamples */
     M32(mt + 36) = 0;                       /* bTemporalCompression */
-    M32(mt + 40) = 1280 * 1024 * 4;         /* lSampleSize */
+    M32(mt + 40) = 1280u * 1024u * 3u;      /* lSampleSize */
     memcpy(MEM + mt + 44, FORMAT_VideoInfo, 16);
     M32(mt + 60) = 0;                       /* pUnk */
     M32(mt + 64) = 88;                      /* cbFormat */
@@ -250,17 +281,17 @@ static uint32_t build_video_mediatype(uint32_t subtype)
     /* VIDEOINFOHEADER */
     M32(vih + 0) = 0; M32(vih + 4) = 0; M32(vih + 8) = 1280; M32(vih + 12) = 1024;
     M32(vih + 16) = 0; M32(vih + 20) = 0; M32(vih + 24) = 1280; M32(vih + 28) = 1024;
-    M32(vih + 32) = 1280 * 1024 * 4 * 60;   /* dwBitRate */
+    M32(vih + 32) = 1280u * 1024u * 3u * 30u;  /* dwBitRate */
     M32(vih + 36) = 0;
-    MF64(vih + 40) = 166667.0;              /* AvgTimePerFrame: 60 Hz */
+    MF64(vih + 40) = 333667.0;              /* AvgTimePerFrame: 30 Hz */
     /* BITMAPINFOHEADER */
     M32(vih + 48) = 40;
     M32(vih + 52) = 1280;
     M32(vih + 56) = 1024;
     M16(vih + 60) = 1;                      /* biPlanes */
-    M16(vih + 62) = subtype ? 16 : 32;      /* biBitCount */
-    M32(vih + 64) = subtype ? 3 : 0;        /* YUY2 / RGB */
-    M32(vih + 68) = 1280 * 1024 * (subtype ? 2 : 4);  /* biSizeImage */
+    M16(vih + 62) = 24;                     /* biBitCount */
+    M32(vih + 64) = 0;                      /* biCompression = BI_RGB */
+    M32(vih + 68) = 1280u * 1024u * 3u;     /* biSizeImage */
     return mt;
 }
 
@@ -282,7 +313,7 @@ static void gb_Render(void)
     args[1] = out;
     uint32_t r = x86_call_stdcall(M32(M32(filter) + 10 * 4), args, 2);  /* EnumPins */
     uint32_t pins = M32(out);
-    if (r < 0 || !pins) {
+    if ((int32_t)r < 0 || !pins) {
         RET32(0x80004005u);
         return;
     }
@@ -294,7 +325,7 @@ static void gb_Render(void)
     nargs[3] = 0;
     r = x86_call_stdcall(M32(M32(pins) + 3 * 4), nargs, 4);             /* Next */
     uint32_t in_pin = M32(out);
-    if (r < 0 || !in_pin) {
+    if ((int32_t)r < 0 || !in_pin) {
         RET32(0x80004005u);
         return;
     }
@@ -304,9 +335,12 @@ static void gb_Render(void)
         rca[0] = in_pin;
         rca[1] = src_pin;
         rca[2] = mt;
+        if (getenv("OTOMEDIUS_MOVIE_DBG"))
+            fprintf(stderr, "dshow: Render: pin=%08x vtbl=%08x method=%08x\n",
+                    in_pin, M32(in_pin), M32(M32(in_pin) + 4 * 4));
         r = x86_call_stdcall(M32(M32(in_pin) + 4 * 4), rca, 3);         /* ReceiveConnection */
         log_printf("dshow: Render: subtype %d -> ReceiveConnection %08x", sub, r);
-        if (r >= 0) {
+        if ((int32_t)r >= 0) {
             RET32(0);
             return;
         }
@@ -373,6 +407,12 @@ static const method_t audio_vtbl[] = {
 static void fg_AddFilter(void)
 {
     uint32_t f = arg32(1), name = arg32(2), graph = arg32(0);
+    /* The game builds a fresh graph for every movie (the startup probe and the
+     * movie manager both do AddFilter(renderer) + AddSourceFilter).  Clear the
+     * previous filter list when a new graph is being assembled, otherwise the
+     * freed renderer filter from the previous graph is still in the list. */
+    if (g_state == 0)
+        g_nfilters = 0;
     if (g_nfilters < MAX_GRAPH_FILTERS) {
         g_filters[g_nfilters++] = f;
         log_printf("dshow: AddFilter(%08x)", f);
@@ -392,6 +432,34 @@ static void gb_AddSourceFilter(void)
     uint32_t pp = arg32(3);
     uint32_t fail = 0;
     const char *env = getenv("OTOMEDIUS_NOMOVIE");
+    /* AddSourceFilter(lpstrFileName, lpstrFilterName, ppFilter): the game
+     * converts ".\Data\OTOMEDIUS_OP_f.wmv" to UTF-16 before COM sees it. */
+    {
+        const char *file = getenv("OTOMEDIUS_MOVIE_FILE");
+        uint32_t src = arg32(1);
+        if (file && *file) {
+            /* diagnostic override: already a host path */
+            snprintf(g_movie_path, sizeof(g_movie_path), "%s", file);
+            snprintf(g_movie_host, sizeof(g_movie_host), "%s", file);
+        } else {
+            size_t i;
+            char *host;
+            for (i = 0; src && i + 1 < sizeof(g_movie_path); i++) {
+                uint16_t c = M16(src + (uint32_t)i * 2u);
+                if (!c)
+                    break;
+                g_movie_path[i] = (char)c;
+            }
+            g_movie_path[i] = 0;
+            host = win_host_path(g_movie_path);
+            if (host) {
+                snprintf(g_movie_host, sizeof(g_movie_host), "%s", host);
+                free(host);
+            }
+        }
+        log_printf("dshow: source file \"%s\" -> \"%s\"", g_movie_path,
+                   g_movie_host);
+    }
     if (env && *env && strcmp(env, "0") != 0)
         fail = 1;                       /* diagnostic: pretend the file is missing */
     if (pp)
@@ -626,6 +694,39 @@ static uint32_t dshow_object_for(uint32_t iid)
     log_printf("dshow: QueryInterface for {%08x-%04x-%04x} not implemented",
                M32(iid), M16(iid + 4), M16(iid + 6));
     return 0;
+}
+
+/* Called once per presented frame: copy the newest decoded video frame into
+ * the texture the game's own TextureRenderer created ([wrapper+0x10]+0x160).
+ * The movie manager's draw callback (0x43F540) samples that texture. */
+void dshow_movie_tick(void)
+{
+    uint32_t wrap, filter, tex, tw = 0, th = 0;
+    const uint32_t *px;
+    static unsigned uploaded;
+    int got;
+
+    if (!movie_active())
+        return;
+    wrap = M32(0x5DCF88u);
+    if (!wrap)
+        return;
+    filter = M32(wrap + 0x10u);
+    if (!filter)
+        return;
+    tex = M32(filter + 0x160u);
+    if (!tex)
+        return;
+    px = texture_argb(tex, &tw, &th);
+    if (!px || !tw || !th)
+        return;
+    got = movie_frame((uint8_t *)(uintptr_t)px, (int)tw, (int)th);
+    if (got)
+        uploaded++;
+    if (getenv("OTOMEDIUS_MOVIE_DBG") && got &&
+        (uploaded == 1 || uploaded % 120 == 0))
+        fprintf(stderr, "movie: frame %u uploaded to tex %08x (%ux%u)\n",
+                uploaded, tex, tw, th);
 }
 
 /* CLSID_FilterGraph {e436ebb3-524f-11ce-9f53-0020af0ba770} */

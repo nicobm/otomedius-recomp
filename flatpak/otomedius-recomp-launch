@@ -18,4 +18,22 @@ if [ ! -f "$GAME_DIR/oto.ini" ] && [ -f "$GAME_DIR/otomedius.ini" ]; then
     cp -f "$GAME_DIR/otomedius.ini" "$GAME_DIR/oto.ini"
 fi
 
+# The cabinet artwork (bezel.png) arrived with a later dump revision.  Older
+# installs already have GAME_DIR, so copy the art in when it is missing; an
+# existing file is left alone because the user may have replaced it.
+if [ -f "$GAME_SRC/bezel.png" ] && [ ! -f "$GAME_DIR/bezel.png" ]; then
+    cp -f "$GAME_SRC/bezel.png" "$GAME_DIR/bezel.png"
+fi
+
+# The intro movie is WMV3.  Its decoder lives in the runtime's codecs-extra
+# extension (mounted under /usr/lib/<arch>/codecs-extra).  The runtime puts
+# that directory in the loader configuration, but the base libavcodec comes
+# first, so put it ahead explicitly.  Without the extension the game still
+# runs; the video simply never produces frames.
+CODECS="/usr/lib/x86_64-linux-gnu/codecs-extra/lib"
+if [ -d "$CODECS" ]; then
+    LD_LIBRARY_PATH="$CODECS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export LD_LIBRARY_PATH
+fi
+
 exec /app/bin/otomedius-recomp "$GAME_DIR"

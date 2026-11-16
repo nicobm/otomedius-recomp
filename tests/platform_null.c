@@ -23,5 +23,8 @@ void platform_draw(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e, i
 void platform_draw_up(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e) { (void)a;(void)b;(void)c;(void)d;(void)e; }
 void platform_set_size(int w, int h) { g_w = w; g_h = h; }
 void platform_wait(void) {}
+int  platform_audio_open(int rate, int channels) { (void)rate; (void)channels; return 0; }
+void platform_audio_write(const void *data, int len) { (void)data; (void)len; }
+void platform_audio_close(void) {}
 void platform_read_pad(pad_state_t *o) { memset(o, 0, sizeof(*o)); }
 void platform_read_touch(touch_state_t *o) { memset(o, 0, sizeof(*o)); }

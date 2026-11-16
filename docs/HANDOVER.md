@@ -15,8 +15,16 @@
 > bitmap de 8 bpp. Ver §5.2. Además, el **boot de Konami ya corre** (los
 > managers se actualizan y el quad del logo se dibuja), pero la textura real de
 > `KonamiLogo.pak` aún no se carga porque el state machine del boot/attract
-> manager se queda en el sub-estado 8. Ver §5.4. Este documento es el prompt de
-> transferencia para una sesión nueva; el repo es
+> manager se queda en el sub-estado 8. Ver §5.4.
+>
+> **Sesión 2026-11-16 (última)**: se añadió el **bezel de la cabina** (arte
+> 1920x1080 con hueco de pantalla transparente, fullscreen por defecto y `F11`
+> a 1366x768), se consiguió **decodificar y mostrar el vídeo de introducción**
+> (WMV3 640x512, `Data/OTOMEDIUS_OP_f.wmv`) dentro de la **textura real del
+> `TextureRenderer` del juego**, con **audio** (WMAv2 -> SDL3), y se corrigió
+> el **cierre con Esc a mitad de vídeo** (cuelgue del hilo de audio + `call`
+> a NULL en `0x4050B0`). Detalle completo en **§7**. Este documento es el
+> prompt de transferencia para una sesión nueva; el repo es
 > `/var/home/vm/Proyectos/SALA DE TRABAJO/otomedius-recomp`.
 
 ---
@@ -172,6 +180,18 @@ OTOMEDIUS_TEXDBG=1               # dump each font atlas to /tmp/opencode/tex_*.p
 OTOMEDIUS_KONAMI=1               # experimental: drive the KonamiLogo manager
                                  # directly from render.c (0x439920 + 0x4395B0)
 OTOMEDIUS_DIR=path               # game directory
+OTOMEDIUS_BEZEL=path|0           # cabinet artwork (default: <game>/bezel.png)
+OTOMEDIUS_WINDOWED=1             # start windowed (1366x768) instead of fullscreen
+OTOMEDIUS_FULLSCREEN=1           # force fullscreen (also without a bezel)
+OTOMEDIUS_BEZEL_DUMP=file.ppm    # dump the composed window (bezel+game)
+OTOMEDIUS_BEZEL_DUMP_AT=n        # present at which to dump (default 0 = first)
+OTOMEDIUS_MOVIE=1                # create the movie manager and show the intro
+OTOMEDIUS_MOVIE_PREVIEW=1        # show the intro over the frame (no manager)
+OTOMEDIUS_MOVIE_FILE=path        # override the movie file (host path)
+OTOMEDIUS_MOVIE_SIZE=WxH         # decoder size (default 640x512)
+OTOMEDIUS_MOVIE_DBG=1            # movie/dshow diagnostics
+OTOMEDIUS_BOOTDBG=1              # boot/attract state machine + local heap trace
+OTOMEDIUS_QUIT_AT=n              # request quit at present n (shutdown testing)
 ```
 
 ---
@@ -1027,36 +1047,222 @@ Después: renderer de sprites reales (`0x40F780`/`0x40FA44`), audio
 
 ---
 
+## 7. Sesión 2026-11-16: bezel, vídeo de introducción y audio
+
+### 7.1 Bezel de la cabina y modo ventana (`native/platform_sdl.c`)
+
+El dump trae `bezel.png` (1920x1080, RGBA) con el arte de los costados y un
+**hueco de pantalla transparente**. La capa SDL:
+
+* Carga `bezel.png` del directorio del juego (o `OTOMEDIUS_BEZEL=path`;
+  `OTOMEDIUS_BEZEL=0` lo desactiva) antes de crear la ventana.
+* Detecta el hueco por el canal alfa: columnas transparentes en (casi) todo el
+  alto y, dentro, filas transparentes. Para este arte: **hueco
+  `(288,0)-(1631,1079)` = 1344x1080**. Si el hueco fuese opaco dibuja el arte
+  debajo; aquí es transparente y el arte va **encima** (`overlay`).
+* Ventana: **fullscreen por defecto**; `F11` alterna y al volver a ventana pone
+  **1366x768** centrado. `OTOMEDIUS_WINDOWED=1` arranca en ventana.
+* Composición: el arte se escala manteniendo su aspecto y el frame del juego
+  (1280x1024) se encaja en el hueco manteniendo el suyo (1344x1075, centrado).
+* Ratón/lápiz se mapean al **rectángulo del juego** (no a la ventana), con
+  corrección HiDPI (`SDL_GetWindowSize` vs `SDL_GetWindowSizeInPixels`).
+* Diagnóstico: `OTOMEDIUS_BEZEL_DUMP=file.ppm` (+ `..._AT=n`) lee el
+  backbuffer compuesto con `SDL_RenderReadPixels` **antes** de `Present`.
+
+`flatpak/otomedius-recomp-launch` copia `bezel.png` al `GAME_DIR` si falta
+(instalaciones ya existentes) y pone delante
+`/usr/lib/x86_64-linux-gnu/codecs-extra/lib` en `LD_LIBRARY_PATH`.
+
+### 7.2 Vídeo: DirectShow real + decodificación con ffmpeg
+
+El juego reproduce `Data/OTOMEDIUS_OP_f.wmv` (WMV3 640x512 30 fps, 60 s,
+audio WMAv2) a través de un grafo DirectShow **falso** (`native/dshow.c`) y de
+su propio filtro `TextureRenderer` (clase en `0x4175C0`).
+
+Cadena medida (direcciones del binario original):
+
+| Dirección | Papel |
+|---|---|
+| `0x417480` | sonda de arranque: abre el grafo y lo cierra (no debe decodificar) |
+| `0x4174B0` | abre el "movie wrapper" (0x1C bytes en `[0x5DCF88]`) |
+| `0x417A80` | construye el grafo: `CoCreateInstance`, `AddFilter(renderer)`, `AddSourceFilter`, `Render` |
+| `0x417D90` | cierra y libera el wrapper |
+| `0x417590` | cierra el wrapper global (`[0x5DCF88]=0`) |
+| `0x43F280` | ctor del **manager del vídeo** (vtable `0x55E904`), registra en `0x5DE258` |
+| `0x43F370` | update del manager: estados 0..4 (`0x43F4CC`), abre el grafo, fade, temporizador 3570 |
+| `0x43F4E0` | draw del manager: encola `0x43F540` en la lista `[0x5E1F9C]` |
+| `0x43F540` | callback de dibujo del vídeo (quad con la textura) |
+| `0x4175C0` | ctor del `TextureRenderer` (objeto con IBaseFilter en +0xC, IPin, vtables `0x55926C/0x559334/0x559374/0x55938C`) |
+| `0x4176E0` | `SetMediaType` del renderer: exige `FORMAT_VideoInfo`, `MEDIATYPE_Video` y **`MEDIASUBTYPE_RGB24`** (GUID en `0x55917C`) |
+| `0x417750` | crea la textura del vídeo (1280x1024 X8R8G8B8) al aceptar el media type |
+| `0x527110` | `ReceiveConnection` del pin de entrada del renderer |
+| `0x521390` / `0x521400` | métodos del pin que delegan en el renderer (`SetMediaType`, `NotifyAllocator`) |
+| `0x52DA30` | copia el media type con **`CoTaskMemAlloc`** (si devuelve NULL -> `E_OUTOFMEMORY`) |
+
+Cambios en `native/dshow.c`:
+
+* `AddSourceFilter` recibe el nombre en **UTF-16** (`0x55920C` es el ANSI
+  `".\Data\OTOMEDIUS_OP_f.wmv"`, convertido con `MultiByteToWideChar` en
+  `0x4174B0`); se lee a `g_movie_path` y se convierte con `win_host_path()` a
+  `g_movie_host`.
+* `build_video_mediatype()` ofrece **RGB24** (no RGB32/YUY2), 1280x1024,
+  `biBitCount=24`, `lSampleSize=1280*1024*3`, `AvgTimePerFrame=333667` (30 Hz).
+  Antes se ofrecía RGB32 y el renderer lo rechazaba con `VFW_E_TYPE_NOT_ACCEPTED`
+  (`0x8004022A`).
+* `gb_Render`: los `HRESULT` se comparan como **`(int32_t)`**; antes `r >= 0`
+  sobre `uint32_t` daba por bueno el intento fallido.
+* `fg_AddFilter`: si `g_state == 0` (grafo nuevo) se limpia `g_nfilters`; el
+  filtro del renderer de la sonda de arranque ya estaba liberado y se usaba.
+* `mc_Run`: arranca el decodificador **solo si el manager del vídeo es dueño de
+  `0x5DE258`** (`[0x5DE258] != 0 && M32([0x5DE258]) == 0x55E904`); así la sonda
+  `0x417480` no genera frame ni pitido. `mc_Stop` cierra el decodificador.
+* `dshow_movie_tick()` (llamado en cada `Present`): toma
+  `[0x5DCF88] -> [+0x10] -> [+0x160]` (la textura del renderer) y copia el
+  frame más reciente con `movie_frame()`/`texture_argb()`.
+
+`native/movie.c` / `movie.h` (nuevo):
+
+* Lanza `ffmpeg -v error -nostdin -re -i <wmv> -f rawvideo -pix_fmt bgra -`
+  (fork/exec, pipe) y un hilo lector con anillo de 3 frames.
+* `movie_frame(dst, dst_w, dst_h)` escala con vecino más cercano y tiene el
+  camino rápido 640x512 -> 1280x1024 (2x) y fuerza alfa 0xFF.
+* Audio: segundo `ffmpeg -vn -f s16le -ar 48000 -ac 2 -` y otro hilo que llama a
+  `platform_audio_write()`.
+* Cierre: `SIGKILL` al proceso, `join` de los hilos, `waitpid`, `close`.
+
+El cuadro del vídeo **del propio juego** (`0x43F540`) sale degenerado en el
+port: vértices `(1,inf)-(2561,1024)` (un `fdiv` a cero en su secuencia x87,
+constantes `0x577528=1024.0`, `0x577530=1280.0`, `0x5773E0=2^32`). Por eso
+`render.c` **compone** la textura del vídeo en el framebuffer software
+(`movie_draw_tick`), aplicando el fade del manager (`[0x5DE224]`, solo en los
+estados 2 y 4) y con `memcpy` cuando el tamaño coincide y no hay fade.
+
+### 7.3 Audio (`platform.h`, `platform_sdl.c`, `tests/platform_null.c`)
+
+* API nueva: `platform_audio_open(rate, channels)`, `platform_audio_write`,
+  `platform_audio_close`.
+* SDL3: `SDL_InitSubSystem(SDL_INIT_AUDIO)` +
+  `SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
+  {S16LE, 2, 48000})`, `SDL_PutAudioStreamData`.
+* La espera de cola (~200 ms) es **acotada** (máx. ~500 ms) y descarta el trozo
+  si el dispositivo se para: evita bloquear el cierre.
+* El backend headless acepta las llamadas y las descarta.
+
+### 7.4 Log UTF-8
+
+`win32_misc.c` exporta `win_sjis_to_utf8()` (iconv CP932 -> UTF-8) y `font.c`
+la usa para el nombre de la fuente: `font: CreateFontA(h=48
+face=ＤＦＧ中太丸ゴシック体)`.
+
+### 7.5 Cierre seguro con Esc a mitad de vídeo
+
+Dos fallos corregidos:
+
+1. **Cuelgue**: `platform_audio_write` esperaba sin límite a que bajara la cola;
+   con el dispositivo parado el hilo de audio no terminaba y `movie_close()`
+   bloqueaba el hilo del juego (GNOME "no responde"). Ahora la espera es
+   acotada; además `platform_sdl.c` llama a `movie_close()` al recibir
+   `Esc`/`SDL_EVENT_QUIT`, antes de `win_request_quit()`.
+2. **`call` a NULL**: el apagado (`0x4050B0`, llamado solo desde `0x402238`)
+   libera los objetos en `0x5E1F88`/`0x5E1F8C`; con el vídeo interrumpido uno
+   llegaba con la **vtable a cero** y el juego hacía `call [0+8]` ->
+   `x86: no recompiled code at 00000000`. `patches.c` reimplementa `0x4050B0`
+   con el mismo cierre pero tolerando el objeto muerto (log
+   `config: sound object ... has no vtable`).
+
+Verificado: `quit@60`, `quit@300`, `quit@1200` (con `OTOMEDIUS_QUIT_AT`) salen
+con `exit=0` y sin crash, con y sin vídeo.
+
+### 7.6 Qué falta (medido en esta sesión)
+
+* **Boot/attract (`0x4547E0`)**: sigue en `state=1 sub=8` con
+  `slot258=0`, `mask220=0`, `mask224=0xFFFFFFFF`. Datos nuevos:
+  - tabla de estados `0x45598C` = `{0:0x454893, 1:0x454B51, 2:0x454BE4,
+    3:0x454D95, 4:0x454E43, 5:0x454F1C}`;
+  - tabla de sub-estados `0x4559A8` (16 entradas, `[8]=0x454A74`);
+  - **el dispatch de sub-estados (`0x454950`) está dentro del handler del
+    estado 0**, y el handler del estado 1 (`0x454B51`) solo compara `sub` con 0
+    y 1: **`state=1 sub=8` es un estado muerto** (no ejecuta nada);
+  - el estado 0 sub 6 (`0x454A29`) crea el manager del vídeo: alloc `0xC` con
+    `0x4142B0(0x5E1F28, 0xC)` + ctor `0x43F280` en `0x454A4A`;
+  - el estado 0 sub 8 (`0x454A74`) crea otro manager: alloc `0xC` +
+    ctor `0x429210` en `0x454A95` (vtable `0x55AE88`, update `0x429340`,
+    draw `0x4294C0`), también en el slot `0x5DE258`.
+* **Texto**: sigue pendiente `GGO_GRAY8_BITMAP`/`GGO_BITMAP` (§5.2).
+* **Audio del juego**: `dsound` sigue mudo; solo suena el vídeo.
+* **Quad del vídeo del juego**: `0x43F540` degenerado (arriba).
+
+### 7.7 Comandos de verificación usados
+
+```sh
+# build local (headless) y SDL
+sh /tmp/opencode/build.sh <ficheros.c...>
+# regenerar (84 ficheros con --chunk 60)
+PYTHONPATH=../.work/pylib python3 tools/recomp/recomp.py --exe ../.work/oto/otomedius.exe --out ../.work/gen --chunk 60
+sh /tmp/opencode/gen_build.sh
+
+# bezel + fullscreen (OpenGL, sin ventana)
+cd ../.work/oto
+SDL_VIDEODRIVER=offscreen OTOMEDIUS_BEZEL_DUMP=/tmp/opencode/w.ppm OTOMEDIUS_BEZEL_DUMP_AT=120   /tmp/opencode/otomedius-sdl .
+
+# vídeo + audio + dump de un frame
+LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/codecs-extra/lib   OTOMEDIUS_MOVIE=1 OTOMEDIUS_DUMP_FB=/tmp/opencode/v.ppm OTOMEDIUS_DUMP_AT=600   ../obj/otomedius-recomp .
+
+# cierre limpio a mitad de vídeo
+OTOMEDIUS_QUIT_AT=300 OTOMEDIUS_MOVIE=1 ../obj/otomedius-recomp .
+```
+
+### 7.8 Ficheros de esta sesión
+
+```
+M native/platform_sdl.c   bezel, fullscreen/F11, audio SDL, movie_close en Esc
+M native/platform.h       platform_audio_open/write/close
+M native/dshow.c          RGB24, CoTaskMemAlloc, grafo nuevo, decoder, tick
+M native/render.c         OTOMEDIUS_MOVIE (manager 0x43F280) + composición
+A native/movie.c/.h       decoder vídeo+audio con ffmpeg
+M native/win32_misc.c     CoTaskMemAlloc real; win_sjis_to_utf8 exportada
+M native/win32.h          declaración de win_sjis_to_utf8
+M native/d3d9_objects.c   GetLevelDesc (D3DSURFACE_DESC) + log MOVIE_DBG
+M native/font.c           nombre de fuente CP932 -> UTF-8 en el log
+M native/patches.c        OTOMEDIUS_BOOTDBG + 0x4050B0 tolerante
+M tests/platform_null.c   stubs de audio
+M flatpak/..-launch       copia bezel.png; LD_LIBRARY_PATH codecs-extra
+M README.md, docs/HANDOVER.md
+```
+
+---
+
 ### Prompt corto para pegar al abrir la sesión nueva
 
 ```
 Contexto: repo /var/home/vm/Proyectos/SALA DE TRABAJO/otomedius-recomp
 (recompilación estática de Otomedius, Flatpak + SDL3). Lee docs/HANDOVER.md
-entero antes de tocar nada.
+entero antes de tocar nada (la sesión anterior está en §7).
 
-Estado: el juego arranca y es estable 30 s (exit 124, 0 crashes). x87
-corregido (fxch/pop), CreateDevice 1280x1024, texturas reales por defecto,
-FreeType integrado (DejaVu, h/4, mutex). El boot de Konami ya corre: los
-managers 0x439550 (KonamiLogo) y 0x4547E0 (boot/attract) se actualizan y el
-quad del logo se dibuja, pero la textura real de KonamiLogo.pak aun no se
-carga (state=1 sub=8 atascado en 0x454A74).
+Estado: bezel de la cabina (bezel.png 1920x1080, hueco transparente
+(288,0)-(1631,1079)), fullscreen por defecto y F11 -> 1366x768. El vídeo de
+introducción (Data/OTOMEDIUS_OP_f.wmv, WMV3 640x512 30fps) ya se decodifica
+con el ffmpeg del runtime y se sube a la textura real del TextureRenderer del
+juego (1280x1024 X8R8G8B8); suena el audio (WMAv2 -> SDL3). Se ve con
+OTOMEDIUS_MOVIE=1 (crea el manager 0x43F280). Esc a mitad de vídeo cierra
+limpio. El juego sigue estable.
 
-BLOQUEO 1 (texto): el juego pide GetGlyphOutlineA con fmt=6 =
-GGO_GRAY8_BITMAP, NO GGO_NATIVE. font.c devuelve un outline y el
-rasterizador 0x409D20 lo lee como bitmap 8bpp -> ruido. Plan: implementar
-GGO_GRAY8_BITMAP (stride (w+3)&~3, 0..255) y GGO_BITMAP (1bpp) en font.c,
-enrutar por format exacto en win32_misc.c, escribir el avance tambien en
-gm+0x10, validar con OTOMEDIUS_TEXDBG.
+BLOQUEO 1 (boot): 0x4547E0 sigue en state=1 sub=8 con slot258=0. El dispatch
+de sub-estados (0x454950) está en el handler del estado 0 y el del estado 1
+(0x454B51) solo mira sub 0/1 => state=1 sub=8 es muerto. El estado 0 sub 6
+(0x454A29 -> 0x454A4A, ctor 0x43F280) crea el manager del vídeo; el sub 8
+(0x454A74 -> 0x454A95, ctor 0x429210) crea otro manager (vtable 0x55AE88).
+Entender por qué se quedó en state=1/sub=8 y hacer que el boot llegue solo a
+los logos, al warning y al vídeo.
 
-BLOQUEO 2 (logo): 0x4547E0 se queda en state=1 sub=8 (0x454A74); el
-constructor 0x429210 no registra en 0x5DE258. Investigar 0x4142B0 y el
-registro; luego cargar KonamiLogo.pak y validar el logo real.
+BLOQUEO 2 (texto): GetGlyphOutlineA fmt=6 = GGO_GRAY8_BITMAP; implementar
+GGO_GRAY8_BITMAP (stride (w+3)&~3) y GGO_BITMAP (1bpp, stride
+((w+31)/32)*4) en font.c, enrutar por formato exacto en win32_misc.c y
+escribir el avance también en gm+0x10 (0x409F5E).
 
-No reescribas el HANDOVER sin pedirlo. No hagas commits sin pedirlo.
-Build local: sh /tmp/opencode/build.sh <archivo.c ...>; gen:
-PYTHONPATH=../.work/pylib python3 tools/recomp/recomp.py --exe
-../.work/oto/otomedius.exe --out ../.work/gen --chunk 60; run:
-cd ../.work/oto && ../obj/otomedius-recomp .
+BLOQUEO 3 (quad del vídeo): el draw 0x43F540 del juego genera vértices
+(1,inf)-(2561,1024) (fdiv a cero en x87); el port compone la textura. Revisar
+la secuencia x87/constantes 0x577528/0x577530 para usar el draw nativo.
 
 No reescribas el HANDOVER sin pedirlo. No hagas commits sin pedirlo.
 Build local: sh /tmp/opencode/build.sh <archivo.c ...>; gen:
