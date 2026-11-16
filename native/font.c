@@ -187,6 +187,46 @@ int font_available(void)
     return ok;
 }
 
+/* The boot pak carries its own font file and registers it with
+ * AddFontMemResourceEx.  Keeping a memory face lets the port draw with the
+ * arcade typeface instead of a system substitute. */
+static const unsigned char *g_mem_font;
+static unsigned long        g_mem_font_size;
+
+int font_add_memory(const void *data, unsigned long size)
+{
+    FT_Face f = NULL;
+    int ok = 0;
+
+    if (!data || size < 12)
+        return 0;
+    FONT_LOCK();
+    font_init();
+    if (!g_ok) {
+        FONT_UNLOCK();
+        return 0;
+    }
+    if (FT_New_Memory_Face(g_lib, (const FT_Byte *)data, (FT_Long)size, 0,
+                           &f) == 0) {
+        g_mem_font = (const unsigned char *)data;
+        g_mem_font_size = size;
+        ok = 1;
+        if (g_verbose)
+            fprintf(stderr, "font: registered memory font (%lu bytes, %s)\n",
+                    size, f->family_name ? f->family_name : "?");
+        FT_Done_Face(f);
+    } else if (g_verbose) {
+        fprintf(stderr, "font: AddFontMemResourceEx blob is not a font "
+                "(first bytes %02x %02x %02x %02x)\n",
+                ((const unsigned char *)data)[0],
+                ((const unsigned char *)data)[1],
+                ((const unsigned char *)data)[2],
+                ((const unsigned char *)data)[3]);
+    }
+    FONT_UNLOCK();
+    return ok;
+}
+
 static FT_Face open_face(int height)
 {
     static const char *cand[] = {
@@ -205,6 +245,20 @@ static FT_Face open_face(int height)
     const char *paths[MAX_FONTS + 8];
     char tmp[512];
     int n = 0, i;
+
+    /* The game's own font first, when it registered one. */
+    if (g_mem_font && !getenv("OTOMEDIUS_SYSFONT")) {
+        FT_Face f = NULL;
+        int px = (height + 3) / 4;   /* CTexFont stores glyphs at 1/4 size */
+        if (px < 4)
+            px = 4;
+        if (FT_New_Memory_Face(g_lib, g_mem_font, (FT_Long)g_mem_font_size, 0,
+                               &f) == 0) {
+            if (FT_Set_Pixel_Sizes(f, 0, (FT_UInt)px) == 0)
+                return f;
+            FT_Done_Face(f);
+        }
+    }
 
     if (g_font_path[0])
         paths[n++] = g_font_path;

@@ -298,7 +298,21 @@ static void g_GetCharABCWidthsA(void)
     }
     RET32(1);
 }
-static void g_AddFontMemResourceEx(void) { RET32(0); }
+/* AddFontMemResourceEx(pFileView, cbSize, pvReserved, pNumFonts).
+ * The boot pak keeps a font file in a FONT chunk, decrypts it in place and
+ * registers it here; the asset builder treats failure as fatal for the whole
+ * package, so this must succeed and report one face. */
+static void g_AddFontMemResourceEx(void)
+{
+    uint32_t data = arg32(0), size = arg32(1), out = arg32(3);
+    int ok = (data && size) ? font_add_memory(MEM + data, size) : 0;
+    if (out)
+        M32(out) = 1;
+    if (!ok && g_verbose)
+        fprintf(stderr, "gdi32: AddFontMemResourceEx(%u bytes) accepted as a "
+                "stub (FreeType could not open it)\n", size);
+    RET32(data && size ? 0x0F020001u : 0);   /* a HANDLE, not a BOOL */
+}
 
 const import_def_t gdi32_imports[] = {
     {"gdi32.dll", "CreateFontA", g_CreateFontA, 14},

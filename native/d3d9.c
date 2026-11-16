@@ -36,25 +36,40 @@ static struct {
     uint32_t vt;
     uint32_t count;
     const char *name;
+    const method_t *methods;
 } g_vt[MAX_VT];
 static unsigned g_nvt;
 
-uint32_t com_create_named(const char *name, const method_t *methods, int count,
-                          uint32_t extra)
+/* Every COM object of the same class shares one vtable.  The original code
+ * registered a fresh set of native thunks for every object; a title that
+ * creates a texture per frame exhausted the fixed 0x10000-entry thunk table
+ * ("imports: too many native thunks") after a few thousand frames. */
+static uint32_t vtable_for(const char *name, const method_t *methods, int count)
 {
+    for (unsigned v = 0; v < g_nvt; v++)
+        if (g_vt[v].methods == methods && g_vt[v].count == (uint32_t)count)
+            return g_vt[v].vt;
     uint32_t vt = emu_alloc((uint32_t)count * 4u);
     for (int i = 0; i < count; i++)
         M32(vt + (uint32_t)i * 4u) = x86_native_register(methods[i].fn,
                                                          methods[i].nargs);
-    uint32_t obj = emu_alloc(8u + extra);
-    M32(obj) = vt;
-    M32(obj + 4) = 1;
     if (g_nvt < MAX_VT) {
         g_vt[g_nvt].vt = vt;
         g_vt[g_nvt].count = (uint32_t)count;
         g_vt[g_nvt].name = name;
+        g_vt[g_nvt].methods = methods;
         g_nvt++;
     }
+    return vt;
+}
+
+uint32_t com_create_named(const char *name, const method_t *methods, int count,
+                          uint32_t extra)
+{
+    uint32_t vt = vtable_for(name, methods, count);
+    uint32_t obj = emu_alloc(8u + extra);
+    M32(obj) = vt;
+    M32(obj + 4) = 1;
     return obj;
 }
 
@@ -325,9 +340,16 @@ static void dev_Present(void)
 
 static void dev_GetBackBuffer(void)
 {
+    /* The scene renderer asks for the back buffer, reads its description and
+     * creates a matching texture (the 3D target).  Returning S_OK with a NULL
+     * surface made the caller dereference address 0. */
     uint32_t pp = arg32(4);
+    static uint32_t surface;
+    if (!surface)
+        surface = surface_create((uint32_t)render_width(), (uint32_t)render_height(),
+                                 0x15u /* D3DFMT_A8R8G8B8 */, 1);
     if (pp)
-        M32(pp) = 0;
+        M32(pp) = surface;
     RET32(0);
 }
 

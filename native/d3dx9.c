@@ -301,6 +301,7 @@ static void d3dx_Vec3Transform(void)
     MF32(o) = x * MF32(m) + y * MF32(m + 16) + z * MF32(m + 32) + MF32(m + 48);
     MF32(o + 4) = x * MF32(m + 4) + y * MF32(m + 20) + z * MF32(m + 36) + MF32(m + 52);
     MF32(o + 8) = x * MF32(m + 8) + y * MF32(m + 24) + z * MF32(m + 40) + MF32(m + 56);
+    MF32(o + 12) = x * MF32(m + 12) + y * MF32(m + 28) + z * MF32(m + 44) + MF32(m + 60);
     RET32(o);
 }
 
@@ -327,24 +328,40 @@ static void d3dx_Vec3TransformNormal(void)
     RET32(o);
 }
 
+/* D3DXVec3TransformArray(pOut, OutStride, pV, VStride, pM, NumVectors) writes
+ * D3DXVECTOR4 per element; the stride arguments are in bytes.  The old
+ * 5-argument stub both mis-read the matrix and left one argument on the
+ * caller's stack, which drifted ESP by 4 bytes on every call until a return
+ * address turned into heap data. */
 static void d3dx_Vec3TransformArray(void)
 {
-    uint32_t o = arg32(0), v = arg32(1), m = arg32(2), n = arg32(3), stride = arg32(4);
+    uint32_t o = arg32(0), ostride = arg32(1), v = arg32(2),
+             vstride = arg32(3), m = arg32(4), n = arg32(5);
+    if (!ostride)
+        ostride = 16;
+    if (!vstride)
+        vstride = 12;
     for (uint32_t i = 0; i < n; i++) {
-        uint32_t s = v + i * stride, d = o + i * 12;
+        uint32_t s = v + i * vstride, d = o + i * ostride;
         float x = MF32(s), y = MF32(s + 4), z = MF32(s + 8);
         MF32(d) = x * MF32(m) + y * MF32(m + 16) + z * MF32(m + 32) + MF32(m + 48);
         MF32(d + 4) = x * MF32(m + 4) + y * MF32(m + 20) + z * MF32(m + 36) + MF32(m + 52);
         MF32(d + 8) = x * MF32(m + 8) + y * MF32(m + 24) + z * MF32(m + 40) + MF32(m + 56);
+        MF32(d + 12) = x * MF32(m + 12) + y * MF32(m + 28) + z * MF32(m + 44) + MF32(m + 60);
     }
     RET32(o);
 }
 
 static void d3dx_Vec3TransformNormalArray(void)
 {
-    uint32_t o = arg32(0), v = arg32(1), m = arg32(2), n = arg32(3), stride = arg32(4);
+    uint32_t o = arg32(0), ostride = arg32(1), v = arg32(2),
+             vstride = arg32(3), m = arg32(4), n = arg32(5);
+    if (!ostride)
+        ostride = 12;
+    if (!vstride)
+        vstride = 12;
     for (uint32_t i = 0; i < n; i++) {
-        uint32_t s = v + i * stride, d = o + i * 12;
+        uint32_t s = v + i * vstride, d = o + i * ostride;
         float x = MF32(s), y = MF32(s + 4), z = MF32(s + 8);
         MF32(d) = x * MF32(m) + y * MF32(m + 16) + z * MF32(m + 32);
         MF32(d + 4) = x * MF32(m + 4) + y * MF32(m + 20) + z * MF32(m + 36);
@@ -596,15 +613,235 @@ static void d3dx_CreateTexture(void)
     RET32(0);
 }
 
-/* D3DXCreateEffect(pDevice, pSrcData, SrcDataLen, pDefines, pInclude,
- * pStateBlock, pPool, pStateBlock?, ppEffect, pHRESULT) -> ppEffect is the
- * 9th argument; it must be written or the caller uses stack garbage. */
-static void d3dx_CreateEffect(void)
+/* ID3DXEffect stub.
+ *
+ * The asset loader compiles every effect found in a pak with
+ * D3DXCreateEffect and treats any failure as fatal for the whole package:
+ * 0x418040/0x4186f0 log 2302 ("Failed Create Shader") and 2306 ("Failed
+ * Build"), the package never becomes ready (flag at pkg+0x40 stays 0) and the
+ * demo/game state machine blocks.  That is what stopped the attract after the
+ * eye-catch: Stage01.pak failed to build because its effects did not compile.
+ *
+ * We cannot compile HLSL, but the programs the game compiles are D3DX effect
+ * wrappers whose drawing path goes through the fixed-function pipeline this
+ * port already emulates.  Returning a stub object lets the package finish
+ * loading; the handle methods return usable non-NULL handles and the state
+ * methods are accepted, so the game can bind techniques and draw.
+ *
+ * Vtable order follows d3dx9effect.h (ID3DXBaseEffect then ID3DXEffect).
+ * OTOMEDIUS_EFFECTDBG=1 traces which methods the game calls. */
+#define EFFECT_HANDLE 0xE0000001u
+
+static void eff_QueryInterface(void) { RET32(0); }
+static void eff_AddRef(void) { M32(arg32(0) + 4)++; RET32(M32(arg32(0) + 4)); }
+static void eff_Release(void) { RET32(0); }
+static void eff_ok(void) { RET32(0); }
+
+/* Methods listed alphabetically in the docs but in declaration order in the
+ * header: GetDesc..SetArrayRange are the ID3DXBaseEffect block. */
+static void eff_zero_desc(void)
 {
-    uint32_t pp = arg32(8);
+    uint32_t p = arg32(1);
+    if (p)
+        memset(MEM + p, 0, 64);
+    RET32(0);
+}
+static void eff_desc2(void)
+{
+    uint32_t p = arg32(2);
+    if (p)
+        memset(MEM + p, 0, 64);
+    RET32(0);
+}
+static void eff_get_handle(void) { RET32(EFFECT_HANDLE); }
+static void eff_current_technique(void) { RET32(EFFECT_HANDLE); }
+static void eff_set_technique(void) { RET32(0); }
+static void eff_get_pool(void)
+{
+    uint32_t pp = arg32(1);
     if (pp)
         M32(pp) = 0;
-    RET32(0x80004005u);   /* E_FAIL */
+    RET32(0);
+}
+static void eff_get_device(void)
+{
+    uint32_t pp = arg32(1);
+    if (pp)
+        M32(pp) = 0;
+    RET32(0);
+}
+static void eff_validate(void) { RET32(0); }        /* S_OK */
+static void eff_is_used(void) { RET32(1); }         /* TRUE */
+static void eff_begin(void)
+{
+    uint32_t passes = arg32(1);
+    if (passes)
+        M32(passes) = 1;
+    RET32(0);
+}
+static void eff_set_texture(void)
+{
+    uint32_t tex = arg32(2);
+    render_set_texture(0, tex);
+    RET32(0);
+}
+static void eff_get_texture(void)
+{
+    uint32_t pp = arg32(2);
+    if (pp)
+        M32(pp) = 0;
+    RET32(0);
+}
+static void eff_set_matrix(void)
+{
+    /* Keep the most recent matrix (usually WorldViewProj) so a future 3D
+     * path can consume it.  See render.c g_xform for the device transforms. */
+    uint32_t m = arg32(2);
+    if (m) {
+        extern void render_set_effect_matrix(const void *matrix);
+        render_set_effect_matrix(MEM + m);
+    }
+    RET32(0);
+}
+static void eff_get_matrix(void)
+{
+    uint32_t m = arg32(2);
+    if (m)
+        memset(MEM + m, 0, 64);
+    RET32(0);
+}
+static void eff_get_value(void)
+{
+    uint32_t p = arg32(2), n = arg32(3);
+    if (p && n)
+        memset(MEM + p, 0, n);
+    RET32(0);
+}
+
+/* Generic entry for the remaining methods: accept and return S_OK. */
+static void eff_generic(void) { RET32(0); }
+
+/* Build the method table in declaration order.  Indices are documented with
+ * the header member name; the unused tail tolerates newer SDK entries. */
+static const method_t effect_methods[] = {
+    {eff_QueryInterface, 3},   /* 0  QueryInterface */
+    {eff_AddRef, 1},           /* 1  AddRef */
+    {eff_Release, 1},          /* 2  Release */
+    {eff_zero_desc, 2},        /* 3  GetDesc */
+    {eff_desc2, 3},            /* 4  GetParameterDesc */
+    {eff_desc2, 3},            /* 5  GetTechniqueDesc */
+    {eff_desc2, 3},            /* 6  GetPassDesc */
+    {eff_desc2, 3},            /* 7  GetFunctionDesc */
+    {eff_get_handle, 3},       /* 8  GetParameter */
+    {eff_get_handle, 3},       /* 9  GetParameterByName */
+    {eff_get_handle, 3},       /* 10 GetParameterBySemantic */
+    {eff_get_handle, 3},       /* 11 GetParameterElement */
+    {eff_get_handle, 2},       /* 12 GetTechnique */
+    {eff_get_handle, 2},       /* 13 GetTechniqueByName */
+    {eff_get_handle, 3},       /* 14 GetPass */
+    {eff_get_handle, 3},       /* 15 GetPassByName */
+    {eff_get_handle, 2},       /* 16 GetFunction */
+    {eff_get_handle, 2},       /* 17 GetFunctionByName */
+    {eff_get_handle, 3},       /* 18 GetAnnotation */
+    {eff_get_handle, 3},       /* 19 GetAnnotationByName */
+    {eff_ok, 4},               /* 20 SetValue */
+    {eff_get_value, 4},        /* 21 GetValue */
+    {eff_ok, 3},               /* 22 SetBool */
+    {eff_ok, 3},               /* 23 GetBool */
+    {eff_ok, 4},               /* 24 SetBoolArray */
+    {eff_ok, 4},               /* 25 GetBoolArray */
+    {eff_ok, 3},               /* 26 SetInt */
+    {eff_ok, 3},               /* 27 GetInt */
+    {eff_ok, 4},               /* 28 SetIntArray */
+    {eff_ok, 4},               /* 29 GetIntArray */
+    {eff_ok, 3},               /* 30 SetFloat */
+    {eff_ok, 3},               /* 31 GetFloat */
+    {eff_ok, 4},               /* 32 SetFloatArray */
+    {eff_ok, 4},               /* 33 GetFloatArray */
+    {eff_ok, 3},               /* 34 SetVector */
+    {eff_ok, 3},               /* 35 GetVector */
+    {eff_ok, 4},               /* 36 SetVectorArray */
+    {eff_ok, 4},               /* 37 GetVectorArray */
+    {eff_set_matrix, 3},       /* 38 SetMatrix */
+    {eff_get_matrix, 3},       /* 39 GetMatrix */
+    {eff_ok, 4},               /* 40 SetMatrixArray */
+    {eff_ok, 4},               /* 41 GetMatrixArray */
+    {eff_ok, 4},               /* 42 SetMatrixPointerArray */
+    {eff_ok, 4},               /* 43 GetMatrixPointerArray */
+    {eff_set_matrix, 3},       /* 44 SetMatrixTranspose */
+    {eff_get_matrix, 3},       /* 45 GetMatrixTranspose */
+    {eff_ok, 4},               /* 46 SetMatrixTransposeArray */
+    {eff_ok, 4},               /* 47 GetMatrixTransposeArray */
+    {eff_ok, 4},               /* 48 SetMatrixTransposePointerArray */
+    {eff_ok, 4},               /* 49 GetMatrixTransposePointerArray */
+    {eff_ok, 3},               /* 50 SetString */
+    {eff_ok, 3},               /* 51 GetString */
+    {eff_set_texture, 3},      /* 52 SetTexture */
+    {eff_get_texture, 3},      /* 53 GetTexture */
+    {eff_ok, 3},               /* 54 GetPixelShader */
+    {eff_ok, 3},               /* 55 GetVertexShader */
+    {eff_ok, 4},               /* 56 SetArrayRange */
+    {eff_get_pool, 2},         /* 57 GetPool */
+    {eff_set_technique, 2},    /* 58 SetTechnique */
+    {eff_current_technique, 1},/* 59 GetCurrentTechnique */
+    {eff_validate, 2},         /* 60 ValidateTechnique */
+    {eff_ok, 3},               /* 61 FindNextValidTechnique */
+    {eff_is_used, 3},          /* 62 IsParameterUsed */
+    {eff_begin, 3},            /* 63 Begin */
+    {eff_ok, 2},               /* 64 BeginPass */
+    {eff_ok, 1},               /* 65 CommitChanges */
+    {eff_ok, 1},               /* 66 EndPass */
+    {eff_ok, 1},               /* 67 End */
+    {eff_get_device, 2},       /* 68 GetDevice */
+    {eff_ok, 1},               /* 69 OnLostDevice */
+    {eff_ok, 1},               /* 70 OnResetDevice */
+    {eff_ok, 2},               /* 71 SetStateManager */
+    {eff_ok, 2},               /* 72 GetStateManager */
+    {eff_ok, 1},               /* 73 BeginParameterBlock */
+    {eff_get_handle, 1},       /* 74 EndParameterBlock */
+    {eff_ok, 2},               /* 75 ApplyParameterBlock */
+    {eff_ok, 2},               /* 76 DeleteParameterBlock */
+    {eff_ok, 3},               /* 77 CloneEffect */
+    {eff_ok, 5},               /* 78 SetRawValue */
+};
+
+static uint32_t effect_object(void)
+{
+    static uint32_t cached;
+    if (!cached)
+        cached = com_create_named("ID3DXEffect", effect_methods,
+                                  (int)(sizeof(effect_methods) /
+                                        sizeof(effect_methods[0])), 16);
+    return cached;
+}
+
+/* D3DXCreateEffect(pDevice, pSrcData, SrcDataLen, pDefines, pInclude, Flags,
+ * pPool, ppEffect, ppCompilationErrors) */
+static void d3dx_CreateEffect(void)
+{
+    uint32_t pp = arg32(7), errs = arg32(8);
+    uint32_t obj = effect_object();
+    if (pp)
+        M32(pp) = obj;
+    if (errs)
+        M32(errs) = 0;
+    if (getenv("OTOMEDIUS_EFFECTDBG")) {
+        uint32_t src = arg32(1), len = arg32(2);
+        static unsigned n;
+        if (n++ < 8) {
+            char buf[96];
+            int i = 0;
+            if (src)
+                for (; i < 80 && i < (int)len && MEM[src + i] &&
+                       i < (int)sizeof(buf) - 1; i++)
+                    buf[i] = (MEM[src + i] >= 32 && MEM[src + i] < 127) ?
+                             (char)MEM[src + i] : ' ';
+            buf[i] = 0;
+            fprintf(stderr, "d3dx9: CreateEffect #%u len=%u src=%08x \"%s\"\n",
+                    n, len, src, buf);
+        }
+    }
+    RET32(0);   /* S_OK */
 }
 static void d3dx_CreateEffectPool(void)
 {
@@ -649,8 +886,8 @@ const import_def_t d3dx9_imports[] = {
     {"d3dx9_32.dll", "D3DXMatrixTranspose", d3dx_MatrixTranspose, 2},
     {"d3dx9_32.dll", "D3DXPlaneTransform", d3dx_PlaneTransform, 3},
     {"d3dx9_32.dll", "D3DXVec2Hermite", d3dx_Vec2Hermite, 6},
-    {"d3dx9_32.dll", "D3DXVec3TransformNormalArray", d3dx_Vec3TransformNormalArray, 5},
-    {"d3dx9_32.dll", "D3DXVec3TransformArray", d3dx_Vec3TransformArray, 5},
+    {"d3dx9_32.dll", "D3DXVec3TransformNormalArray", d3dx_Vec3TransformNormalArray, 6},
+    {"d3dx9_32.dll", "D3DXVec3TransformArray", d3dx_Vec3TransformArray, 6},
     {"d3dx9_32.dll", "D3DXVec3Transform", d3dx_Vec3Transform, 3},
     {"d3dx9_32.dll", "D3DXVec2Normalize", d3dx_Vec2Normalize, 2},
     {"d3dx9_32.dll", "D3DXCreateTexture", d3dx_CreateTexture, 8},

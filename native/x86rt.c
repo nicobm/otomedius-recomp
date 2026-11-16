@@ -270,6 +270,35 @@ void x86_dispatch(uint32_t addr)
     cpu_t *cpu = x86_cpu();
     extern void game_config_after_reset(uint32_t addr);   /* config.c */
     extern int  x86_patch_call(uint32_t addr);            /* patches.c */
+    /* OTOMEDIUS_TRIPWIRE=<hex>[,<hex>...]: abort and dump when one of these
+     * dwords stops looking like a code address.  Used to catch wild writes
+     * into small job lists without polling every store. */
+    {
+        static uint32_t tw[8];
+        static int tw_n = -1;
+        if (tw_n < 0) {
+            const char *e = getenv("OTOMEDIUS_TRIPWIRE");
+            tw_n = 0;
+            if (e && *e) {
+                char buf[256];
+                snprintf(buf, sizeof(buf), "%s", e);
+                for (char *p = buf; *p && tw_n < 8; ) {
+                    tw[tw_n++] = (uint32_t)strtoul(p, &p, 16);
+                    if (*p == ',')
+                        p++;
+                }
+            }
+        }
+        for (int i = 0; i < tw_n; i++) {
+            uint32_t v = M32(tw[i]);
+            if (v && (v < 0x400000u || v >= 0x5F0000u)) {
+                fprintf(stderr, "tripwire: %08x = %08x after dispatch %08x "
+                        "(prev %08x)\n", tw[i], v, addr, g_trace[(g_trace_pos - 1) & 63]);
+                x86_trace_dump();
+                abort();
+            }
+        }
+    }
     game_config_after_reset(addr);
     if (x86_patch_call(addr))
         return;

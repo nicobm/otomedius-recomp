@@ -18,6 +18,11 @@ void     font_init(void);
 void     font_shutdown(void);
 int      font_available(void);
 
+/* Register a font file that the game supplies in memory (AddFontMemResourceEx).
+ * The blob lives in emulated MEM for the rest of the run, so FreeType can keep
+ * a memory face backed by it.  Returns 1 when the blob is a usable font. */
+int      font_add_memory(const void *data, unsigned long size);
+
 /* Create/select/delete a GDI font object.  `handle` is the value returned by
  * CreateFontA and must be passed to SelectObject/DeleteObject. */
 uint32_t font_create(int height, const char *face);

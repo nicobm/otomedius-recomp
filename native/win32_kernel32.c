@@ -113,11 +113,14 @@ static handle_t *handle_get(uint32_t h)
 }
 
 /* ------------------------------------------------------------- allocator */
-/* Two arenas inside the emulated space: heap blocks and page allocations. */
+/* Two arenas inside the emulated space: heap blocks and page allocations.
+ * The file-mapping window must not overlap either of them: the Title/attract
+ * paks alone push it past 96 MiB, and the old 0x0A000000..0x20000000 window
+ * ran straight into the heap at 0x10000000, overwriting live job lists. */
 #define HEAP_ARENA_BASE  0x10000000u
-#define HEAP_ARENA_END   0x30000000u
-#define MAP_ARENA_BASE   0x0A000000u
-#define MAP_ARENA_END    0x20000000u
+#define HEAP_ARENA_END   0x20000000u
+#define MAP_ARENA_BASE   0x20000000u
+#define MAP_ARENA_END    0x30000000u
 #define PAGE_ARENA_BASE  0x30000000u
 #define PAGE_ARENA_END   0x60000000u
 
@@ -134,20 +137,76 @@ static uint32_t g_heap_bump = HEAP_ARENA_BASE;
 static uint32_t g_page_bump = PAGE_ARENA_BASE;
 static pthread_mutex_t g_alloc_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static uint32_t g_map_bump = MAP_ARENA_BASE;
+/* File mapping views live in their own window of the emulated space.  Views
+ * are now reclaimed by UnmapViewOfFile (the attract loops through the same
+ * paks, and a pure bump allocator eventually exhausts the window).  The
+ * allocator tracks 64 KiB pages in a bitmap and remembers each view's size so
+ * the view can be released by its base pointer alone. */
+#define MAP_PAGE_SHIFT 16
+#define MAP_PAGE_SIZE  (1u << MAP_PAGE_SHIFT)
+#define MAP_PAGES      ((MAP_ARENA_END - MAP_ARENA_BASE) >> MAP_PAGE_SHIFT)
+#define MAX_MAP_VIEWS  256
+static uint8_t  g_map_used[MAP_PAGES];
+static struct { uint32_t base; uint32_t pages; } g_map_views[MAX_MAP_VIEWS];
+static unsigned g_map_views_n;
+static pthread_mutex_t g_map_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* File mapping views live in their own window of the emulated space. */
 static uint32_t map_arena_alloc(uint32_t size)
 {
-    size = (size + 4095u) & ~4095u;
+    unsigned pages, i, run, first;
+    uint32_t base = 0;
+
     if (!size)
-        size = 4096;
-    if (g_map_bump + size > MAP_ARENA_END)
+        size = MAP_PAGE_SIZE;
+    size = (size + MAP_PAGE_SIZE - 1u) & ~(MAP_PAGE_SIZE - 1u);
+    pages = size >> MAP_PAGE_SHIFT;
+    if (pages > MAP_PAGES)
         return 0;
-    uint32_t p = g_map_bump;
-    g_map_bump += size;
-    memset(MEM + p, 0, size);
-    return p;
+
+    pthread_mutex_lock(&g_map_lock);
+    for (i = 0; i + pages <= MAP_PAGES; ) {
+        if (g_map_used[i]) {
+            i++;
+            continue;
+        }
+        for (run = 0, first = i; run < pages && i + run < MAP_PAGES &&
+                                    !g_map_used[i + run]; run++)
+            ;
+        if (run == pages) {
+            for (unsigned k = 0; k < pages; k++)
+                g_map_used[first + k] = 1;
+            base = MAP_ARENA_BASE + (first << MAP_PAGE_SHIFT);
+            if (g_map_views_n < MAX_MAP_VIEWS) {
+                g_map_views[g_map_views_n].base = base;
+                g_map_views[g_map_views_n].pages = pages;
+                g_map_views_n++;
+            }
+            break;
+        }
+        i = first + run;
+    }
+    pthread_mutex_unlock(&g_map_lock);
+
+    if (!base)
+        return 0;
+    memset(MEM + base, 0, size);
+    return base;
+}
+
+static void map_arena_free(uint32_t base)
+{
+    pthread_mutex_lock(&g_map_lock);
+    for (unsigned i = 0; i < g_map_views_n; i++) {
+        if (g_map_views[i].base != base)
+            continue;
+        unsigned first = (base - MAP_ARENA_BASE) >> MAP_PAGE_SHIFT;
+        for (unsigned k = 0; k < g_map_views[i].pages; k++)
+            if (first + k < MAP_PAGES)
+                g_map_used[first + k] = 0;
+        g_map_views[i] = g_map_views[--g_map_views_n];
+        break;
+    }
+    pthread_mutex_unlock(&g_map_lock);
 }
 
 /* The scene manager object lives around 0x1003D5F8; if that block is freed
@@ -997,7 +1056,13 @@ static void k_MapViewOfFile(void)
     RET32(base);
 }
 
-static void k_UnmapViewOfFile(void) { RET32(1); }
+static void k_UnmapViewOfFile(void)
+{
+    uint32_t base = arg32(0);
+    if (base >= MAP_ARENA_BASE && base < MAP_ARENA_END)
+        map_arena_free(base);
+    RET32(1);
+}
 
 /* ------------------------------------------------------------- memory */
 static void k_GetProcessHeap(void)

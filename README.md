@@ -43,11 +43,11 @@ Version: see [`VERSION`](VERSION).
 | `kernel32` (files, heap, threads, TLS, code pages, time, file mappings) | working |
 | Konami AVS layer (`libacio`, `libbms`, `libtouchpanel`) | offline/free-play cabinet emulation |
 | `user32` window + message loop | minimal |
-| `d3d9`/`d3dx9` objects, math, DDS textures | interfaces verified against `d3d9.h`; texture `LockRect`/upload works by default |
+| `d3d9`/`d3dx9` objects, math, DDS textures | interfaces verified against `d3d9.h`; textures decode by pixel format (DXT1/3/5, RGB24, R5G6B5, A1R5G5B5, A4R4G4B4) and upload works; `ID3DXEffect` is a working stub (packages that compile HLSL effects now finish loading) |
 | `dsound` (device, buffers, lock/play) | working; voices are mixed to SDL3 (volume/pan/rate/loop) |
 | `dshow` (opening movie: graph, filter, pin) | interfaces working; the WMV3 intro is decoded with the runtime's ffmpeg and uploaded into the game's own video texture |
-| Fonts / text | working: `GGO_GRAY8_BITMAP`/`GGO_BITMAP` implemented; the game's `SysFont.dds`/`gradius_font.dds` atlases are loaded through a real `D3DXCreateTextureFromFileExA` and text is legible |
-| Renderer (2D, sprites, playfield) | 2D path working (signed-area fix in `draw_tri`); the game runs its main loop, creates a 1280×1024 device and draws every frame (`BeginScene`/`EndScene`/`Present`), including the console overlay; the 3D playfield path is still pending |
+| Fonts / text | working: `GGO_GRAY8_BITMAP`/`GGO_BITMAP` implemented; `AddFontMemResourceEx` registers the game's own fonts (DFGothic/DFMincho/DFPOP…) and `SysFont.dds`/`gradius_font.dds` load through a real `D3DXCreateTextureFromFileExA` |
+| Renderer (2D, sprites, playfield) | 2D path working (signed-area fix in `draw_tri`); the game runs its main loop, creates a 1280×1024 device and draws every frame (`BeginScene`/`EndScene`/`Present`); the attract HUD is visible; the 3D playfield path (XYZ + `.x` meshes) is still pending |
 | Audio | `dsound` voices are mixed to SDL3 (volume/pan/rate/loop); the intro movie track (WMAv2) plays cleanly through the same stream |
 
 Today the recompiled game boots completely: the MSVC CRT runs, the window is
@@ -92,12 +92,25 @@ mixed into one 48 kHz stereo stream with volume/pan/rate/loop, and the intro
 audio no longer stutters (the audio ffmpeg decodes ahead instead of running
 with `-re`).
 
-What is still missing: after the attract tutorial the screen stays on a white
-fade while `CDemoPlayMan` is stuck in its state 4 (creating `CGameMan`), the
-native movie quad still doubles its X scale (the port composites the video
-instead), and the software rasteriser runs at ~26–36 fps.  The detailed state
-and the next three steps are in [`docs/HANDOVER.md`](docs/HANDOVER.md)
-(section 10); the ready-to-paste next-session prompt is
+The attract now runs: once the eye-catch ends, `CDemoPlayMan` builds
+`CGameMan` and enters state 5, and the 2D HUD (player portrait, bars, buttons)
+is drawn. The blocker was not the fade: `D3DXCreateEffect` returned `E_FAIL`,
+which aborted the build of `Stage01.pak` (so the package never became ready and
+`0x403DB0` suspended every manager with `mask220 = 0xFFFFFFFF`). A functional
+`ID3DXEffect` stub lets the package finish loading. The port now also
+registers the game's own font files through a real `AddFontMemResourceEx`,
+keeps the file-mapping arena out of the heap (it used to overwrite live job
+lists), shares one COM vtable per class (a per-object vtable exhausted the
+fixed native-thunk table after a few thousand frames), and implements
+`GetBackBuffer`/`GetDesc`.
+
+What is still missing: the **3D layer**. The attract scene expects `.x` model
+and animation data from `D3DXLoadMeshHierarchyFromXInMemory` (a stub here) and
+the XYZ vertex path (FVF `0x142`/`0x144`, transforms, z-buffer) is not complete,
+so the background and the player ship are absent. The HUD text strip is also
+still mis-scaled, and the software rasteriser runs at ~26–36 fps. The detailed
+state and the next three steps are in [`docs/HANDOVER.md`](docs/HANDOVER.md)
+(section 11); the ready-to-paste next-session prompt is
 [`docs/HANDOVER_PROMPT.md`](docs/HANDOVER_PROMPT.md).
 
 ## Requirements
@@ -137,6 +150,25 @@ flatpak run io.github.nicobm.OtomediusRecomp
 
 See [`FLATPAK.md`](FLATPAK.md) for the package names per distribution and for
 what the sandbox is allowed to access.
+
+## Testing (headless, silent)
+
+[`tests/smoke.sh`](tests/smoke.sh) is the reproducible smoke test. It boots the
+game with the software renderer and SDL's **dummy audio driver**, stops after a
+fixed number of presents and checks: clean exit, no dispatch outside the
+recompiled code, `CDemoPlayMan` reaching state 5, `CGameMan` leaving
+`mask220 = 0`, and the native-thunk table not being exhausted.
+
+```sh
+# local agent tree (.work next to the repository)
+OTOMEDIUS_SMOKE_LOG=/tmp/opencode/smoke.log sh tests/smoke.sh
+
+# against another build/dump
+OTOMEDIUS_BIN=out/otomedius-recomp OTOMEDIUS_DIR=/path/to/dump sh tests/smoke.sh
+```
+
+The script always sets `SDL_AUDIODRIVER=dummy`, so tests are quiet (including
+the intro movie's audio). For manual runs use the same variable.
 
 ## Controls
 
@@ -219,7 +251,14 @@ AZERTY, QWERTZ and other layouts.
 | `OTOMEDIUS_MOVIE_SIZE=WxH` | override the movie size used by the decoder (default 640x512) |
 | `OTOMEDIUS_NATIVE_MOVIE=1` | leave the movie to the game's own `0x43F540` draw instead of compositing the texture (diagnostic) |
 | `OTOMEDIUS_LOADER_GUARD=1` | force the async loader to report "done" after ~7 s (old workaround, off by default) |
-| `OTOMEDIUS_BOOTDBG=1` | trace the boot/attract state machine, the loader (`LOADER` lines) and the logo package |
+| `OTOMEDIUS_BOOTDBG=1` | trace the boot/attract state machine, the loader (`LOADER` lines), the `CGameMan` constructor, `0x403DB0` log ids and corrupted job lists |
+| `OTOMEDIUS_MALLOCDBG=1` | with `OTOMEDIUS_BOOTDBG`, also print the first 400 `MallocLocal` calls |
+| `OTOMEDIUS_EFFECTDBG=1` | print the first `D3DXCreateEffect` shader blobs (size and ASCII preview) |
+| `OTOMEDIUS_TRIPWIRE=addr[,addr…]` | abort with a dispatch trace when one of those dwords stops looking like code (wild-write detector) |
+| `OTOMEDIUS_TEXDBG=1` | print every texture object creation and upload |
+| `OTOMEDIUS_TEXDUMP=WxH` | dump the first decoded texture of that size to `/tmp/opencode/tex_<obj>.ppm` |
+| `OTOMEDIUS_SYSFONT=1` | ignore the game's embedded fonts and use the system font |
+| `OTOMEDIUS_WATCHDOG=1` | dump every emulated thread's state every 2 s (deadlock diagnosis) |
 | `OTOMEDIUS_DUMP_EVERY=n` | with `OTOMEDIUS_DUMP_FB`, dump a frame every `n` presents starting at `OTOMEDIUS_DUMP_AT` (files get a `.NNNNN` suffix) |
 | `OTOMEDIUS_DRAWDBG=n` | print every 2D draw (FVF, texture, render/sampler state, first vertices) of present `n`; also prints `SKIP`/`DISCARD` draws and the WORLD/VIEW/PROJ matrices |
 | `OTOMEDIUS_TEXFMT=1` | print the DDS format/size of textures created from memory |

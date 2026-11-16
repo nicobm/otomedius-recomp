@@ -11,9 +11,32 @@
 #define _GNU_SOURCE
 unsigned render_presents(void);
 #include "win32.h"
+#include "d3d9.h"
 
 #include <time.h>
 #include <string.h>
+
+/* 0x4ecbf3 - CPlayer02::Init waits for its motion/animation interface.
+ *
+ * The interface comes from the .x skeletal animation that
+ * D3DXLoadMeshHierarchyFromXInMemory would build; this port does not parse .x
+ * files yet, so the field at scene+0x150 is NULL and the original code
+ * dereferences address 0.  When the field is empty, install a tiny COM object
+ * whose methods do nothing so the attract can keep running (the player model
+ * will be missing, but the rest of the scene/state machine advances). */
+static void model_stub(void) { }
+static uint32_t fake_model_iface(void)
+{
+    static uint32_t obj;
+    if (!obj) {
+        static const method_t m[4] = {
+            {model_stub, 3}, {model_stub, 3}, {model_stub, 3}, {model_stub, 3}
+        };
+        obj = com_create(m, 4, 0x50);
+        M32(obj + 0x44) = obj + 4;   /* the game expects [field+0x44] */
+    }
+    return obj;
+}
 
 /* 0x40ED00 - file integrity check.
  *
@@ -38,6 +61,21 @@ static int skip_chksum(void)
 int x86_patch_call(uint32_t addr)
 {
     cpu_t *cpu = x86_cpu();
+
+    /* See fake_model_iface(): keep CPlayer02::Init from dereferencing the
+     * missing .x animation interface. */
+    if (addr == 0x4ecbf3u) {
+        uint32_t self = cpu->esi;
+        uint32_t a = self ? M32(self + 0x94u) : 0;
+        uint32_t b = a ? M32(a + 8u) : 0;
+        if (b && !M32(b + 0x150u)) {
+            M32(b + 0x150u) = fake_model_iface();
+            static int fired;
+            if (!fired++)
+                fprintf(stderr, "config: no .x animation for this scene, "
+                        "using an empty motion object\n");
+        }
+    }
 
     /* OTOMEDIUS_BOOTDBG=1 traces the boot/attract hand-off: the state and
      * sub-state of the manager, the local-heap allocator and the manager
@@ -68,9 +106,11 @@ int x86_patch_call(uint32_t addr)
                     M32(0x5BC91Cu), M32(0x5DCF90u), M32(0x5DCF94u));
         } else if (addr == 0x4142B0u) {
             uint32_t desc = M32(cpu->esp + 4u), size = M32(cpu->esp + 8u);
-            fprintf(stderr, "bootdbg: MallocLocal(%u) desc=%08x first=%08x "
-                    "name=%08x\n", size, desc, desc ? M32(desc + 4u) : 0,
-                    desc ? M32(desc) : 0);
+            static unsigned nmalloc;
+            if (getenv("OTOMEDIUS_MALLOCDBG") && nmalloc++ < 400)
+                fprintf(stderr, "bootdbg: MallocLocal(%u) desc=%08x first=%08x "
+                        "name=%08x\n", size, desc, desc ? M32(desc + 4u) : 0,
+                        desc ? M32(desc) : 0);
         } else if (addr == 0x429210u) {
             fprintf(stderr, "bootdbg: manager ctor this=%08x slot258=%08x\n",
                     cpu->esi, M32(0x5DE258u));
@@ -80,13 +120,78 @@ int x86_patch_call(uint32_t addr)
              * CGameMan in 0x5DE260. */
             uint32_t self = cpu->ecx;
             static int last = -1;
+            static unsigned present_last;
             int st = self ? M8(self + 0xAu) : -1;
-            if (st != last) {
+            unsigned p = render_presents();
+            if (st != last || p - present_last >= 120u) {
                 fprintf(stderr, "bootdbg: [present %u] DEMO state=%d "
-                        "slot25c=%08x slot260=%08x io=%u mask220=%08x\n",
-                        render_presents(), st, M32(0x5DE25Cu),
-                        M32(0x5DE260u), M8(0x5E2136u), M32(0x5DE220u));
+                        "slot25c=%08x slot260=%08x io=%u mask220=%08x "
+                        "slot258=%08x\n",
+                        p, st, M32(0x5DE25Cu),
+                        M32(0x5DE260u), M8(0x5E2136u), M32(0x5DE220u),
+                        M32(0x5DE258u));
                 last = st;
+                present_last = p;
+            }
+        } else if (addr == 0x42E1F0u) {
+            /* CGameMan constructor called from CDemoPlayMan state 4. */
+            uint32_t self = M32(cpu->esp + 4u);
+            static unsigned n;
+            fprintf(stderr, "bootdbg: [present %u] CGameMan ctor #%u this=%08x "
+                    "slot260=%08x mask220=%08x\n", render_presents(), ++n,
+                    self, M32(0x5DE260u), M32(0x5DE220u));
+        } else if (addr == 0x429443u) {
+            fprintf(stderr, "bootdbg: [present %u] CGameMan ctor returned, "
+                    "eax=%08x slot260=%08x mask220=%08x\n",
+                    render_presents(), cpu->eax, M32(0x5DE260u),
+                    M32(0x5DE220u));
+        } else if (addr == 0x4095a0u) {
+            /* Generic job-list runner (sorts then calls every record).  A bad
+             * record here means something overwrote the list or its count. */
+            uint32_t self = cpu->esi;
+            unsigned n = self ? M32(self + 0x10u) : 0;
+            uint32_t b = self ? M32(self + 8u) : 0;
+            int bad = n > 16;
+            for (unsigned i = 0; !bad && i < n; i++) {
+                uint32_t fn = M32(b + i * 12u + 4u);
+                if (fn && (fn < 0x400000u || fn >= 0x5F0000u))
+                    bad = 1;
+            }
+            if (bad) {
+                fprintf(stderr, "bootdbg: [present %u] BAD RUNLIST self=%08x "
+                        "base=%08x cur=%08x n=%u\n", render_presents(), self,
+                        b, self ? M32(self + 0xCu) : 0, n);
+                for (unsigned i = 0; i < n && i < 24; i++)
+                    fprintf(stderr, "    rec[%u] %08x: prio=%08x fn=%08x "
+                            "arg=%08x\n", i, b + i * 12u, M32(b + i * 12u),
+                            M32(b + i * 12u + 4u), M32(b + i * 12u + 8u));
+            }
+        } else if (addr == 0x4ecbf3u) {
+            uint32_t self = cpu->esi;
+            uint32_t a = self ? M32(self + 0x94u) : 0;
+            uint32_t b = a ? M32(a + 8u) : 0;
+            uint32_t c = b ? M32(b + 0x150u) : 0;
+            fprintf(stderr, "bootdbg: [present %u] stage obj self=%08x "
+                    "vt=%08x a=%08x b=%08x bvt=%08x c=%08x\n",
+                    render_presents(), self, self ? M32(self) : 0, a, b,
+                    b ? M32(b) : 0, c);
+        } else if (addr == 0x403DB0u) {
+            uint32_t msg = M32(cpu->esp + 8u), id = M32(cpu->esp + 12u);
+            static int last_id = -1;
+            static unsigned nlog;
+            if ((int)id != last_id && nlog < 40) {
+                char buf[128];
+                const unsigned char *p = msg ? (const unsigned char *)(MEM + msg) : 0;
+                int i = 0;
+                if (p)
+                    for (; i < (int)sizeof(buf) - 1 && p[i]; i++)
+                        buf[i] = (p[i] >= 32 && p[i] < 127) ? (char)p[i] : '?';
+                buf[i] = 0;
+                fprintf(stderr, "bootdbg: [present %u] LOG id=%d (0x%x) msg=%08x "
+                        "\"%s\" mask220=%08x\n", render_presents(), (int)id, id,
+                        msg, msg ? buf : "", M32(0x5DE220u));
+                last_id = (int)id;
+                nlog++;
             }
         } else if (addr == 0x439550u || addr == 0x439BB0u) {
             uint32_t pkg = M32(0x5DE0BCu);

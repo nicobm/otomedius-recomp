@@ -31,9 +31,9 @@
 > tabla de thunks fija, rasterizador con estados D3D, fondo del Title roto).
 > Donde §3–§8 contradigan a §9, manda §9.
 >
-> **Sesión más reciente: ver §10** (fondo del Title y attract resueltos:
-> DDS RGB24/R5G6B5/A1R5G5B5, mezclador dsound→SDL, ventana configurable y
-> dump al pulsar Esc). Donde §1–§9 contradigan a §10, manda §10.
+> **Sesión más reciente: ver §11** (el attract corre: `ID3DXEffect` real,
+> fuentes del juego, arenas heap/map separadas, back buffer y HUD 2D; falta
+> el 3D `.x`/XYZ). Donde §1–§10 contradigan a §11, manda §11.
 
 ---
 
@@ -1786,6 +1786,209 @@ Pendiente tras esta sesión: dejar correr el attract más allá del fade de
 carga (present > 6200) para ver el eye-catch y el demo (`CGameMan`), añadir
 el camino XYZ + transforms + z-buffer si el demo usa 3D, y subir el mezclador
 al Flatpak (el hilo de audio necesita el dispositivo PulseAudio del sandbox).
+
+---
+
+## 11. Sesión 2026-11-16 (quinta parte): el attract corre — efecto D3DX real, fuentes del juego, arenas y HUD
+
+> **Esta sección manda sobre §1–§10.** El bloqueo que §10 describía como
+> "pantalla blanca con `mask220=0xFFFFFFFF` y `CDemoPlayMan` en state 4" está
+> resuelto: el attract entra en **state 5**, construye `CGameMan` sin envenenar
+> la máscara y dibuja el **HUD 2D** (retrato Player 1, barras, botones). Lo que
+> falta ahora es el **3D** (modelos `.x` + pipeline XYZ).
+
+### 11.1 Causa raíz real del bloqueo (corrige §10)
+
+El par de logs `2302:Failed Create Shader` / `2306:Failed Build` **no era
+cosmético**. En `0x418040` (worker del pak) → `0x4186F0` (build del grupo),
+`0x418B63` llama a `D3DXCreateEffect`; si devuelve `E_FAIL` se registra 2302
+(`0x418C6A`) y el build del paquete se aborta (2306 en `0x41812B`). Por eso
+`Stage01.pak` nunca marcaba `pkg+0x40 = 1`; `CGameMan::CGameMan` (`0x42E1F0`)
+veía el pak STAGE (`0x5DE0A0`) sin cargar, registraba **1036 "Not load pak
+STAGE"** y `0x403DB0` ponía `[0x5DE220] = 0xFFFFFFFF`, suspendiendo todos los
+managers. El porqué de que el juego no avanzara era, por tanto, el compilador
+de efectos HLSL, no el fade.
+
+Cadena verificada tras el arreglo:
+
+```
+present 4160  DEMO state=0
+present 4163  DEMO state=3 slot25c=10176d78
+present 4277  DEMO state=4
+present 4277  CGameMan ctor this=1018bca0
+present 4277  CGameMan ctor returned eax=1018bca0 mask220=00000000
+present 4278  DEMO state=5 slot260=1018bca0
+present 4398  DEMO state=5 (se mantiene)
+```
+
+Corrida headless con `SDL_AUDIODRIVER=dummy` hasta `OTOMEDIUS_QUIT_AT=9000`:
+sin crashes, sin `no recompiled code`, sin agotar thunks. Frame 6000:
+129 quads / 258 vértices, HUD visible (fondo 3D negro).
+
+### 11.2 Cambios de esta sesión (por fichero)
+
+**`native/d3dx9.c`**
+- `ID3DXEffect` stub funcional (tabla de 79 métodos en el orden de
+  `d3dx9effect.h`): `GetParameter*`/`GetTechnique*`/`GetPass*` devuelven un
+  handle no nulo, `Begin` escribe `passes=1`, `SetTechnique`/`BeginPass`/
+  `EndPass`/`End`/`CommitChanges` aceptan, `SetTexture` enlaza el stage 0 y
+  `SetMatrix` guarda la última matriz (`render_set_effect_matrix`).
+  `D3DXCreateEffect` devuelve `S_OK` y escribe `ppEffect = arg7`,
+  `ppCompilationErrors = arg8` (9 argumentos).
+- **`D3DXVec3TransformArray` / `D3DXVec3TransformNormalArray`**: firma real de
+  **6** argumentos `(pOut, OutStride, pV, VStride, pM, n)`. La tabla decía 5:
+  cada llamada dejaba 4 bytes en la pila y acabó convirtiendo una dirección de
+  retorno en `0x101f4960` (heap). `D3DXVec3Transform` ahora escribe también
+  el componente `w`.
+
+**`native/win32_kernel32.c`**
+- Arenas separadas de verdad: `HEAP 0x10000000–0x20000000`,
+  `MAP 0x20000000–0x30000000`, `PAGE 0x30000000–0x60000000`. La ventana de
+  `MapViewOfFile` anterior (`0x0A000000–0x20000000`) se solapaba con el heap:
+  al cargar `Title.pak`/`TitleSnd.pak`/`title_stream.xwb` escribió encima de
+  la lista de jobs (`fn = 0xc954c1a1`). `UnmapViewOfFile` ahora libera de
+  verdad (bitmap de páginas de 64 KiB + tabla base→tamaño).
+
+**`native/d3d9.c`**
+- Vtables **compartidas por clase** (`vtable_for`): antes cada objeto
+  registraba thunks nuevos (22 por textura); ~3000 texturas agotaban la tabla
+  fija de `0x10000` (`imports: too many native thunks`).
+- `dev_GetBackBuffer` devuelve una `IDirect3DSurface9` real de
+  `render_width()×render_height()` en `D3DFMT_A8R8G8B8`; `s_GetDesc` rellena
+  `D3DSURFACE_DESC`. `0x4505E0` lee formato/tamaño del back buffer para crear
+  su textura; con la surface a NULL se llamaba a la dirección 0.
+
+**`native/win32_misc.c` + `native/font.c`**
+- `AddFontMemResourceEx` real: intenta `FT_New_Memory_Face`, devuelve un
+  HANDLE y `*pNumFonts = 1`. El juego registra **DFGothic-SU, DFMincho-SU,
+  DFMaruGothic-Bd, DFPOP2-W9, DFPOPCorn-W12 y DFGothicP-W5** (fuentes
+  auténticas del boot pak). `open_face` usa la fuente del juego si está
+  registrada; `OTOMEDIUS_SYSFONT=1` vuelve a la del sistema (diagnóstico).
+
+**`native/patches.c`**
+- Workaround del bloqueo 3D: en `CPlayer02::Init` (`0x4ECBF3`), si el campo
+  `scene+0x150` (interfaz de animación creada por el loader `.x`) está vacío,
+  se instala un objeto COM vacío con `model_stub` para no desreferenciar NULL.
+  Sin esto el juego moría en `0x4ECBFC` (`mov ecx,[eax+0x150]` →
+  `mov ecx,[ecx+0x44]` → `call [0]`). No dibuja la nave: solo mantiene vivo el
+  state machine.
+- Instrumentación acotada: `OTOMEDIUS_BOOTDBG` (estado del manager, ctor de
+  `CGameMan`, alocaciones no, `LOG` de `0x403DB0` con id/mensaje/`mask220`,
+  `BAD RUNLIST`), `OTOMEDIUS_MALLOCDBG` para `MallocLocal`.
+
+**`native/render.c`**
+- `render_set_effect_matrix` (última matriz de `ID3DXEffect::SetMatrix`).
+- `OTOMEDIUS_TEXDUMP=WxH`: vuelca a `/tmp/opencode/tex_<obj>.ppm` la primera
+  textura decodificada que coincida. Sirve para separar "DXT mal" de "UV/estado
+  mal". La textura `60915380` 512×64 (DXT5) decodifica bien: es una tira de
+  botones hexagonal, no un atlas de texto.
+
+**`native/x86rt.c`**
+- `OTOMEDIUS_TRIPWIRE=addr[,addr…]`: si uno de esos dwords deja de parecer una
+  dirección de código, imprime el último dispatch y aborta con el trace. Así se
+  localizó el solape MapView/heap (`100062ac = eb82d33c tras 0041af5c`, el
+  `MapViewOfFile` del `.xwb`).
+
+**`tests/smoke.sh`** (nuevo)
+- Test de humo reproducible: offscreen + `SDL_AUDIODRIVER=dummy`, 4700
+  presentes, exige exit 0, ausencia de `no recompiled code`, `DEMO state=5`,
+  `CGameMan ctor returned … mask220=00000000` y que no se agote la tabla de
+  thunks.
+
+### 11.3 Cómo reproducir (logs mínimos, sin sonido)
+
+```sh
+# compilar solo lo tocado y enlazar
+sh ../.work/tools/build.sh patches.c d3dx9.c d3d9.c d3d9_objects.c \
+   win32_kernel32.c win32_misc.c font.c render.c x86rt.c
+
+# test de humo (recomendado)
+OTOMEDIUS_SMOKE_LOG=/tmp/opencode/smoke.log sh tests/smoke.sh
+
+# corrida manual con dumps
+cd ../.work/oto
+SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy \
+  OTOMEDIUS_BOOTDBG=1 OTOMEDIUS_DUMP_FB=/tmp/opencode/h \
+  OTOMEDIUS_DUMP_AT=4400 OTOMEDIUS_DUMP_EVERY=600 \
+  OTOMEDIUS_QUIT_AT=9000 ../obj/otomedius-recomp . \
+  > /tmp/opencode/h.log 2>&1
+```
+
+`SDL_AUDIODRIVER=dummy` es obligatorio en tests: el mixer dsound→SDL suena de
+verdad si hay dispositivo.
+
+### 11.4 Estado actual y bloqueos
+
+**Verificado**
+- Boot completo → logos → Warning → vídeo (~60 s) → Title → eye-catch →
+  attract hasta `Stage01.pak`, `CGameMan` y **state 5**.
+- Demo de 3300 frames del `CGameMan` y corrida headless a 9000 presentes sin
+  crash, sin solapes de arena y sin agotar thunks.
+- HUD 2D: retrato de Player 1, barra superior, barras e iconos inferiores.
+- Fuentes reales del juego registradas e importadas a FreeType.
+
+**Bloqueo activo: 3D**
+- `CPlayer02` (vtable `0x56CAFC`, RTTI `0x58AE20`; método índice 2 =
+  `0x4ECBE0`) espera en `scene+0x150` la interfaz del modelo/animación.
+- Esa interfaz la produce el loader `.x` (`0x414960` →
+  `D3DXLoadMeshHierarchyFromXInMemory` en `0x4149FE`), que devuelve `S_OK` con
+  frame/animación NULL en este port. Sin ella no hay nave ni fondo.
+- El workaround de `0x4ECBF3` evita el crash, pero el pipeline de dibujo 3D
+  (FVF `0x142`/`0x144`, `DrawPrimitive`/`DrawIndexedPrimitive`, transforms
+  WORLD/VIEW/PROJ, z-buffer) tampoco está completo: `draw=0` en todos los
+  frames del demo.
+
+**Pendientes secundarios**
+- Texto/barra superior ilegible: la tira de botones 512×64 se estira en un
+  quad ancho (`u 0.000–0.524`) junto a quads de 16 px; revisar UV por celdas,
+  blending y el uso de `D3DTS_*`/`TSS` en esos draws.
+- `FreeLocal error 1172/1173/1174` al teardown **solo con `BOOTDBG`**; con la
+  corrida normal no aparecen. Sospecha: datos `.x` ausentes + objeto falso.
+- Quad nativo `0x43F540` con X duplicada; rasterizador a 26–36 fps.
+
+### 11.5 Plan inmediato (3 pasos)
+
+1. **Modelos `.x`**: leer `0x414960` (loader) y `0x4EA0E0` (constructor base de
+   `CPlayer02`) para ver qué estructuras espera el juego; decidir entre parser
+   `.x` mínimo (frames + mesh + materiales) o HLE a partir de los chunks de
+   `Player02.pak`/`Stage01.pak`. Comprobar también `D3DXLoadMeshHierarchy…` y
+   la allocator interface que pasa el juego.
+2. **Pipeline XYZ en `render.c`**: completar el camino de vértices XYZ (FVF
+   `0x142`/`0x144`): `v' = v · W · V · P`, dividir por `w`, viewport, z-test y
+   UV perspective-correct; usar `g_xform` (VIEW/PROJ/WORLD) y
+   `g_effect_xform`. Enlazar `DrawPrimitive`/`DrawIndexedPrimitive` con los
+   vertex/index buffers ya lockeables.
+3. **HUD y rendimiento**: corregir el quad ancho (UV/estado), revisar DXT5 y
+   blending de los textos, y luego perfilar `draw_tri`/`tex_sample`.
+
+### 11.6 Entorno / notas de la sesión
+
+- **REA** está disponible como MCP, pero su provider Ghidra **no arranca** en
+  este entorno (`GhidraLaunchError`: falta `launch.properties` del Flatpak).
+  Se trabajó con `capstone` local, el código generado (`../.work/gen/rc_*.c`) e
+  instrumentación en runtime. Si se arregla Ghidra o se usa el provider Rizin,
+  es el atajo natural para el 3D.
+- Regla intacta: tocar `native/x86rt.h` obliga a regenerar y recompilar los 85
+  `rc_*.c`. Los cambios de esta sesión son solo `native/*.c`.
+- Logs grandes = tokens: usar `OTOMEDIUS_QUIT_AT` bajo, `grep`/`head`/`tail` y
+  la instrumentación acotada; no volcar logs completos al contexto.
+
+### 11.7 Ficheros de esta sesión
+
+```
+M native/d3dx9.c           ID3DXEffect stub; Vec3TransformArray 6 args; w
+M native/d3d9.c            vtables compartidas; back buffer real
+M native/d3d9_objects.c    GetDesc de surface; TEXDBG
+M native/win32_kernel32.c  arenas heap/map; UnmapViewOfFile real
+M native/win32_misc.c      AddFontMemResourceEx real
+M native/font.c            fuentes en memoria; OTOMEDIUS_SYSFONT
+M native/patches.c         0x4ECBF3 workaround; BOOTDBG/MALLOCDBG acotado
+M native/render.c          render_set_effect_matrix; OTOMEDIUS_TEXDUMP
+M native/x86rt.c           OTOMEDIUS_TRIPWIRE
+A tests/smoke.sh           test de humo headless
+M docs/HANDOVER.md         esta sección
+M docs/HANDOVER_PROMPT.md  prompt de la sesión siguiente
+```
 
 ---
 

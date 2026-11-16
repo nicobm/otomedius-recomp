@@ -140,6 +140,9 @@ static uint32_t g_tss[32];
 static uint32_t g_ss[16];
 /* WORLD / VIEW / PROJECTION as last set by SetTransform (D3D row-major). */
 static float g_xform[3][16];
+/* Last matrix bound through ID3DXEffect::SetMatrix (the effect path uses it
+ * instead of SetTransform; kept for the future 3D vertex path). */
+static float g_effect_xform[16];
 enum { RS_ALPHATESTENABLE = 15, RS_SRCBLEND = 19, RS_DESTBLEND = 20,
        RS_ALPHAREF = 24, RS_ALPHAFUNC = 25, RS_ALPHABLENDENABLE = 27,
        RS_TEXTUREFACTOR = 60 };
@@ -567,6 +570,36 @@ static void draw_up_vertices(uint32_t prim, uint32_t prim_count, uint32_t data,
             tex = (uint32_t *)px;
             tw = w;
             th = h;
+            /* OTOMEDIUS_TEXDUMP=WxH dumps the first matching decoded texture
+             * as PPM, which is how a bad DXT decode is told apart from a bad
+             * palette or UV mapping. */
+            {
+                const char *e = getenv("OTOMEDIUS_TEXDUMP");
+                static int done;
+                if (e && !done) {
+                    unsigned fw = 0, fh = 0;
+                    if (sscanf(e, "%ux%u", &fw, &fh) == 2 &&
+                        fw == w && fh == h) {
+                        char path[256];
+                        done = 1;
+                        snprintf(path, sizeof(path), "/tmp/opencode/tex_%08x.ppm",
+                                 g_tex0);
+                        FILE *fp = fopen(path, "wb");
+                        if (fp) {
+                            fprintf(fp, "P6\n%u %u\n255\n", w, h);
+                            for (uint32_t i = 0; i < w * h; i++) {
+                                uint32_t p = px[i];
+                                fputc((int)((p >> 16) & 255), fp);
+                                fputc((int)((p >> 8) & 255), fp);
+                                fputc((int)(p & 255), fp);
+                            }
+                            fclose(fp);
+                            fprintf(stderr, "render: dumped texture %08x %ux%u "
+                                    "to %s\n", g_tex0, w, h, path);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -913,6 +946,12 @@ void render_set_transform(uint32_t state, const void *matrix)
     if (slot >= 0 && matrix)
         memcpy(g_xform[slot], matrix, 16 * sizeof(float));
     platform_transform(state, matrix);
+}
+
+void render_set_effect_matrix(const void *matrix)
+{
+    if (matrix)
+        memcpy(g_effect_xform, matrix, sizeof g_effect_xform);
 }
 
 void render_set_state(uint32_t state, uint32_t value)

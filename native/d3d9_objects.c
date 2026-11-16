@@ -238,6 +238,9 @@ uint32_t texture_create(uint32_t w, uint32_t h, uint32_t levels, uint32_t usage,
     t->pool = pool;
     t->data = emu_alloc(w * h * 4 + 64);
     t->data_size = w * h * 4;
+    if (getenv("OTOMEDIUS_TEXDBG"))
+        fprintf(stderr, "texdbg: CreateTexture %08x %ux%u fmt=%u levels=%u "
+                "usage=%x pool=%u\n", obj, w, h, format, levels, usage, pool);
     if (g_verbose > 1)
         fprintf(stderr, "d3d9: CreateTexture(%ux%u fmt %u) -> %08x data %08x\n",
                 w, h, format, obj, t->data);
@@ -253,6 +256,8 @@ void texture_upload(uint32_t obj, const void *data, uint32_t size, int fmt)
         size = t->data_size;
     memcpy(MEM + t->data, data, size);
     t->fmt = fmt;
+    if (getenv("OTOMEDIUS_TEXDBG"))
+        fprintf(stderr, "texdbg: upload %08x fmt=%d %u bytes\n", obj, fmt, size);
     if (g_verbose > 1)
         fprintf(stderr, "d3d9: texture %08x %ux%u uploaded (%u bytes, fmt %d)\n",
                 obj, t->w, t->h, size, fmt);
@@ -343,7 +348,27 @@ static void s_SetPriority(void) { RET32(0); }
 static void s_GetPriority(void) { RET32(0); }
 static void s_PreLoad(void) {}
 static void s_GetType(void) { RET32(1); }
-static void s_GetDesc(void) { RET32(0); }
+static void s_GetDesc(void)
+{
+    /* D3DSURFACE_DESC: Format, Type, Usage, Pool, MultiSampleType,
+     * MultiSampleQuality, Width, Height.  The scene code uses the back
+     * buffer's format/size to create its render target texture. */
+    surface_t_ *s = surf(arg32(0));
+    uint32_t d = arg32(1);
+    if (!s || !d) {
+        RET32(0x8876086Au);
+        return;
+    }
+    M32(d + 0)  = s->format;
+    M32(d + 4)  = 2;                 /* D3DRTYPE_SURFACE */
+    M32(d + 8)  = 0;                 /* Usage */
+    M32(d + 12) = 0;                 /* Pool */
+    M32(d + 16) = 0;                 /* MultiSampleType */
+    M32(d + 20) = 0;                 /* MultiSampleQuality */
+    M32(d + 24) = s->w;
+    M32(d + 28) = s->h;
+    RET32(0);
+}
 /* IDirect3DSurface9::LockRect(D3DLOCKED_RECT *locked, RECT *rect, DWORD flags) */
 static void s_LockRect(void)
 {
