@@ -80,6 +80,9 @@ void     x86_native_invoke(uint32_t thunk);
 int      x86_is_native_thunk(uint32_t addr);
 uint32_t x86_native_entry(uint32_t thunk);
 
+/* patches.c: address overrides for deliberate deviations (return 1 = handled) */
+int      x86_patch_call(uint32_t addr);
+
 /* dshow.c */
 int      dshow_create_filter_graph(uint32_t rclsid, uint32_t riid, uint32_t ppv);
 
@@ -90,5 +93,10 @@ uint32_t texture_data_of(uint32_t tex);
 /* verbose logging switch (OTOMEDIUS_LOG=1) */
 void  log_printf(const char *fmt, ...);
 extern int g_verbose;
+
+/* config.c: apply oto.ini to the game's variable table (0x5BE328) */
+void  game_config_load(void);
+void  game_config_after_reset(uint32_t addr);
+void  game_state_init(void);
 
 #endif

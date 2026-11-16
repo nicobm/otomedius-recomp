@@ -70,17 +70,68 @@ static void t_GetLevel(void)
 }
 
 static void t_GetLevelDesc(void) { RET32(0); }
-static void t_LockRect(void) { RET32(0x8876086Au); }
+/* IDirect3DTexture9::LockRect(Level, D3DLOCKED_RECT *locked, RECT *rect,
+ * DWORD flags) - the game uploads every texture by locking it and copying its
+ * decoded pixels in, so returning D3DERR_INVALIDCALL here left every texture
+ * blank (all-black preview, invisible sprites). */
+static void t_LockRect(void)
+{
+    uint32_t self = arg32(0);
+    uint32_t locked = arg32(2);
+    texture_t *t = tex(self);
+
+    /* Real D3D9 succeeds here, and that is what OTOMEDIUS_TEXTURES=1 enables:
+     * the game then builds its font atlases and gets past the 1117 halt, but
+     * it currently dies at 0x409C00 (CTexFont) while rasterising the synthetic
+     * glyph outlines.  Until that is fixed the default keeps the historical
+     * behaviour (failure), which leaves the pak loader running. */
+    if (!getenv("OTOMEDIUS_TEXTURES")) {
+        RET32(0x8876086Au);
+        return;
+    }
+    if (!t || !t->data) {
+        RET32(0x8876086Au);   /* D3DERR_INVALIDCALL */
+        return;
+    }
+    if (locked) {
+        M32(locked + 0) = t->w * 4u;   /* Pitch */
+        M32(locked + 4) = t->data;     /* pBits, emulated pointer */
+    }
+    {
+        static int n;
+        if (g_verbose && n++ < 6)
+            fprintf(stderr, "d3d9: tex LockRect(%08x) %ux%u -> %08x\n",
+                    self, t->w, t->h, t->data);
+    }
+    RET32(0);
+}
 static void t_UnlockRect(void) { RET32(0); }
 static void t_AddDirtyRect(void) { RET32(0); }
 
+/* The engine uploads pixels through the level-0 surface
+ * (GetSurfaceLevel -> LockRect -> memcpy), so the surface must share the
+ * texture's pixel buffer - the old code gave it a private one and every
+ * upload went to memory nobody rendered from. */
 static void t_GetSurfaceLevel(void)
 {
     uint32_t level = arg32(1), pp = arg32(2);
-    if (pp)
-        M32(pp) = surface_create(tex(arg32(0))->w, tex(arg32(0))->h,
-                                 tex(arg32(0))->format, 1);
+    texture_t *t = tex(arg32(0));
+    uint32_t s;
+    if (!pp)
+        return;
+    if (!t) {
+        M32(pp) = 0;
+        RET32(0x8876086Au);
+        return;
+    }
+    s = surface_create(t->w, t->h, t->format, 1);
+    if (s) {
+        surf(s)->data = t->data;
+        surf(s)->w = t->w;
+        surf(s)->h = t->h;
+    }
     (void)level;
+    M32(pp) = s;
     RET32(0);
 }
 
@@ -125,6 +176,9 @@ uint32_t texture_create(uint32_t w, uint32_t h, uint32_t levels, uint32_t usage,
     t->pool = pool;
     t->data = emu_alloc(w * h * 4 + 64);
     t->data_size = w * h * 4;
+    if (g_verbose > 1)
+        fprintf(stderr, "d3d9: CreateTexture(%ux%u fmt %u) -> %08x data %08x\n",
+                w, h, format, obj, t->data);
     return obj;
 }
 
@@ -137,8 +191,9 @@ void texture_upload(uint32_t obj, const void *data, uint32_t size, int fmt)
         size = t->data_size;
     memcpy(MEM + t->data, data, size);
     t->fmt = fmt;
-    log_printf("d3d9: texture %08x %ux%u uploaded (%u bytes, fmt %d)", obj, t->w,
-               t->h, size, fmt);
+    if (g_verbose > 1)
+        fprintf(stderr, "d3d9: texture %08x %ux%u uploaded (%u bytes, fmt %d)\n",
+                obj, t->w, t->h, size, fmt);
 }
 
 /* -------------------------------------------------------------- buffers */
@@ -227,11 +282,19 @@ static void s_GetPriority(void) { RET32(0); }
 static void s_PreLoad(void) {}
 static void s_GetType(void) { RET32(1); }
 static void s_GetDesc(void) { RET32(0); }
+/* IDirect3DSurface9::LockRect(D3DLOCKED_RECT *locked, RECT *rect, DWORD flags) */
 static void s_LockRect(void)
 {
-    uint32_t pp = arg32(3);
-    if (pp)
-        M32(pp) = surf(arg32(0))->data;
+    surface_t_ *s = surf(arg32(0));
+    uint32_t locked = arg32(1);
+    if (!s || !s->data) {
+        RET32(0x8876086Au);
+        return;
+    }
+    if (locked) {
+        M32(locked + 0) = s->w * 4u;
+        M32(locked + 4) = s->data;
+    }
     RET32(0);
 }
 static void s_UnlockRect(void) { RET32(0); }
@@ -312,3 +375,188 @@ uint32_t shader_create(uint32_t code_addr, int pixel)
 }
 
 uint32_t texture_data_of(uint32_t o) { return tex(o)->data; }
+
+uint32_t texture_width(uint32_t o) { return tex(o)->w; }
+uint32_t texture_height(uint32_t o) { return tex(o)->h; }
+
+/* ------------------------------------------------------- texture decoding
+ * Textures arrive as raw A8R8G8B8 ("FMT_ARGB") or as compressed DXT1/3/5
+ * blocks (that is what decode_dds() records - it only parses the header).  The
+ * software rasteriser needs linear ARGB, so decode on first use and keep the
+ * result in a small side cache keyed by the emulated texture object. */
+enum { TF_ARGB = 0, TF_DXT1, TF_DXT3, TF_DXT5, TF_L8, TF_A8 };
+
+#define TEX_CACHE 64
+static struct {
+    uint32_t obj, w, h;
+    uint32_t *px;
+} g_tex[64];
+
+static uint32_t *tex_cache_slot(uint32_t obj, uint32_t w, uint32_t h)
+{
+    static unsigned next;
+    for (int i = 0; i < TEX_CACHE; i++)
+        if (g_tex[i].px && g_tex[i].obj == obj && g_tex[i].w == w &&
+            g_tex[i].h == h)
+            return g_tex[i].px;
+    for (int i = 0; i < TEX_CACHE; i++) {
+        if (!g_tex[i].px) {
+            g_tex[i].px = (uint32_t *)malloc((size_t)w * h * 4);
+            g_tex[i].obj = obj;
+            g_tex[i].w = w;
+            g_tex[i].h = h;
+            return g_tex[i].px;
+        }
+    }
+    /* all slots busy: recycle */
+    unsigned s = next++ % TEX_CACHE;
+    free(g_tex[s].px);
+    g_tex[s].px = (uint32_t *)malloc((size_t)w * h * 4);
+    g_tex[s].obj = obj;
+    g_tex[s].w = w;
+    g_tex[s].h = h;
+    return g_tex[s].px;
+}
+
+static uint32_t rgb565(uint32_t c)
+{
+    uint32_t r = (c >> 11) & 0x1F, g = (c >> 5) & 0x3F, b = c & 0x1F;
+    r = (r << 3) | (r >> 2);
+    g = (g << 2) | (g >> 4);
+    b = (b << 3) | (b >> 2);
+    return 0xFF000000u | (r << 16) | (g << 8) | b;
+}
+
+/* one 4x4 colour block (8 bytes) */
+static void dxt_color_block(const uint8_t *b, uint32_t *out, int stride,
+                            int force4, uint32_t alpha_or)
+{
+    uint32_t c0 = (uint32_t)b[0] | ((uint32_t)b[1] << 8);
+    uint32_t c1 = (uint32_t)b[2] | ((uint32_t)b[3] << 8);
+    uint32_t p[4];
+    p[0] = rgb565(c0) | alpha_or;
+    p[1] = rgb565(c1) | alpha_or;
+    if (force4 || c0 > c1) {
+        p[2] = 0xFF000000u | (((rgb565(c0) & 0xFEFEFEu) >> 1) +
+                              ((rgb565(c1) & 0xFEFEFEu) >> 1));
+        p[3] = 0xFF000000u | (((rgb565(c0) & 0xFEFEFEu) * 2 / 3) +
+                              ((rgb565(c1) & 0xFEFEFEu) / 3));
+    } else {
+        p[2] = 0xFF000000u | (((rgb565(c0) & 0xFEFEFEu) >> 1) +
+                              ((rgb565(c1) & 0xFEFEFEu) >> 1));
+        p[3] = 0;   /* transparent black */
+    }
+    uint32_t bits = (uint32_t)b[4] | ((uint32_t)b[5] << 8) |
+                    ((uint32_t)b[6] << 16) | ((uint32_t)b[7] << 24);
+    for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 4; x++, bits >>= 2)
+            out[y * stride + x] = p[bits & 3];
+}
+
+static uint32_t *decode_dxt(uint32_t obj, uint32_t w, uint32_t h, int fmt)
+{
+    const uint8_t *src = MEM + tex(obj)->data;
+    uint32_t *dst, *cached = tex_cache_slot(obj, w, h);
+    uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4;
+    uint32_t bs = (fmt == TF_DXT1) ? 8u : 16u;
+
+    if (!cached)
+        return NULL;
+    dst = cached;
+    for (uint32_t by = 0; by < bh; by++) {
+        for (uint32_t bx = 0; bx < bw; bx++) {
+            const uint8_t *blk = src + ((size_t)by * bw + bx) * bs;
+            uint32_t px[16];
+            uint32_t alpha_or = 0;
+            if (fmt == TF_DXT3) {
+                uint64_t abits = 0;
+                for (int i = 0; i < 8; i++)
+                    abits |= (uint64_t)blk[i] << (i * 8);
+                dxt_color_block(blk + 8, px, 4, 1, 0);
+                for (int i = 0; i < 16; i++) {
+                    uint32_t a = (uint32_t)((abits >> (i * 4)) & 0xF);
+                    px[i] = (px[i] & 0x00FFFFFFu) | ((a * 17u) << 24);
+                }
+            } else if (fmt == TF_DXT5) {
+                uint32_t a0 = blk[0], a1 = blk[1];
+                uint64_t abits = 0;
+                for (int i = 0; i < 6; i++)
+                    abits |= (uint64_t)blk[2 + i] << (i * 8);
+                uint32_t al[8];
+                al[0] = a0;
+                al[1] = a1;
+                if (a0 > a1) {
+                    for (int i = 1; i <= 6; i++)
+                        al[i + 1] = ((7 - i) * a0 + i * a1) / 7;
+                } else {
+                    for (int i = 1; i <= 4; i++)
+                        al[i + 1] = ((5 - i) * a0 + i * a1) / 5;
+                    al[6] = 0;
+                    al[7] = 255;
+                }
+                dxt_color_block(blk + 8, px, 4, 1, 0);
+                for (int i = 0; i < 16; i++) {
+                    uint32_t a = al[(abits >> (i * 3)) & 7];
+                    px[i] = (px[i] & 0x00FFFFFFu) | (a << 24);
+                }
+            } else {
+                dxt_color_block(blk, px, 4, 0, 0xFF000000u);
+            }
+            for (uint32_t y = 0; y < 4; y++) {
+                uint32_t dy = by * 4 + y;
+                if (dy >= h)
+                    break;
+                for (uint32_t x = 0; x < 4; x++) {
+                    uint32_t dx = bx * 4 + x;
+                    if (dx >= w)
+                        break;
+                    dst[(size_t)dy * w + dx] = px[y * 4 + x];
+                }
+            }
+        }
+    }
+    return dst;
+}
+
+/* Linear 0xAARRGGBB pixels for a texture object (NULL if it has no data). */
+const uint32_t *texture_argb(uint32_t obj, uint32_t *w, uint32_t *h)
+{
+    texture_t *t;
+    if (!obj)
+        return NULL;
+    t = tex(obj);
+    if (!t || !t->w || !t->h || !t->data)
+        return NULL;
+    *w = t->w;
+    *h = t->h;
+    switch (t->fmt) {
+    case TF_ARGB:
+        return (const uint32_t *)(MEM + t->data);
+    case TF_L8: {
+        uint32_t *px = tex_cache_slot(obj, t->w, t->h);
+        const uint8_t *s = MEM + t->data;
+        if (!px)
+            return NULL;
+        for (uint32_t i = 0; i < t->w * t->h; i++) {
+            uint32_t v = s[i];
+            px[i] = 0xFF000000u | (v << 16) | (v << 8) | v;
+        }
+        return px;
+    }
+    case TF_A8: {
+        uint32_t *px = tex_cache_slot(obj, t->w, t->h);
+        const uint8_t *s = MEM + t->data;
+        if (!px)
+            return NULL;
+        for (uint32_t i = 0; i < t->w * t->h; i++)
+            px[i] = (uint32_t)s[i] << 24;
+        return px;
+    }
+    case TF_DXT1:
+    case TF_DXT3:
+    case TF_DXT5:
+        return decode_dxt(obj, t->w, t->h, t->fmt);
+    default:
+        return (const uint32_t *)(MEM + t->data);
+    }
+}

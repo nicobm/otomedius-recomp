@@ -27,6 +27,10 @@ static void push_msg(uint32_t hwnd, uint32_t msg, uint32_t wp, uint32_t lp);
 void win_request_quit(void)
 {
     g_quit = 1;
+    /* tells the platform / DestroyWindow / PostQuitMessage paths apart */
+    if (g_verbose)
+        fprintf(stderr, "user32: WM_QUIT requested (caller %p)\n",
+                __builtin_return_address(0));
     /* always deliver WM_QUIT: this is what makes the window close button and
      * Esc end the game */
     push_msg(HWND_MAIN, 0x0012, 0, 0);
@@ -95,7 +99,11 @@ static void u_CreateWindowExA(void)
     RET32(HWND_MAIN);
 }
 
-static void u_DestroyWindow(void) { RET32(1); }
+static void u_DestroyWindow(void)
+{
+    log_printf("user32: DestroyWindow(hwnd %08x) from the game", arg32(0));
+    RET32(1);
+}
 static void u_ShowWindow(void) { RET32(0); }
 static void u_UpdateWindow(void) { RET32(1); }
 static void u_DefWindowProcA(void) { RET32(0); }

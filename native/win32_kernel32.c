@@ -39,6 +39,13 @@ char *win_host_path(const char *guest)
         src = guest + 2;
     while (*src == '\\' || *src == '/')
         src++;
+    /* The cabinet kept its non-volatile memory in E:\\nvmem (testmode.bin,
+     * bookkeep.bin, ea_conf.bin, ...); the dump ships those files in the game
+     * directory itself, so drop that component. */
+    if ((src[0] | 0x20) == 'n' && (src[1] | 0x20) == 'v' &&
+        (src[2] | 0x20) == 'm' && (src[3] | 0x20) == 'e' &&
+        (src[4] | 0x20) == 'm' && (src[5] == '\\' || src[5] == '/'))
+        src += 6;
     size_t n = 0;
     for (; *src && n + 2 < sizeof(tmp); src++)
         tmp[n++] = (*src == '\\') ? '/' : *src;
@@ -60,6 +67,16 @@ typedef struct {
     size_t size;
     uint32_t extra;
 } handle_t;
+
+/* one emulated thread; lives as long as its handle because WaitForSingleObject
+ * needs it after the thread has finished */
+typedef struct {
+    uint32_t start;
+    uint32_t param;
+    uint32_t stack_top;
+    uint32_t teb;
+    volatile int done;
+} thread_arg_t;
 
 #define MAX_HANDLES 4096
 static handle_t g_handles[MAX_HANDLES];
@@ -133,6 +150,12 @@ static uint32_t map_arena_alloc(uint32_t size)
     return p;
 }
 
+/* The scene manager object lives around 0x1003D5F8; if that block is freed
+ * and handed out again while still in use its fields get overwritten (we saw
+ * the sub-state turn into the text "lv_f").  Log any allocator traffic there. */
+#define WATCH_LO 0x1003D000u
+#define WATCH_HI 0x1003E000u
+
 static uint32_t heap_alloc(uint32_t heap, uint32_t size)
 {
     size = (size + 7u) & ~7u;
@@ -154,6 +177,10 @@ static uint32_t heap_alloc(uint32_t heap, uint32_t size)
             break;
     }
     if (g_heap_bump + sizeof(hdr_t) + size > HEAP_ARENA_END) {
+        static int warned;
+        if (!warned++)
+            fprintf(stderr, "kernel32: heap arena exhausted (bump=%08x "
+                    "size=%u)\n", g_heap_bump, size);
         pthread_mutex_unlock(&g_alloc_lock);
         return 0;
     }
@@ -165,6 +192,9 @@ static uint32_t heap_alloc(uint32_t heap, uint32_t size)
     uint32_t p = g_heap_bump + sizeof(hdr_t);
     g_heap_bump += sizeof(hdr_t) + size;
     memset(MEM + p, 0, size);
+    if (g_verbose > 1 && p >= WATCH_LO && p < WATCH_HI)
+        fprintf(stderr, "kernel32: HeapAlloc(%u) -> %08x  [manager range]\n",
+                size, p);
     pthread_mutex_unlock(&g_alloc_lock);
     return p;
 }
@@ -176,6 +206,8 @@ static int heap_free(uint32_t ptr)
     hdr_t *h = (hdr_t *)(MEM + ptr - sizeof(hdr_t));
     if (h->magic != HDR_MAGIC)
         return 0;
+    if (g_verbose > 1 && ptr >= WATCH_LO && ptr < WATCH_HI)
+        fprintf(stderr, "kernel32: HeapFree(%08x) [manager range]\n", ptr);
     h->used = 0;
     return 1;
 }
@@ -733,6 +765,9 @@ static void k_ReadFile(void)
         return;
     }
     ssize_t got = read(h->fd, MEM + buf, n);
+    if (g_verbose > 1)
+        fprintf(stderr, "kernel32: ReadFile(fd %d, %u) -> %zd\n",
+                h->fd, n, got);
     if (readp) {
         M32(readp) = got > 0 ? (uint32_t)got : 0;
     }
@@ -797,6 +832,17 @@ static void k_CloseHandle(void)
         close(h->fd);
     if (h->type == H_MAPPING && h->ptr)
         munmap(h->ptr, h->size);
+    if (h->type == H_THREAD) {
+        /* Keep thread entries alive: the game closes the handle and keeps
+         * polling the same value from its loader pump, and dropping the entry
+         * made WaitForSingleObject() return WAIT_FAILED forever, so the load
+         * state machine never completed. */
+        if (g_verbose > 1)
+            fprintf(stderr, "kernel32: CloseHandle(thread %08x) kept as zombie\n",
+                    arg32(0));
+        RET32(1);
+        return;
+    }
     h->type = H_FREE;
     RET32(1);
 }
@@ -1088,9 +1134,15 @@ static void k_InitializeCriticalSection(void)
 
 static void k_EnterCriticalSection(void)
 {
-    int i = cs_index(arg32(0), 1);
-    if (i >= 0)
+    uint32_t a = arg32(0);
+    int i = cs_index(a, 1);
+    if (i < 0)
+        return;
+    if (pthread_mutex_trylock(&g_cs[i]) != 0) {
+        if (g_verbose > 1)
+            fprintf(stderr, "kernel32: enter cs %08x BLOCKED\n", a);
         pthread_mutex_lock(&g_cs[i]);
+    }
 }
 
 static void k_LeaveCriticalSection(void)
@@ -1155,18 +1207,52 @@ static void k_WaitForSingleObject(void)
 {
     uint32_t h = arg32(0), ms = arg32(1);
     handle_t *hd = handle_get(h);
+    if (g_verbose > 1)
+        fprintf(stderr, "kernel32: WaitForSingleObject(h=%08x type=%d ms=%d)\n",
+                h, hd ? hd->type : -1, (int)ms);
     if (!hd) {
         RET32(0xFFFFFFFFu);
         return;
     }
     if (hd->type == H_THREAD) {
-        pthread_t *t = (pthread_t *)hd->ptr;
-        if (t) {
-            pthread_join(*t, NULL);
-            free(t);
-            hd->ptr = NULL;
+        /* A thread wait must honour the timeout: the game polls loaders with
+         * ms == 0 ("has it finished?") and joins with INFINITE.  Completion is
+         * tracked by the thread itself (thread_arg_t.done) because glibc's
+         * pthread_tryjoin_np() reported EBUSY for finished threads here. */
+        thread_arg_t *ta = (thread_arg_t *)hd->ptr;
+        if (g_verbose) {
+            static uint32_t last_h;
+            static int last_done = -2;
+            int dn = ta ? ta->done : -1;
+            if (h != last_h || dn != last_done) {
+                fprintf(stderr, "kernel32:   wait thread h=%08x ta=%p done=%d\n",
+                        h, (void *)ta, dn);
+                last_h = h;
+                last_done = dn;
+            }
         }
-        RET32(0);
+        if (!ta || __atomic_load_n(&ta->done, __ATOMIC_ACQUIRE)) {
+            RET32(0);               /* WAIT_OBJECT_0 */
+            return;
+        }
+        if (ms == 0) {
+            RET32(258);             /* WAIT_TIMEOUT */
+            return;
+        }
+        if (ms == 0xFFFFFFFFu) {
+            while (!__atomic_load_n(&ta->done, __ATOMIC_ACQUIRE))
+                usleep(200);
+            RET32(0);
+            return;
+        }
+        for (uint32_t i = 0; i < ms; i++) {
+            if (__atomic_load_n(&ta->done, __ATOMIC_ACQUIRE)) {
+                RET32(0);
+                return;
+            }
+            usleep(1000);
+        }
+        RET32(258);                 /* WAIT_TIMEOUT */
         return;
     }
     if (ms && ms != 0xFFFFFFFFu)
@@ -1192,12 +1278,6 @@ static void k_WaitForMultipleObjects(void)
 }
 
 /* --------------------------------------------------------------- threads */
-typedef struct {
-    uint32_t start;
-    uint32_t param;
-    uint32_t stack_top;
-    uint32_t teb;
-} thread_arg_t;
 
 /* thread slots: a private stack and TEB each, inside the emulated space */
 #define THREAD_ARENA_BASE 0x02000000u
@@ -1208,7 +1288,11 @@ static void *thread_trampoline(void *p)
 {
     thread_arg_t *ta = (thread_arg_t *)p;
     x86_thread_begin(ta->start, ta->param, ta->stack_top, ta->teb);
-    free(ta);
+    /* The thread says so itself: pthread_tryjoin_np() reported EBUSY even for
+     * threads that had long finished, which deadlocked the game's loader. */
+    __atomic_store_n(&ta->done, 1, __ATOMIC_RELEASE);
+    if (g_verbose > 1)
+        fprintf(stderr, "kernel32: thread done (start %08x)\n", ta->start);
     return NULL;
 }
 
@@ -1223,16 +1307,25 @@ static void k_CreateThread(void)
         slot = 60;
     ta->stack_top = THREAD_ARENA_BASE + (slot + 1) * X86_THREAD_STACK_SIZE;
     ta->teb = THREAD_TEB_BASE + slot * 0x2000u;
-    pthread_t *t = malloc(sizeof(*t));
     if (getenv("OTOMEDIUS_NOTHREDS")) {
         /* diagnostic switch: create the handle but never run the thread */
-        memset(t, 0, sizeof(*t));
+        ta->done = 0;
     } else {
-        pthread_create(t, NULL, thread_trampoline, ta);
+        pthread_t t;
+        int rc = pthread_create(&t, NULL, thread_trampoline, ta);
+        if (rc)
+            log_printf("kernel32: pthread_create failed (%d) for slot %u", rc,
+                       slot);
+        if (idp)
+            M32(idp) = (uint32_t)(uintptr_t)t;
     }
-    if (idp)
-        M32(idp) = (uint32_t)(uintptr_t)*t;
-    RET32(handle_new(H_THREAD, -1, t, 0));
+    uint32_t hth = handle_new(H_THREAD, -1, ta, 0);
+    if (g_verbose > 1) {
+        fprintf(stderr, "kernel32: CreateThread(slot=%u handle=%08x fn=%08x "
+                "ta=%p\n", slot, hth, param ? M32(param + 0x54) : 0,
+                (void *)ta);
+    }
+    RET32(hth);
 }
 
 static void k_ResumeThread(void) { RET32(1); }
@@ -1241,7 +1334,10 @@ static void k_GetThreadPriority(void) { RET32(0); }
 
 static void k_ExitThread(void)
 {
-    pthread_exit(NULL);
+    /* see x86_thread_exit() in main.c: never call pthread_exit() from inside
+     * the dispatcher, it strands the thread inside glibc's cleanup. */
+    extern int x86_thread_exit(void);
+    x86_thread_exit();
 }
 
 static void k_DuplicateHandle(void)

@@ -157,8 +157,32 @@ AZERTY, QWERTZ and other layouts.
 | `OTOMEDIUS_LOG=2` | also log every Win32 call |
 | `OTOMEDIUS_LOG=3` | also log every dispatcher transfer |
 | `OTOMEDIUS_DIR=path` | game directory (default: the current directory) |
+| `OTOMEDIUS_WATCH="addr[:n],…"` | trace entries to code addresses (hex) |
+| `OTOMEDIUS_WATCHMEM="addr,…"` | dump those globals on every watch hit |
+| `OTOMEDIUS_PEEKARGS=1` | also dump the stack arguments at watch hits |
+| `OTOMEDIUS_DUMP_FB=frame.ppm` | write one software frame (headless verification) |
+| `OTOMEDIUS_DUMP_AT=n` | which frame to dump (default 200) |
+| `OTOMEDIUS_TEST_QUAD=1\|2` | renderer self-test / texture preview |
+| `OTOMEDIUS_TEXTURES=1` | real `LockRect`/surface uploads (see HANDOVER §7.6) |
+| `OTOMEDIUS_CHKSUM=1` | keep the original `ChkSum.bin` integrity gate |
+| `OTOMEDIUS_AUTOCOIN=1` | pulse the coin line every 2 s (input testing) |
+| `OTOMEDIUS_BADTARGET=skip` | report missing functions instead of aborting |
 
 ## License
 
 MIT for the code in this repository (see [`LICENSE`](LICENSE), © 2026 nicobm).
 The game itself is not covered and not distributed.
+
+## How this port is being written
+
+The static recompilation, the reverse engineering and the native Linux layer in
+this repository are being developed with **DeepSeek V4.1 Flash 1017**, served by
+**OpenRouter** and driven through **OpenCode** as the coding agent.
+
+Everything runs against a local dump of the arcade build: the agent reads the
+recompiled C, instruments the emulated Win32/D3D9 layer, and iterates on
+`zig`/`flatpak-builder` builds from the command line. If you want to attempt the
+same kind of port (Konami PC arcade titles share the `libacio`/`libbms`/
+`libtouchpanel` stack, Direct3D 9 and a statically linked MSVC 2005 runtime),
+that combination is a practical starting point - the tooling and the notes in
+[`docs/HANDOVER.md`](docs/HANDOVER.md) are what made it tractable here.

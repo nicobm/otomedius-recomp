@@ -1,0 +1,21 @@
+# Extra entry points for the recompiler (one hex address per line).
+#
+# The discovery pass finds functions through the entry point, the export
+# table, code pointers stored in the data sections, direct calls and a
+# prologue heuristic.  Some functions are only ever reached through a
+# *computed* pointer, and their prologue (`push esi; push edi`, no frame
+# pointer) does not match the heuristic, so they have to be listed here or the
+# game dies with "no recompiled code at ...".
+#
+# Found with OTOMEDIUS_BADTARGET=skip, which turns an unknown target into a
+# no-op and reports every missing function in one run instead of crashing at
+# the first one.
+
+# Once.pak loader helpers (CRT/stream support around 0x40f5xx and 0x4197xx)
+419700
+40f4d0
+40f570
+40f5c0
+40f5f0
+419730
+419740

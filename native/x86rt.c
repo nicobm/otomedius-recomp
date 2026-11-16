@@ -14,6 +14,9 @@ const char *x86_game_dir = ".";
 
 static __thread cpu_t *t_cpu;
 
+void x86_register_cpu(cpu_t *c);
+void x86_dump_threads(void);
+
 cpu_t *x86_cpu(void)
 {
     if (!t_cpu) {
@@ -29,8 +32,85 @@ cpu_t *x86_cpu(void)
         t_cpu->seg[1] = 0x23;
         t_cpu->seg[2] = 0x2B;
         t_cpu->seg[3] = 0x2B;
+        x86_register_cpu(t_cpu);
     }
     return t_cpu;
+}
+
+/* ------------------------------------------------------- thread registry
+ * Every emulated thread owns a cpu_t; the watchdog prints their eip so a
+ * deadlock inside a worker thread is visible instead of silent. */
+#define X86_MAX_CPUS 64
+static cpu_t *g_cpus[X86_MAX_CPUS];
+static volatile int g_ncpu;
+__thread int x86_cpu_idx = -1;
+const char *x86_import_name[X86_MAX_CPUS];
+volatile int x86_cpu_dead[X86_MAX_CPUS];
+
+void x86_register_cpu(cpu_t *c)
+{
+    int i = __atomic_fetch_add(&g_ncpu, 1, __ATOMIC_RELAXED);
+    x86_cpu_idx = i;
+    if (i < X86_MAX_CPUS)
+        __atomic_store_n(&g_cpus[i], c, __ATOMIC_RELEASE);
+}
+
+extern __thread const char *x86_current_import;
+
+/* OTOMEDIUS_WATCHCHG=<addr>: poll one dword once per frame and, when it
+ * changes, dump the dispatch ring so the writer can be identified. */
+void x86_watchchg_poll(uint32_t at)
+{
+    static uint32_t last;
+    static int init, armed;
+    const char *e = getenv("OTOMEDIUS_WATCHCHG");
+    uint32_t addr, v;
+
+    if (!e || !*e)
+        return;
+    /* "auto" follows the manager object's sub-state field: the slot array at
+     * 0x5DE228 holds the manager pointer and the sub-state is at +8. */
+    if (e[0] == 'a') {
+        uint32_t mgr = M32(0x5DE228u);
+        addr = mgr ? mgr + 8u : 0;
+        if (!addr)
+            return;
+    } else {
+        addr = (uint32_t)strtoul(e, NULL, 16);
+    }
+    if (!init) {
+        last = M32(addr);
+        init = 1;
+        armed = 1;
+        fprintf(stderr, "[chg] watching %08x = %08x\n", addr, last);
+        return;
+    }
+    v = M32(addr);
+    if (v != last) {
+        fprintf(stderr, "[chg] %08x: %08x -> %08x (dispatched %08x)\n", addr,
+                last, v, at);
+        last = v;
+        (void)armed;
+    }
+}
+
+void x86_dump_threads(void)
+{
+    int n = __atomic_load_n(&g_ncpu, __ATOMIC_ACQUIRE);
+    if (n > X86_MAX_CPUS)
+        n = X86_MAX_CPUS;
+    for (int i = 0; i < n; i++) {
+        cpu_t *c = __atomic_load_n(&g_cpus[i], __ATOMIC_ACQUIRE);
+        if (!c)
+            continue;
+        fprintf(stderr, "[thread %d] eip=%08x esp=%08x eax=%08x ebx=%08x "
+                "ecx=%08x edx=%08x esi=%08x edi=%08x ebp=%08x\n",
+                i, c->eip, c->esp, c->eax, c->ebx, c->ecx, c->edx, c->esi,
+                c->edi, c->ebp);
+        fprintf(stderr, "[thread %d]   in native: %s%s\n", i,
+                x86_import_name[i] ? x86_import_name[i] : "-",
+                x86_cpu_dead[i] ? "  (thread already finished)" : "");
+    }
 }
 
 /* ------------------------------------------------------------- dispatcher */
@@ -67,9 +147,138 @@ static const x86_entry_t *find_entry(uint32_t addr)
 int x86_is_native_thunk(uint32_t addr);
 uint32_t x86_native_entry(uint32_t thunk);
 
+/* ---------------------------------------------------------- watch points */
+/* OTOMEDIUS_WATCH="addr[:limit][,addr[:limit]]" (hex) prints every entry to
+ * the given addresses with the live registers, `limit` times each (default
+ * 20).  Pure diagnostic: costs nothing unless the variable is set.  Used to
+ * follow the Konami boot machine and the post-boot init path without having
+ * to patch the generated code. */
+#define X86_WATCH_MAX 8
+static struct {
+    uint32_t addr;
+    unsigned long limit;
+    unsigned long seen;
+} g_watch[X86_WATCH_MAX];
+static int g_watch_len = -1;
+
+static void x86_watch_parse(void)
+{
+    const char *s = getenv("OTOMEDIUS_WATCH");
+    g_watch_len = 0;
+    if (!s)
+        return;
+    while (*s && g_watch_len < X86_WATCH_MAX) {
+        char *end;
+        uint32_t a = (uint32_t)strtoul(s, &end, 16);
+        if (end == s)
+            break;
+        s = end;
+        unsigned long lim = 20;
+        if (*s == ':') {
+            lim = strtoul(s + 1, &end, 10);
+            s = end;
+        }
+        if (*s == ',')
+            s++;
+        g_watch[g_watch_len].addr = a;
+        g_watch[g_watch_len].limit = lim;
+        g_watch[g_watch_len].seen = 0;
+        g_watch_len++;
+    }
+}
+
+/* OTOMEDIUS_WATCHMEM="addr[,addr...]" (hex) additionally prints one byte per
+ * address on every watch hit - the quickest way to follow a game global that
+ * gates a state machine. */
+#define X86_PEEK_MAX 8
+static uint32_t g_peek[X86_PEEK_MAX];
+static int g_peek_len = -1;
+
+static void x86_peek_parse(void)
+{
+    const char *s = getenv("OTOMEDIUS_WATCHMEM");
+    g_peek_len = 0;
+    if (!s)
+        return;
+    while (*s && g_peek_len < X86_PEEK_MAX) {
+        char *end;
+        uint32_t a = (uint32_t)strtoul(s, &end, 16);
+        if (end == s)
+            break;
+        g_peek[g_peek_len++] = a;
+        s = end;
+        if (*s == ',')
+            s++;
+    }
+}
+
+static void x86_peek_dump(void)
+{
+    cpu_t *cpu;
+    if (g_peek_len < 0)
+        x86_peek_parse();
+    cpu = x86_cpu();
+    if (getenv("OTOMEDIUS_PEEKREGS")) {
+        /* object layout probe: the game passes `this` in esi/ecx very often */
+        fprintf(stderr,
+                "[watch]   esi[%08x]=%08x +4=%08x +8=%08x +c=%08x +10=%08x "
+                "| ecx[%08x]=%08x +4=%08x\n",
+                cpu->esi, M32(cpu->esi), M32(cpu->esi + 4), M32(cpu->esi + 8),
+                M32(cpu->esi + 0xc), M32(cpu->esi + 0x10),
+                cpu->ecx, M32(cpu->ecx), M32(cpu->ecx + 4));
+    }
+    if (!g_peek_len)
+        return;
+    fprintf(stderr, "[watch]   mem:");
+    for (int i = 0; i < g_peek_len; i++)
+        fprintf(stderr, " %08x=%08x", g_peek[i], M32(g_peek[i]));
+    fputc('\n', stderr);
+}
+
+static void x86_watch_hit(uint32_t addr)
+{
+    cpu_t *cpu;
+    if (g_watch_len < 0)
+        x86_watch_parse();
+    if (!g_watch_len)
+        return;
+    cpu = x86_cpu();
+    for (int i = 0; i < g_watch_len; i++) {
+        if (g_watch[i].addr != addr)
+            continue;
+        if (g_watch[i].seen < g_watch[i].limit)
+            fprintf(stderr,
+                    "[watch] %08x #%lu esp=%08x ret=%08x eax=%08x ebx=%08x "
+                    "ecx=%08x edx=%08x esi=%08x edi=%08x ebp=%08x\n",
+                    addr, g_watch[i].seen + 1, cpu->esp,
+                    cpu->esp ? M32(cpu->esp) : 0, cpu->eax, cpu->ebx,
+                    cpu->ecx, cpu->edx, cpu->esi, cpu->edi, cpu->ebp);
+        if (g_watch[i].seen < g_watch[i].limit)
+            x86_peek_dump();
+        g_watch[i].seen++;
+        if (g_watch[i].seen <= g_watch[i].limit && getenv("OTOMEDIUS_PEEKARGS")) {
+            fprintf(stderr, "[watch]   stack:");
+            for (int k = 1; k <= 6; k++)
+                fprintf(stderr, " [esp+%d]=%08x", k * 4, M32(cpu->esp + 4 * k));
+            fputc('\n', stderr);
+        }
+    }
+}
+
 void x86_dispatch(uint32_t addr)
 {
     cpu_t *cpu = x86_cpu();
+    extern void game_config_after_reset(uint32_t addr);   /* config.c */
+    extern int  x86_patch_call(uint32_t addr);            /* patches.c */
+    game_config_after_reset(addr);
+    if (x86_patch_call(addr))
+        return;
+    if (getenv("OTOMEDIUS_WATCHCHG")) {
+        extern void x86_watchchg_poll(uint32_t at);
+        x86_watchchg_poll(addr);
+    }
+    if (g_watch_len)
+        x86_watch_hit(addr);
     if (g_verbose > 2)
         fprintf(stderr, "  dispatch %08x (esp=%08x top=%08x)\n", addr, cpu->esp, M32(cpu->esp));
     if (x86_is_native_thunk(addr)) {
@@ -154,6 +363,29 @@ void x86_trace_dump(void)
 void x86_bad_target(uint32_t addr)
 {
     cpu_t *c = x86_cpu();
+
+    /* Diagnostic: OTOMEDIUS_BADTARGET=skip turns an unknown target into a
+     * no-op that "returns" to the caller, so one run can reveal *every*
+     * missing function instead of dying at the first one.  Used to find the
+     * discovery gaps that only appear through computed call pointers. */
+    if (getenv("OTOMEDIUS_BADTARGET")) {
+        static uint32_t seen[256];
+        static int nseen;
+        int known = 0;
+        for (int i = 0; i < nseen; i++)
+            if (seen[i] == addr)
+                known = 1;
+        if (!known && nseen < 256) {
+            seen[nseen++] = addr;
+            fprintf(stderr, "[missing] %08x (caller %08x)\n", addr,
+                    c->esp ? M32(c->esp) : 0);
+        }
+        c->eax = 0;
+        c->eip = M32(c->esp);
+        c->esp += 4;
+        return;
+    }
+
     x86_trace_dump();
     /* the game keeps its local heap descriptors at 0x5e1f20..0x5e1f40 */
     fprintf(stderr, "IAT: timeGetTime[54d264]=%08x DestroyWindow[54d250]=%08x "

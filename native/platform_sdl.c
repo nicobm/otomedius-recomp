@@ -24,9 +24,16 @@ static uint32_t g_clear = 0xFF000000u;
 static SDL_Gamepad *g_pad;
 static int g_quit;
 
-/* The software surface the renderer draws into. */
-uint8_t *g_fb;
-int g_fb_w, g_fb_h;
+/* touch panel state, fed by pen (tablet) or mouse events */
+static struct {
+    float x, y;
+    int pressed;
+    int pressure;
+    int pen_seen;      /* a real pen has been used: prefer it over the mouse */
+} g_touch;
+
+/* Size of the streaming texture fed by render.c's software frame buffer. */
+static int g_fb_w, g_fb_h;
 
 void platform_set_size(int w, int h)
 {
@@ -59,9 +66,8 @@ int platform_init(void)
         return -1;
     }
     SDL_SetRenderVSync(g_ren, 1);
-    g_fb = (uint8_t *)calloc((size_t)g_w * g_h * 4, 1);
-    g_fb_w = g_w;
-    g_fb_h = g_h;
+    g_fb_w = 0;          /* the streaming texture follows render_framebuffer() */
+    g_fb_h = 0;
     g_ready = 1;
     log_printf("platform: %s renderer", SDL_GetRendererName(g_ren));
     return 0;
@@ -71,8 +77,6 @@ void platform_shutdown(void)
 {
     if (!g_ready)
         return;
-    free(g_fb);
-    g_fb = NULL;
     if (g_tex)
         SDL_DestroyTexture(g_tex);
     if (g_ren)
@@ -91,16 +95,73 @@ void platform_clear(uint32_t flags, uint32_t color)
 
 void platform_present(void)
 {
+    int fw = 0, fh = 0;
+    const uint8_t *fb;
+    SDL_Event ev;
+
     if (!g_ready)
         return;
-    SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
-        if (ev.type == SDL_EVENT_QUIT)
+        if (ev.type == SDL_EVENT_QUIT) {
+            log_printf("platform: SDL_EVENT_QUIT");
             win_request_quit();
-        else if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_ESCAPE)
+        } else if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_ESCAPE) {
+            log_printf("platform: Esc pressed");
             win_request_quit();
-        else if (ev.type == SDL_EVENT_GAMEPAD_ADDED && !g_pad)
+        } else if (ev.type == SDL_EVENT_GAMEPAD_ADDED && !g_pad) {
             g_pad = SDL_OpenGamepad(ev.gdevice.which);
+        } else if (ev.type == SDL_EVENT_PEN_DOWN ||
+                   ev.type == SDL_EVENT_PEN_MOTION) {
+            g_touch.pen_seen = 1;
+            g_touch.x = ev.ptouch.x / (float)(g_w > 0 ? g_w : 1);
+            g_touch.y = ev.ptouch.y / (float)(g_h > 0 ? g_h : 1);
+            if (ev.type == SDL_EVENT_PEN_DOWN) {
+                g_touch.pressed = 1;
+                g_touch.pressure = 255;
+            }
+        } else if (ev.type == SDL_EVENT_PEN_UP) {
+            g_touch.pen_seen = 1;
+            g_touch.x = ev.ptouch.x / (float)(g_w > 0 ? g_w : 1);
+            g_touch.y = ev.ptouch.y / (float)(g_h > 0 ? g_h : 1);
+            g_touch.pressed = 0;
+            g_touch.pressure = 0;
+        } else if (ev.type == SDL_EVENT_MOUSE_MOTION) {
+            if (!g_touch.pen_seen) {
+                g_touch.x = ev.motion.x / (float)(g_w > 0 ? g_w : 1);
+                g_touch.y = ev.motion.y / (float)(g_h > 0 ? g_h : 1);
+            }
+        } else if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+            if (!g_touch.pen_seen && ev.button.button == SDL_BUTTON_LEFT) {
+                g_touch.x = ev.button.x / (float)(g_w > 0 ? g_w : 1);
+                g_touch.y = ev.button.y / (float)(g_h > 0 ? g_h : 1);
+                g_touch.pressed = 1;
+                g_touch.pressure = 255;
+            }
+        } else if (ev.type == SDL_EVENT_MOUSE_BUTTON_UP) {
+            if (!g_touch.pen_seen && ev.button.button == SDL_BUTTON_LEFT) {
+                g_touch.pressed = 0;
+                g_touch.pressure = 0;
+            }
+        }
+    }
+
+    fb = render_framebuffer(&fw, &fh);
+    if (fb && fw > 0 && fh > 0) {
+        if (!g_tex || g_fb_w != fw || g_fb_h != fh) {
+            if (g_tex)
+                SDL_DestroyTexture(g_tex);
+            g_tex = SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_ARGB8888,
+                                      SDL_TEXTUREACCESS_STREAMING, fw, fh);
+            g_fb_w = fw;
+            g_fb_h = fh;
+        }
+        if (g_tex) {
+            SDL_UpdateTexture(g_tex, NULL, fb, fw * 4);
+            SDL_RenderClear(g_ren);
+            SDL_RenderTexture(g_ren, g_tex, NULL, NULL);
+            SDL_RenderPresent(g_ren);
+            return;
+        }
     }
     SDL_SetRenderDrawColor(g_ren, (g_clear >> 16) & 0xFF, (g_clear >> 8) & 0xFF,
                            g_clear & 0xFF, 255);
@@ -149,8 +210,7 @@ static int key_down(SDL_Keycode k)
 }
 
 void platform_read_pad(pad_state_t *out)
-{
-    memset(out, 0, sizeof(*out));
+{    memset(out, 0, sizeof(*out));
     if (!g_ready)
         return;
     if (key_down(SDLK_UP) || key_down(SDLK_W))
@@ -199,4 +259,15 @@ void platform_read_pad(pad_state_t *out)
         if (SDL_GetGamepadButton(g_pad, SDL_GAMEPAD_BUTTON_BACK))
             out->coin = 1;
     }
+}
+
+void platform_read_touch(touch_state_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!g_ready)
+        return;
+    out->x = g_touch.x < 0.0f ? 0.0f : (g_touch.x > 1.0f ? 1.0f : g_touch.x);
+    out->y = g_touch.y < 0.0f ? 0.0f : (g_touch.y > 1.0f ? 1.0f : g_touch.y);
+    out->pressed = g_touch.pressed;
+    out->pressure = g_touch.pressure;
 }

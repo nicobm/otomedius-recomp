@@ -561,7 +561,11 @@ static void dev_CreateVertexDeclaration(void) { RET32(0); }
 static void dev_SetVertexDeclaration(void) { RET32(0); }
 static void dev_GetVertexDeclaration(void) { RET32(0); }
 
-static void dev_SetFVF(void) { RET32(0); }
+static void dev_SetFVF(void)
+{
+    render_set_fvf(arg32(1));
+    RET32(0);
+}
 static void dev_GetFVF(void) { RET32(0); }
 
 static void dev_CreateVertexShader(void)

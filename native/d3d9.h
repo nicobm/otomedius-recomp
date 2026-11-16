@@ -37,6 +37,7 @@ void render_set_state(uint32_t state, uint32_t value);
 void render_set_sampler(uint32_t stage, uint32_t type, uint32_t value);
 void render_set_texture(uint32_t stage, uint32_t tex);
 void render_set_stream(uint32_t stream, uint32_t vb, uint32_t offset, uint32_t stride);
+void render_set_fvf(uint32_t fvf);
 void render_set_indices(uint32_t ib, uint32_t base);
 void render_set_pixel_shader(uint32_t ps);
 void render_draw(uint32_t prim, uint32_t base_vertex, uint32_t min_index,
@@ -47,5 +48,7 @@ void render_draw_up(uint32_t prim, uint32_t count, uint32_t data, uint32_t strid
 uint32_t texture_data(uint32_t tex);
 uint32_t texture_width(uint32_t tex);
 uint32_t texture_height(uint32_t tex);
+const uint32_t *texture_argb(uint32_t obj, uint32_t *w, uint32_t *h);
+const uint8_t *render_framebuffer(int *w, int *h);
 
 #endif

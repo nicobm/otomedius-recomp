@@ -5,16 +5,209 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <iconv.h>
 
 static void misc_stub(void) { RET32(0); }
 
-/* -------------------------------------------------------------- gdi32 */
-static void g_CreateFontA(void) { RET32(0x0F000001u); }
+/* Log helper: the game passes Shift-JIS face names, which look like garbage in
+ * a UTF-8 terminal.  Convert CP932 -> UTF-8 for the message, fall back to a
+ * plain marker when iconv cannot do it. */
+static const char *sjis_to_utf8(const char *src, char *dst, size_t cap)
+{
+    iconv_t cd = iconv_open("UTF-8", "CP932");
+    char *in = (char *)src;
+    size_t inleft = strlen(src), outleft = cap - 1;
+    char *out = dst;
+
+    if (cd == (iconv_t)-1) {
+        snprintf(dst, cap, "%.*s", (int)(cap - 1), src);
+        return dst;
+    }
+    if (iconv(cd, &in, &inleft, &out, &outleft) == (size_t)-1) {
+        iconv_close(cd);
+        snprintf(dst, cap, "%.*s", (int)(cap - 1), src);
+        return dst;
+    }
+    iconv_close(cd);
+    *out = 0;
+    return dst;
+}
+
+/* -------------------------------------------------------------- gdi32
+ * The game builds its font atlases itself: CreateFontA + SelectObject, then
+ * GetTextMetricsA / GetCharABCWidthsA for the layout and GetGlyphOutlineA
+ * (GGO_BITMAP) per glyph.  GetGlyphOutlineA returning GDI_ERROR aborts the
+ * atlas build and the game logs 1117 CTexFont::GetFontBuffer and suspends
+ * every manager, so these have to answer coherently.  Glyphs are synthesised
+ * as boxes (there is no font file behind the DC yet); the atlas, metrics and
+ * text layout are the real thing. */
+static int g_font_h = 24;
+
+static void g_CreateFontA(void)
+{
+    int h = (int)arg32(0);
+    g_font_h = h < 0 ? -h : (h ? h : 16);
+    if (g_font_h < 6)
+        g_font_h = 6;
+    if (g_font_h > 128)
+        g_font_h = 128;
+    {
+        char face[128];
+        const char *f = arg_str(13);
+        log_printf("gdi32: CreateFontA(h=%d face=%s)", h,
+                   f ? sjis_to_utf8(f, face, sizeof(face)) : "?");
+    }
+    RET32(0x0F000001u);
+}
 static void g_DeleteObject(void) { RET32(1); }
 static void g_SelectObject(void) { RET32(0x0F000002u); }
-static void g_GetGlyphOutlineA(void) { RET32(0xFFFFFFFFu); }   /* GDI_ERROR */
-static void g_GetTextMetricsA(void) { RET32(1); }
-static void g_GetCharABCWidthsA(void) { RET32(1); }
+
+#define GGO_BITMAP 1u
+#define GGO_NATIVE 2u
+
+/* One closed rectangle contour, in GDI's native outline format:
+ *   TTPOLYGONHEADER { DWORD cb; DWORD dwType = TT_POLYGON_TYPE; POINTFX pfxStart; }
+ *   TTPOLYCURVE     { WORD wType = TT_PRIM_LINE; WORD cpfx; POINTFX apfx[]; }
+ * Coordinates are 16.16 fixed point with +y upwards from the baseline, which
+ * is what CTexFont::GetFontBuffer rasterises into the atlas. */
+#define GLYPH_NATIVE_SIZE (16 + 4 + 4 * 8)
+
+static void put_fixed(uint32_t p, float v)
+{
+    M32(p) = (uint32_t)(int32_t)(v * 65536.0f);
+}
+
+static void glyph_native_outline(uint32_t p, int w, int h)
+{
+    M32(p + 0) = GLYPH_NATIVE_SIZE;      /* cb */
+    M32(p + 4) = 24;                     /* TT_POLYGON_TYPE */
+    put_fixed(p + 8, 1.0f);              /* pfxStart.x */
+    put_fixed(p + 12, (float)h);         /* pfxStart.y */
+    M16(p + 16) = 1;                     /* TT_PRIM_LINE */
+    M16(p + 18) = 4;                     /* cpfx */
+    put_fixed(p + 20, (float)w); put_fixed(p + 24, (float)h);
+    put_fixed(p + 28, (float)w); put_fixed(p + 32, 0.0f);
+    put_fixed(p + 36, 1.0f);     put_fixed(p + 40, 0.0f);
+    put_fixed(p + 44, 1.0f);     put_fixed(p + 48, (float)h);
+}
+
+static void g_GetGlyphOutlineA(void)
+{
+    uint32_t ch = arg32(1), format = arg32(2), gm = arg32(3);
+    uint32_t cb = arg32(4), buf = arg32(5);
+    int h = g_font_h, w = (g_font_h * 2) / 3;
+    int stride, size;
+
+    {
+        static int n;
+        if (g_verbose && n++ < 10)
+            fprintf(stderr, "gdi32: GetGlyphOutlineA(ch=%u fmt=%u gm=%08x cb=%u buf=%08x)\n",
+                    ch, format, gm, cb, buf);
+    }
+    if (w < 2)
+        w = 2;
+
+    if (format & GGO_NATIVE) {
+        size = GLYPH_NATIVE_SIZE;
+        if (gm) {
+            M16(gm + 0) = (uint16_t)w;          /* gmBlackBoxX */
+            M16(gm + 2) = (uint16_t)h;          /* gmBlackBoxY */
+            M32(gm + 4) = 1;                    /* gmptGlyphOrigin.x */
+            M32(gm + 8) = 0;                    /* gmptGlyphOrigin.y */
+            M16(gm + 12) = (uint16_t)(w + 1);   /* gmCellIncX */
+            M16(gm + 14) = 0;
+        }
+        if (!cb || !buf)
+            RET32((uint32_t)size);
+        else if (cb < (uint32_t)size)
+            RET32(0xFFFFFFFFu);
+        else {
+            glyph_native_outline(buf, w, h);
+            RET32((uint32_t)size);
+        }
+        return;
+    }
+
+    stride = ((w + 31) / 32) * 4;
+    size = stride * h;
+
+    if (gm) {
+        M16(gm + 0) = (uint16_t)w;          /* gmBlackBoxX */
+        M16(gm + 2) = (uint16_t)h;          /* gmBlackBoxY */
+        M32(gm + 4) = 1;                    /* gmptGlyphOrigin.x */
+        M32(gm + 8) = (uint32_t)(h - 2);    /* gmptGlyphOrigin.y (baseline) */
+        M16(gm + 12) = (uint16_t)(w + 1);   /* gmCellIncX */
+        M16(gm + 14) = 0;
+    }
+    if (format != GGO_BITMAP) {
+        RET32(0xFFFFFFFFu);                 /* GDI_ERROR */
+        return;
+    }
+    if (!cb || !buf) {                      /* size query */
+        RET32((uint32_t)size);
+        return;
+    }
+    if (cb < (uint32_t)size) {
+        RET32(0xFFFFFFFFu);
+        return;
+    }
+    memset(MEM + buf, 0, (size_t)size);
+    /* 1bpp, MSB first: a box outline so the layout is readable */
+    for (int y = 0; y < h; y++) {
+        uint8_t *row = MEM + buf + (size_t)y * stride;
+        row[0] |= 0x80;
+        row[(w - 1) >> 3] |= (uint8_t)(0x80 >> ((w - 1) & 7));
+    }
+    for (int x = 0; x < w; x++) {
+        MEM[buf + (x >> 3)] |= (uint8_t)(0x80 >> (x & 7));
+        MEM[buf + (size_t)(h - 1) * stride + (x >> 3)] |=
+            (uint8_t)(0x80 >> (x & 7));
+    }
+    if (g_verbose > 1) {
+        static int n;
+        if (n++ < 6)
+            fprintf(stderr, "gdi32: GetGlyphOutline(ch %u) %dx%d -> %d bytes\n",
+                    ch, w, h, size);
+    }
+    RET32((uint32_t)size);
+}
+
+static void g_GetTextMetricsA(void)
+{
+    uint32_t tm = arg32(1);
+    int h = g_font_h;
+    if (tm) {
+        memset(MEM + tm, 0, 64);
+        M32(tm + 0) = (uint32_t)h;               /* tmHeight */
+        M32(tm + 4) = (uint32_t)(h - h / 4);     /* tmAscent */
+        M32(tm + 8) = (uint32_t)(h / 4);         /* tmDescent */
+        M32(tm + 12) = (uint32_t)(h / 8);        /* tmInternalLeading */
+        M32(tm + 20) = (uint32_t)((h * 2) / 3);  /* tmAveCharWidth */
+        M32(tm + 24) = (uint32_t)h;              /* tmMaxCharWidth */
+        M32(tm + 28) = 400;                      /* tmWeight */
+        M8(tm + 44) = 0x20;                      /* tmFirstChar */
+        M8(tm + 45) = 0xFF;                      /* tmLastChar */
+        M8(tm + 46) = 0x3F;                      /* tmDefaultChar */
+        M8(tm + 47) = 0x20;                      /* tmBreakChar */
+        M8(tm + 52) = 0;                         /* tmCharSet (ANSI) */
+    }
+    RET32(1);
+}
+
+static void g_GetCharABCWidthsA(void)
+{
+    uint32_t first = arg32(1), last = arg32(2), abc = arg32(3);
+    int adv = (g_font_h * 2) / 3 + 1;
+    if (abc && last >= first && last - first < 0x10000) {
+        for (uint32_t c = first; c <= last; c++) {
+            uint32_t p = abc + (c - first) * 6;
+            M16(p + 0) = 0;                     /* a: left side bearing */
+            M16(p + 2) = (uint16_t)adv;         /* b: black width */
+            M16(p + 4) = 0;                     /* c: right side bearing */
+        }
+    }
+    RET32(1);
+}
 static void g_AddFontMemResourceEx(void) { RET32(0); }
 
 const import_def_t gdi32_imports[] = {

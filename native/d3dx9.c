@@ -523,7 +523,16 @@ static void d3dx_CreateTexture(void)
     RET32(0);
 }
 
-static void d3dx_CreateEffect(void) { RET32(0); }
+/* D3DXCreateEffect(pDevice, pSrcData, SrcDataLen, pDefines, pInclude,
+ * pStateBlock, pPool, pStateBlock?, ppEffect, pHRESULT) -> ppEffect is the
+ * 9th argument; it must be written or the caller uses stack garbage. */
+static void d3dx_CreateEffect(void)
+{
+    uint32_t pp = arg32(8);
+    if (pp)
+        M32(pp) = 0;
+    RET32(0x80004005u);   /* E_FAIL */
+}
 static void d3dx_CreateEffectPool(void)
 {
     uint32_t pp = arg32(0);
@@ -531,7 +540,23 @@ static void d3dx_CreateEffectPool(void)
         M32(pp) = 0;
     RET32(0);
 }
-static void d3dx_LoadMeshHierarchyFromXInMemory(void) { RET32(0); }
+/* ID3DXAnimationController** and ID3DXFRAME** are the last two arguments.
+ * Leaving them untouched made the loader treat whatever was on the stack as an
+ * ID3DXMesh and call `[vtbl+0x28]` on it (crash at 0x10A97). The .x parser is
+ * not implemented, so report failure with NULL outputs and let the game skip
+ * the mesh. */
+static void d3dx_LoadMeshHierarchyFromXInMemory(void)
+{
+    uint32_t ppAnim = arg32(6), ppFrame = arg32(7);
+    if (ppAnim)
+        M32(ppAnim) = 0;
+    if (ppFrame)
+        M32(ppFrame) = 0;
+    if (g_verbose > 1)
+        fprintf(stderr, "d3dx9: LoadMeshHierarchy(%u bytes) -> S_OK, no frames "
+                "(mesh loader not implemented)\n", arg32(1));
+    RET32(0);   /* S_OK: the caller checks the frame pointer and skips it */
+}
 static void d3dx_FrameDestroy(void) { RET32(0); }
 static void d3dx_FrameFind(void) { RET32(0); }
 

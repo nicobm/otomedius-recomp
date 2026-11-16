@@ -32,4 +32,20 @@ typedef struct {
 
 void platform_read_pad(pad_state_t *out);
 
+/* Touch panel (the cabinet had one; Otomedius drove it with a pen).  Devices
+ * that report SDL pen events (Wacom and friends) take priority; a normal mouse
+ * works as a fallback so the panel is usable without a tablet.  Coordinates are
+ * normalised 0..1 over the window, so the AVS layer can map them to whatever
+ * space the game expects. */
+typedef struct {
+    float x, y;      /* 0..1 over the game window */
+    int pressed;     /* pen/mouse is touching the panel */
+    int pressure;    /* 0..255, 0 when unknown */
+} touch_state_t;
+
+void platform_read_touch(touch_state_t *out);
+
+/* the software frame buffer produced by render.c (0xAARRGGBB, w*h) */
+const uint8_t *render_framebuffer(int *w, int *h);
+
 #endif

@@ -24,6 +24,4 @@ void platform_draw_up(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e
 void platform_set_size(int w, int h) { g_w = w; g_h = h; }
 void platform_wait(void) {}
 void platform_read_pad(pad_state_t *o) { memset(o, 0, sizeof(*o)); }
-uint32_t texture_data(uint32_t t) { return t; }
-uint32_t texture_width(uint32_t t) { (void)t; return 0; }
-uint32_t texture_height(uint32_t t) { (void)t; return 0; }
+void platform_read_touch(touch_state_t *o) { memset(o, 0, sizeof(*o)); }

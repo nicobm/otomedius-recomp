@@ -34,6 +34,12 @@ def main(argv=None):
                     help="functions per generated C file (default 120)")
     ap.add_argument("--expect-sha256", default=None,
                     help="refuse to run if the executable hash differs")
+    ap.add_argument("--seed", action="append", default=[], metavar="ADDR",
+                    help="extra entry point (hex), repeatable; needed for "
+                         "functions only reached through a computed pointer")
+    ap.add_argument("--seeds-file", default="recomp/seeds.txt",
+                    help="file with one extra entry point per line "
+                         "(default: recomp/seeds.txt, '#' comments allowed)")
     args = ap.parse_args(argv)
 
     t0 = time.time()
@@ -51,6 +57,19 @@ def main(argv=None):
     prog = xdis.Program(image)
     t = time.time()
     prog.seed_all()
+    seeds = list(args.seed)
+    try:
+        with open(args.seeds_file) as fh:
+            for line in fh:
+                line = line.split("#", 1)[0].strip()
+                if line:
+                    seeds.append(line)
+    except OSError:
+        pass
+    for s in seeds:
+        prog.seeds[int(s, 16)] = "manual seed"
+    if seeds:
+        print("[recomp] manual seeds: %d" % len(seeds))
     prog.discover()
     print("[recomp] discovery: %d functions, %d instructions, %.1fs"
           % (len(prog.funcs), len(prog.insns), time.time() - t))

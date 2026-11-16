@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <setjmp.h>
 #include <unistd.h>
 #include <signal.h>
 #include <setjmp.h>
@@ -94,15 +95,17 @@ static int find_game_dir(char *out, size_t out_size)
     return -1;
 }
 
+extern void x86_dump_threads(void);
+
 static void *watchdog(void *arg)
 {
     (void)arg;
     for (;;) {
         sleep(2);
-        fprintf(stderr, "[watchdog] %llu calls, last targets:",
+        fprintf(stderr, "[watchdog] %llu dispatches, main targets:",
                 (unsigned long long)x86_dispatch_count());
-        for (int i = 0; i < 6; i++) ;
-        fprintf(stderr, "\n");
+        x86_trace_dump();
+        x86_dump_threads();
     }
     return NULL;
 }
@@ -137,6 +140,8 @@ int main(int argc, char **argv)
         return 1;
     if (x86_load_image(exe) != 0)
         return 1;
+    game_config_load();
+    game_state_init();
     if (platform_init() != 0)
         return 1;
 
@@ -165,6 +170,21 @@ int main(int argc, char **argv)
     return 0;
 }
 
+/* ExitThread has to unwind through the dispatcher.  Calling pthread_exit()
+ * from inside a native import leaves glibc's cleanup stuck in this build (the
+ * thread stays alive and pthread_tryjoin_np keeps returning EBUSY), which
+ * deadlocks any loader that waits for its worker to finish.  Each emulated
+ * thread therefore arms a jmp_buf and ExitThread longjmps to it. */
+static __thread jmp_buf t_exit_jmp;
+static __thread int t_exit_armed;
+
+int x86_thread_exit(void)
+{
+    if (t_exit_armed)
+        longjmp(t_exit_jmp, 1);
+    return 0;
+}
+
 /* Every game thread gets its own CPU state (thread local), its own TEB and
  * its own stack inside the emulated address space. */
 int x86_thread_begin(uint32_t start, uint32_t param, uint32_t stack_top, uint32_t teb)
@@ -185,8 +205,36 @@ int x86_thread_begin(uint32_t start, uint32_t param, uint32_t stack_top, uint32_
      * so the callee sees [esp] = ret and [esp+4] = param */
     x86_push32(c, param);
     x86_push32(c, X86_RET_SENTINEL);
+    if (g_verbose)
+        fprintf(stderr, "x86: thread start %08x param %08x esp %08x\n", start,
+                param, c->esp);
+    extern volatile int x86_cpu_dead[];
+    extern __thread int x86_cpu_idx;
+    t_exit_armed = 1;
+    if (setjmp(t_exit_jmp) != 0) {
+        t_exit_armed = 0;
+        if (x86_cpu_idx >= 0 && x86_cpu_idx < 64)
+            x86_cpu_dead[x86_cpu_idx] = 1;
+        if (g_verbose)
+            fprintf(stderr, "x86: thread end   %08x (ExitThread)\n", start);
+        return 0;
+    }
     x86_dispatch(start);
     x86_run();
+    if (x86_cpu_idx >= 0 && x86_cpu_idx < 64)
+        x86_cpu_dead[x86_cpu_idx] = 1;
+    t_exit_armed = 0;
+    if (g_verbose)
+        fprintf(stderr, "x86: thread end   %08x eip %08x\n", start, c->eip);
+    /* a thread that ends with eip == 0 unwound its stack and died silently;
+     * that is how an async loader can leave its state machine "loading"
+     * forever, so say so loudly. */
+    if (c->eip != X86_RET_SENTINEL) {
+        fprintf(stderr,
+                "x86: thread %08x ended abnormally (eip=%08x esp=%08x "
+                "entry=%08x ret=%08x)\n", start, c->eip, c->esp, c->entry_esp,
+                c->esp ? M32(c->esp) : 0);
+    }
     return 0;
 }
 

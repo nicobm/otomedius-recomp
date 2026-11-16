@@ -110,13 +110,21 @@ void x86_native_tail(uint32_t slot)
     c->eip = target;
 }
 
+/* last import each thread entered, for the deadlock watchdog */
+extern __thread int x86_cpu_idx;
+extern const char *x86_import_name[];
+#define NOTE_IMPORT(n) do { if (x86_cpu_idx >= 0 && x86_cpu_idx < 64) \
+        x86_import_name[x86_cpu_idx] = (n); } while (0)
+
 void x86_native_invoke(uint32_t thunk)
 {
     cpu_t *c = x86_cpu();
     uint32_t idx = (thunk - THUNK_BASE) / THUNK_STEP;
     if (idx >= g_nthunks)
         x86_bad_target(thunk);
+    NOTE_IMPORT(g_thunks[idx].name);
     g_thunks[idx].fn();
+    NOTE_IMPORT(NULL);
     c->esp += 4u * (uint32_t)g_thunks[idx].nargs + 4u;  /* args + return address */
 }
 
@@ -134,7 +142,9 @@ void x86_native_call(uint32_t slot)
         uint32_t idx = (target - THUNK_BASE) / THUNK_STEP;
         if (g_verbose > 1)
             fprintf(stderr, "call %-40s esp=%08x (direct)\n", g_thunks[idx].name, c->esp);
+        NOTE_IMPORT(g_thunks[idx].name);
         g_thunks[idx].fn();
+        NOTE_IMPORT(NULL);
         c->esp += 4u * (uint32_t)g_thunks[idx].nargs + 4u;
         return;
     }
