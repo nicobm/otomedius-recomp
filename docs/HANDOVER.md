@@ -26,6 +26,10 @@
 > a NULL en `0x4050B0`). Detalle completo en **§7**. Este documento es el
 > prompt de transferencia para una sesión nueva; el repo es
 > `/var/home/vm/Proyectos/SALA DE TRABAJO/otomedius-recomp`.
+>
+> **Última sesión: ver §9** (loader sin carreras, logo de Konami visible,
+> tabla de thunks fija, rasterizador con estados D3D, fondo del Title roto).
+> Donde §3–§8 contradigan a §9, manda §9.
 
 ---
 
@@ -55,7 +59,9 @@ There is **no CMake and no MSVC**: the build is a single manifest script
 * Layout: `.work/gen` (generated C), `.work/obj` (native `.o`),
   `.work/obj/gen` (generated `.o`), `.work/oto` (extracted dump),
   `.work/pylib` (capstone + pefile), `.work/sdl3/include`.
-* Helper scripts written this session (outside the repo, `/tmp/opencode/`):
+* Helper scripts (**ahora en `.work/tools/`**, porque `/tmp/opencode` se vacía
+  cuando OpenCode reinicia el catálogo de herramientas; `build.sh`, `xd.py`,
+  `ppm2png.py`).  Antiguos, en `/tmp/opencode/`:
   `build.sh <src.c…>` (recompile natives + link), `gen_build.sh` (recompile the
   85 `rc_*.c` in parallel), `ppm2png.py`, `xdis_dump.py`, `hexdump.py`,
   `chk.py`, `xtr*.py` (binary xref scanners).  The local `build.sh` also adds
@@ -165,8 +171,8 @@ OTOMEDIUS_TEST_TEX=0xADDR        # texture object to preview with TEST_QUAD=2
 OTOMEDIUS_TEXTURES=1             # real LockRect + surface sharing (now the default)
 OTOMEDIUS_TEXTURES=0             # restore the old "LockRect always fails" path
 OTOMEDIUS_CHKSUM=1               # keep the original ChkSum.bin integrity gate
-OTOMEDIUS_NO_LOADER_GUARD=1      # do not force the async loader to finish
-OTOMEDIUS_LOADER_GUARD=1         # force it on a 7 s stall (now also default, see §4.7)
+OTOMEDIUS_LOADER_GUARD=1         # OPT-IN: force the loader to finish (52 polls / 70 polls);
+                                 # off by default since §9.1 (NO_LOADER_GUARD no longer exists)
 OTOMEDIUS_FORCE_JOB=1            # experiment: relax the 0x419E30 gate (breaks the boot)
 OTOMEDIUS_WATCHDOG=1             # every 2 s: per-thread eip/regs + current native import
 OTOMEDIUS_AUTOCOIN=1             # pulse the coin line every 2 s (input testing)
@@ -194,6 +200,9 @@ OTOMEDIUS_NATIVE_MOVIE=1         # skip the port's video composition, draw the
                                  # movie with the game's own 0x43F540 quad
 OTOMEDIUS_BOOTDBG=1              # boot/attract state machine + local heap trace
 OTOMEDIUS_QUIT_AT=n              # request quit at present n (shutdown testing)
+OTOMEDIUS_DUMP_EVERY=n           # with DUMP_FB: dump every n presents from DUMP_AT (file.NNNNN)
+OTOMEDIUS_DRAWDBG=n              # print every 2D draw of present n (fvf, tex, rs/tss/ss, verts)
+OTOMEDIUS_TEXFMT=1               # print the DDS format/size of D3DXCreateTextureFromFileInMemoryEx
 ```
 
 ---
@@ -400,12 +409,12 @@ Dispatcher extras added this session: `x86_watch_hit`, `x86_peek_dump`,
 | `0x00418040` | **load-job executor**; first thing: `call 0x419E30`, and only proceeds when it returns non-zero; creates/uses the "package" object and registers it at `0x418799` (`mov [esi*4+0x5DE098], eax`); destroys it at `0x41857F`/`0x41858C` (`free` + `mov [esi*4+0x5DE098], 0`) |
 | `0x00418730`… | package creation block: `EnterCriticalSection(0x5DE058)`, `HeapAlloc(0x5E1F28,0x44)`, `0x419110`, register; failure logs **`2308:Failed Alloc Package`** (`0x55951C`) and jumps to `0x41909B` |
 | `0x00419110` | **package constructor** (writes `+4…+0x3C`, returns the object in `eax`) |
-| `0x00419330` / `0x004193A0` | loader ring helpers that set **state 3** (`0x419355` / `0x4193CC`) |
+| `0x00419330` / `0x004193A0` | **`Cancel(id)`** (id en `ESI`): si el job actual (`[0x5BC918]`) tiene ese id pone el estado **3 = cancelado**, y marca `-1` el `[slot+4]` de todos los slots encolados con ese id (confirmado con Ghidra) |
 | `0x00419D00` | **async loader thread body**: `EnterCriticalSection(0x5DE070)`, scan the ring for `[slot+4] != -1`, run `0x418040(slot[4], &slot[8])`, `LeaveCriticalSection`, loop; on "no work" sets `[0x5B3F82]=1` and calls `_endthreadex` |
 | `0x00419530` | **"has the load finished?" poll** (called by the manager): `Sleep(16)`, `eax = 0x419430()`, returns **1** when the pump returns 0 or 2, else 0 |
 | `0x00419430` | **loader pump** (main thread): compares ring head/tail, polls `[0x5BC914]` with `WaitForSingleObject(h,0)`, closes it, spawns a loader via `0x419CA0`, sets state 0 when head==tail |
 | `0x00419CA0` | spawns one loader thread (`_beginthreadex(0x419D00)`), `SetThreadPriority(-2)`, `ResumeThread`, `[0x5BC91C]=1` |
-| `0x00419E30` | **job gate**: returns 1 only if `[0x5BC914] != 0 && [0x5BC91C] == 3`; used by `0x418040` |
+| `0x00419E30` | **"job cancelled?"** (corregido en §9.1): returns 1 iff `[0x5BC914] != 0 && [0x5BC91C] == 3`.  `0x418040` **aborta** cuando devuelve 1 y sólo procede cuando devuelve 0 |
 | `0x0041A820` | `CDirectSound::Init` (`DirectSoundCreate8`, `SetCooperativeLevel`, `CreateSoundBuffer`, `_beginthreadex`, `Run`) |
 | `0x0041B2A0` | **audio mixer thread entry** (param `0x5DE128`) |
 | `0x00404FB0` / `0x00405120` | `CSound::Create` / `CSound::Init` |
@@ -601,11 +610,9 @@ in order and aborts on the first mismatch (event 4, manager destroyed).
   uninitialised `.data`, so `game_state_init()` writes `-1` into all 16 slots at
   startup. Without it the loader "processed" empty slots, failed and stopped in
   state 4.
-* Because the pump's handshake never completes under our threading emulation
-  (`head=1`, `tail=2`, the worker handle never reports done), `0x419530` is
-  answered "finished" after **70 polls (~7 s)** with no progress. Default on;
-  `OTOMEDIUS_NO_LOADER_GUARD=1` restores waiting. This is what makes the boot
-  machine run at all.
+* **Obsoleto (ver §9.1):** el "handshake que nunca completa" era un bug nuestro
+  (`thread_arg_t.done` sin inicializar).  El guard de `0x419530` ya no está
+  activo por defecto; `OTOMEDIUS_LOADER_GUARD=1` lo reactiva.
 
 ### 4.8 Finalise guard (`native/patches.c`)
 
@@ -1425,43 +1432,190 @@ M native/main.c          TEB check en TLS; backtrace + RIP/RSP al fallar
 M README.md, docs/HANDOVER.md
 ```
 
-### Prompt corto para pegar al abrir la sesión nueva
+---
+
+## 9. Sesión 2026-11-16 (tercera parte): loader sin carreras, logo de Konami, thunks, rasterizador
+
+Esta sección **manda** sobre §3–§8 donde haya contradicción.  Tiene la misma
+estructura de seis puntos que el documento original.
+
+### 9.1 Entorno, toolchain y herramientas (delta)
+
+* Scripts persistentes en **`.work/tools/`** (`/tmp/opencode` se vacía):
+  `sh .work/tools/build.sh <archivo.c...>` (zig cc `-O2 -std=gnu11 -w`,
+  recompila los `.c` nativos indicados y re-linkea contra `.work/obj/*.o` +
+  `.work/obj/gen/*.o`; `tests/platform_null.c` se resuelve por nombre),
+  `python3 .work/tools/xd.py <hex addr> [n]` (desensamblador capstone sobre el
+  `otomedius.exe` original), `python3 .work/tools/ppm2png.py in.ppm out.png [escala]`.
+* **Ghidra MCP** operativo: proyecto `gghidra`, programa `/otomedius.exe`
+  (4533 funciones).  Desde `execute`: `tools["ghidra-mcp"].force_decompile({address:"0x419430"})`.
+  También por HTTP: `curl 'http://127.0.0.1:8089/force_decompile?address=0x419430'`.
+* Corridas largas (Title ≈ present 2750, attract ≈ 4500) tardan 100–200 s:
+  lanzarlas en background con `timeout`, escribir el log a fichero y volcar
+  frames con `OTOMEDIUS_DUMP_AT=… OTOMEDIUS_DUMP_EVERY=…`.  Un `[dump] N
+  dispatches` doble al final es el handler de SIGTERM del `timeout`, no un crash.
+* Identidad git del repo: `nicobm <215758560+nicobm@users.noreply.github.com>`,
+  remoto `https://github.com/nicobm/otomedius-recomp.git`, rama `master`.
+  **No hay `gh` ni credential helper**; el push se hizo con un token pasado por
+  variable de entorno de un único comando.  **Nunca** escribir el token en el repo.
+
+### 9.2 Mapa de memoria y globals (delta)
+
+Cola/loader asíncrono (todo en `.data` no respaldado por archivo, §2.2):
+
+| Dirección | Significado |
+|---|---|
+| `0x5BC914` | handle del hilo worker (`0` = ninguno) |
+| `0x5BC918` | id del job que el worker está procesando |
+| `0x5BC91C` | estado: `0` idle, `1` corriendo, `2` terminado, **`3` CANCELADO**, `4` error |
+| `0x5DCF8C` | id "actual" que consulta el pump |
+| `0x5DCF90` / `0x5DCF94` | head / tail del ring (16 slots × `0x10C` en `0x5DCF98`) |
+| slot `+0` / `+4` / `+8` | id / id (se pone a `-1` al cancelar o liberar) / nombre del pak (`0x104` bytes) |
+| `0x5DC9A2` | loader activo |
+| `0x5DE070` | `CRITICAL_SECTION` del loader |
+| `0x5DE098 + id*4` | tabla de **16** paquetes; `0x5DE0BC` = id 9 (logos/warning/title/attract) |
+| `pkg+4 / pkg+8` | vector de grupos (begin/end, punteros a grupo) |
+| grupo | `[0]=count`, luego `count` entradas de `0x44`: `+0` puntero a textura, `+4` nombre (`0x40`) |
+| `0x5DB708` | cabecera de `testmode.bin`: magic `0x07091300`; **`0x5DB710` = offset de reloj s64** (en este dump `0xFFFFFFFFFFEC29E0` = −1 300 000 ms) |
+
+Otros: `0x5E1F20` device D3D9; `0x5DE258` slot del manager "exclusivo" (logo/warning/vídeo/attract);
+`0x5DE23C` manager KonamiLogo; `0x5E1F7C` log object.  Thunks nativos:
+`THUNK_BASE=0x7F000000`, paso 16, **tabla fija de `0x10000` entradas de 24 B**
+(`native/imports.c`).
+
+### 9.3 Funciones (delta) — loader y logo
+
+| Dirección | Rol (verificado con Ghidra salvo nota) |
+|---|---|
+| `0x419170` | **Enqueue**: `EBX`=id del paquete, arg0=nombre; escribe slot[tail], `WaitForSingleObject([0x5BC914],0)`: si devuelve 0 (hilo terminado) cierra el handle y llama `0x419CA0`; si no, reutiliza el worker; avanza `tail` |
+| `0x419330` / `0x4193A0` | `Cancel(id)` en `ESI` (§3.3) |
+| `0x419430` | **pump** (main thread): devuelve `1` si el id actual está encolado, `2` si no es el job actual, o el estado; lanza el worker si head≠tail; `4` si falla `_beginthreadex` ("2303:Failed Begin Thread") |
+| `0x419530` | `Sleep(16)` + pump; devuelve `1` si pump∈{0,2} |
+| `0x419CA0` / `0x419D00` | crea / cuerpo del worker (`Once.pak` y compañía) |
+| `0x418040(id,name)` | ejecutor del job: `0x40EE90` (abre y mapea el pak) → `0x4185B0` (descomprime CAB) → `0x4186F0` (construye el grupo; llama `0x41DDA0`); errores 2300/2305/2306 |
+| `0x41DDA0` | **constructor de grupo**: `0x4142B0` aloja `(n-1)*0x44+0x48`, y por entrada `strcpy_s(nombre)` + `D3DXGetImageInfoFromFileInMemory` + `D3DXCreateTextureFromFileInMemoryEx(dev,…, mip=1, fmt=0xFFFFFFFD?, pool=1, …)`; errores "2500 Failed Alloc Group" / "2501 Failed Create Tex:%s" |
+| `0x418190(id)` | commit/limpieza del paquete (§4.13, §8.2) |
+| `0x4399A0` | ctor del manager KonamiLogo (vtable `0x55C8A0 = {0x4399F0, 0x44E630, 0x439A70, 0x439B90, 0x41DF40}`, registra en `0x5DE258`, `[obj+4]=0x1000`) |
+| `0x439A70` | update del logo: estado en `[obj+0xA]` (0..4, tabla `0x439B7C`); estado 0 pide `".\Data\KonamiLogo.pak"` (`0x55C884`, id 9) |
+| `0x439B90` → `0x439BB0` | draw del logo: textura = `grupo[0]+0` de `pkg9` (`[0x5DE0BC]`); sin paquete dibuja un quad blanco |
+| `0x439A10` | dtor del manager; llama `0x418190(9)` |
+| `0x40CAF0` | reloj→cadena (`ctime_s` vía `0x52F26E` → helper time64 `0x52DF0D`); usa `0x40CAD0 = 0x40CA10() + [0x5DB710]` |
+| `0x52DF0D` / `0x52FC65` | helper CRT time64: rechaza negativos o > año 3000 con `EINVAL (0x16)` → *invalid parameter handler* → `UnhandledExceptionFilter` |
+
+### 9.4 Parches y arreglos (todo sin commit antes de esta sesión)
+
+1. **`k_CreateThread` (`win32_kernel32.c`)**: `thread_arg_t` pasa de `malloc` a
+   **`calloc`**.  `done` basura (`300`, `555`, `1677721700`) hacía que
+   `WaitForSingleObject(h,0)` dijera "terminado" y `0x419170` arrancara un
+   segundo `0x419D00` concurrente.  Era la causa del Bloqueo 1 (vector del
+   paquete vacío) y del mito "el handshake nunca completa".
+2. **Guard del loader (`patches.c`, `0x419530`)**: ahora **opt-in**
+   (`OTOMEDIUS_LOADER_GUARD=1`).  Antes forzaba "terminado" a los 52 polls
+   mientras el worker aún descomprimía `Once.pak` (~240 presents), y el job de
+   `KonamiLogo.pak` se ejecutaba tras terminar la etapa del logo.
+3. **`bms_time_get_clock_blocking` (`avs.c`)**: `CLOCK_REALTIME` en ms.  El
+   offset de `testmode.bin` es negativo; con reloj monotónico la suma daba un
+   `time64` negativo, `ctime_s` fallaba y el juego moría con *unhandled
+   exception* antes del logo (`0x52DF9B`).
+4. **Tabla de thunks (`imports.c`)**: array estático `g_thunks[0x10000]` +
+   mutex en `x86_native_register`.  El `realloc` anterior corrompía lecturas
+   del hilo del mezclador (`fn_0041b2a0` → `x86_native_call`) → SIGSEGV con
+   dirección de heap del host (`0x…8248`) al cargar `Stage01.pak`.
+5. **`dsbuffer_clone` (`dsound.c`)**: el clon reutiliza la vtable del original
+   (antes registraba un juego nuevo de thunks por voz).
+6. **`UnhandledExceptionFilter` (`win32_kernel32.c`)** imprime código,
+   dirección, contexto y pila; **`fault_handler` (`main.c`)** imprime la última
+   importación nativa del hilo.
+7. **Diagnóstico**: `OTOMEDIUS_DUMP_EVERY`, `OTOMEDIUS_DRAWDBG`,
+   `OTOMEDIUS_TEXFMT`, trazas `bootdbg`/`LOADER` con contador de presents
+   (`render_presents()`), stubs de `UpdateSurface/StretchRect/ColorFill/
+   DrawIndexedPrimitiveUP/ProcessVertices/DrawRectPatch/DrawTriPatch/
+   SetScissorRect` que avisan una vez si se llaman (en la corrida al Title
+   **no se llamó ninguno**).
+8. **Rasterizador (`render.c`, `d3d9.c`)**: ahora usa el **FVF real**
+   (`g_fvf`; antes asumía `0x144` y `DrawPrimitiveUP` pasaba `arg32(5)` basura
+   como FVF); estados `RS_ALPHABLENDENABLE/SRCBLEND/DESTBLEND/ALPHATEST/ALPHAREF/
+   ALPHAFUNC/TEXTUREFACTOR`; operaciones del stage 0 (`COLOROP/ARG1/ARG2`,
+   `ALPHAOP/ARG1/ARG2` con SELECTARG1/2, MODULATE(2X/4X), ADD, SUBTRACT,
+   TFACTOR, complemento/replicado de alfa); sampler stage 0 (WRAP/MIRROR/CLAMP,
+   filtro POINT/LINEAR bilineal); color de vértice interpolado.  Sin textura
+   se usa el difuso tal cual.  `render_set_texture_stage_state()` es nuevo y se
+   llama desde `dev_SetTextureStageState`.  El truco de UV "por celdas" del
+   texto se conserva.
+
+### 9.5 Estado actual y bloqueos
+
+**Verificado (headless, ~200 s):** Konami logo visible (textura 1024×256
+`A1R5G5B5` en `(128,384)-(1152,…)`; el logo real tiene los trazos de velocidad
+sobre "KO"), eAMUSELogo, Warning, vídeo (~60 s), Title (`Title.pak`,
+`TitleSnd.pak`, `title_stream.xwb`), attract (`replay000.pak`,
+`catch_demo02.pak`, `Player02.pak`, `Speed.pak`, `TwinMsil`, `CycLaser`,
+`Ripple`, `MultiOpt`, `Bomb`, `Stage01.pak`), sin `no recompiled code`, sin
+SEH, sin SIGSEGV.
+
+**Bloqueo activo — fondo del Title.**  Present 3400 (33 draws `DrawPrimitiveUP`):
+28 quads de texto (`tex 256×256`), un quad `fvf=44` blanco a pantalla completa,
+un quad `fvf=144` con `tex=…9500 1024×1024` en `(128,0)-(1152,…)`, color
+`0x7FFFFFFF` (alfa 50 %), un quad `tex 2048×512` en `(40,362)` con UV `0..0.586`,
+color `0x5BFFFFFF`, y el overlay rojo/negro de la consola de depuración.  El
+logo "オトメディウス" sale bien, pero el **fondo se ve como puntos sueltos**
+(filas de píxeles aislados) en vez de una imagen continua.
+Hipótesis, por orden: (a) `decode_dds`/`texture_upload` decodifican mal el
+formato de esa textura (probar `OTOMEDIUS_TEXFMT=1`; formatos no soportados caen
+a ARGB; DXT3 vs DXT5, `A8L8`, `L16`, `A8`…); (b) la caché de 64 entradas de
+`texture_argb()` entrega un buffer parcial para texturas grandes; (c) el
+`D3DXCreateTextureFromFileInMemoryEx` del grupo (`0x41DDA0`) ignora `Format`/
+`MipLevels`/`Pool` pedidos (usa siempre A8R8G8B8 1 nivel).
+`OTOMEDIUS_TEXFMT` ya está implementado en `d3dx9.c` y compila; **todavía no se
+ha ejecutado**.
+
+Otros pendientes: attract casi en blanco (present ≥ 5000: barra gris arriba,
+caja negra con texto minúsculo al centro); en la pantalla de aviso de eAMUSEMENT
+la parte izquierda del texto sale con basura amarilla y hay un triángulo negro
+suelto arriba a la derecha (observado antes del rewrite del rasterizador, no
+reverificado); audio de `dsound` mudo (no hay mezclador `dsound`→SDL); quad
+nativo del vídeo (`0x43F540`) con X duplicada; rendimiento ~26–36 fps
+(rasterizador por píxel, flotante).
+
+### 9.6 Plan de acción inmediato
+
+1. `sh .work/tools/build.sh d3dx9.c`; correr en background
+   `OTOMEDIUS_TEXFMT=1 OTOMEDIUS_DRAWDBG=3400 OTOMEDIUS_DUMP_FB=/tmp/opencode/t
+   OTOMEDIUS_DUMP_AT=3400 timeout 170 ../obj/otomedius-recomp .` y leer el formato/
+   tamaño de la textura 1024×1024 (y la de 2048×512).  Corregir `decode_dds`/
+   `texture_upload` (y `texture_argb`) según el formato real.  Verificar con un
+   dump que el fondo es continuo.
+2. Repetir `DRAWDBG`+dump en presents ≈ 4600, 5000 y 6500 (attract): comparar
+   los draws con lo que el juego debería mostrar; buscar texturas con `tex=0`,
+   alfa 0 o FVF no soportados (`!(fvf&4)` se descarta en silencio en
+   `draw_up_vertices`); revisar `DrawPrimitive`/indexados (`draw=0` siempre).
+3. Mezclador de audio: implementar `dsound`→SDL (`platform_audio_*` ya existe,
+   §7.3) leyendo los buffers `dsbuffer_t` (`Play/Stop/Lock/SetVolume`, clones
+   comparten `data`), y revisar el hilo `0x41B2A0`.  Después: draw nativo del
+   vídeo y rendimiento del rasterizador.
+
+### 9.7 Prompt para la sesión nueva
 
 ```
-Contexto: repo /var/home/vm/Proyectos/SALA DE TRABAJO/otomedius-recomp
-(recompilación estática de Otomedius, Flatpak + SDL3). Lee docs/HANDOVER.md
-entero antes de tocar nada (lo último es §8).
+Repo: /var/home/vm/Proyectos/SALA DE TRABAJO/otomedius-recomp (recompilación
+estática de Otomedius, Flatpak + SDL3). Lee docs/HANDOVER.md entero; manda §9.
+No hagas commits ni push sin pedirlo; nunca escribas tokens en archivos.
+Herramientas persistentes: .work/tools/{build.sh,xd.py,ppm2png.py}
+(sh .work/tools/build.sh <archivo.c>; gen: PYTHONPATH=../.work/pylib python3
+tools/recomp/recomp.py --exe ../.work/oto/otomedius.exe --out ../.work/gen --chunk 60;
+run: cd ../.work/oto && ../obj/otomedius-recomp .). Ghidra MCP activo con
+/otomedius.exe (tools["ghidra-mcp"].force_decompile({address})).
 
-Estado: el juego arranca y recorre el boot completo: KonamiLogo ->
-eAMUSELogo -> Warning -> vídeo -> Title -> attract (state 0 sub 8/9). Bezel
-1920x1080, fullscreen por defecto, F11 -> 1366x768. El vídeo de introducción
-(Wmv3 640x512, Data/OTOMEDIUS_OP_f.wmv) se decodifica con ffmpeg, se sube a la
-textura real del TextureRenderer (1280x1024) y suena por SDL3; el manager
-0x43F370 ahora avanza su contador con reloj real (~60 s). El texto se dibuja
-legible con las fuentes reales (SysFont.dds / gradius_font.dds) tras
-implementar D3DXCreateTextureFromFileExA y GGO_GRAY8_BITMAP; el bug que
-giraba todo 180° era fabs(area) en draw_tri() de render.c (ya corregido).
-El logo de eAMUSEMENT sale derecho. El audio del juego (dsound) sigue mudo.
-
-BLOQUEO ACTIVO: el logo de Konami no se ve en el flujo normal. Su pak
-(konami_logo.dds, 1024x256 A1R5G5B5) sí carga si se quita
-Data/KonamiLogoSnd.pak (verificado: vec=169ccf60..169ccf64, rec=100695f8,
-n=1, tex=60930e20). Con los dos, el job de sonido (mismo id 9, SDBK/WVBK)
-corre concurrente y el vector del paquete queda vacío. El commit del id 9 ya
-se difiere (patches.c 0x418190/0x4186F0); falta que el grupo del logo se
-añada/persista. Comprobar por qué arrancan dos workers 0x419D00 a la vez
-(0x419170 + WaitForSingleObject(h,0)) o capturar el grupo en
-0x41DDA0/0x4186F0. Siguiente fallo: Player02.pak -> unhandled exception SEH.
-
-Build local: sh /tmp/opencode/build.sh <archivo.c ...>; gen:
-PYTHONPATH=../.work/pylib python3 tools/recomp/recomp.py --exe
-../.work/oto/otomedius.exe --out ../.work/gen --chunk 60; run:
-cd ../.work/oto && ../obj/otomedius-recomp .
-Vídeo local: LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/codecs-extra/lib
-OTOMEDIUS_MOVIE=1 OTOMEDIUS_DUMP_FB=/tmp/opencode/v.ppm OTOMEDIUS_DUMP_AT=900
-../obj/otomedius-recomp .
-
-No reescribas el HANDOVER sin pedirlo. No hagas commits sin pedirlo.
+Estado: boot completo (KonamiLogo visible -> eAMUSELogo -> Warning -> vídeo ->
+Title -> attract hasta Stage01.pak) sin crash. Arreglado: thread_arg_t.done sin
+inicializar (calloc), guard del loader opt-in, reloj bms CLOCK_REALTIME,
+tabla de thunks fija, clones dsound con vtable compartida, rasterizador con
+FVF/blend/alphatest/TSS/sampler.
+BLOQUEO: fondo del Title (quad 1024x1024 alfa 0x7F y 2048x512) sale como puntos
+sueltos: probable decode DDS/texture_upload. OTOMEDIUS_TEXFMT=1 ya existe en
+d3dx9.c, falta correrlo (background, ~150 s, present ~3400, con
+OTOMEDIUS_DRAWDBG=3400 y OTOMEDIUS_DUMP_FB/DUMP_AT). Luego attract casi en
+blanco, audio dsound mudo, quad nativo del vídeo.
 ```
 
 ---
@@ -1469,5 +1623,4 @@ No reescribas el HANDOVER sin pedirlo. No hagas commits sin pedirlo.
 ### Atribución
 
 La recompilación estática, la ingeniería inversa y la capa nativa Linux se
-desarrollan con **DeepSeek V4.1 Flash 1017**, servido por **OpenRouter** y
-usado a través de **OpenCode** como agente de código.
+desarrollan con varios LLMs usados a través de **OpenCode** como agente de código.

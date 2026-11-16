@@ -73,12 +73,19 @@ game's real font atlases (`SysFont.dds`, `gradius_font.dds`) — the 180°
 rotation that affected every textured quad was a rasteriser bug
 (`fabs(area)` in `draw_tri`), now fixed.
 
-What is still missing: the Konami logo texture does not survive the concurrent
-`KonamiLogoSnd.pak` load (package id 9), `Player02.pak` raises an unhandled SEH
-in the attract loader, the native movie quad still doubles its X scale (the
-port composites the video instead), and the game's `dsound` audio is silent.
-The detailed state and the next three steps are in
-[`docs/HANDOVER.md`](docs/HANDOVER.md).
+The Konami logo is now visible: the loader no longer races (a thread
+completion flag was uninitialised, which started two loader workers at once),
+the attract loader gets through `Player02.pak` up to `Stage01.pak` without an
+exception, and the native-thunk table is a fixed array (a `realloc` raced with
+the audio mixer thread and crashed the attract).  The software rasteriser now
+honours the real FVF, render states (alpha blend/test), stage-0 texture-stage
+operations and the sampler's address/filter modes.
+
+What is still missing: the `Title` background is drawn as scattered dots (a
+texture decoding problem), the attract screen is almost blank after that, the
+native movie quad still doubles its X scale (the port composites the video
+instead), and the game's `dsound` audio is silent.  The detailed state and the
+next three steps are in [`docs/HANDOVER.md`](docs/HANDOVER.md) (section 9).
 
 ## Requirements
 
@@ -197,6 +204,11 @@ AZERTY, QWERTZ and other layouts.
 | `OTOMEDIUS_MOVIE_FILE=path` | override the movie file (host path) |
 | `OTOMEDIUS_MOVIE_SIZE=WxH` | override the movie size used by the decoder (default 640x512) |
 | `OTOMEDIUS_NATIVE_MOVIE=1` | leave the movie to the game's own `0x43F540` draw instead of compositing the texture (diagnostic) |
+| `OTOMEDIUS_LOADER_GUARD=1` | force the async loader to report "done" after ~7 s (old workaround, off by default) |
+| `OTOMEDIUS_BOOTDBG=1` | trace the boot/attract state machine, the loader (`LOADER` lines) and the logo package |
+| `OTOMEDIUS_DUMP_EVERY=n` | with `OTOMEDIUS_DUMP_FB`, dump a frame every `n` presents starting at `OTOMEDIUS_DUMP_AT` (files get a `.NNNNN` suffix) |
+| `OTOMEDIUS_DRAWDBG=n` | print every 2D draw (FVF, texture, render/sampler state, first vertices) of present `n` |
+| `OTOMEDIUS_TEXFMT=1` | print the DDS format/size of textures created from memory |
 
 ## License
 
@@ -206,8 +218,8 @@ The game itself is not covered and not distributed.
 ## How this port is being written
 
 The static recompilation, the reverse engineering and the native Linux layer in
-this repository are being developed with **DeepSeek V4.1 Flash 1017**, served by
-**OpenRouter** and driven through **OpenCode** as the coding agent.
+this repository are being developed with several LLMs, driven through
+**OpenCode** as the coding agent.
 
 Everything runs against a local dump of the arcade build: the agent reads the
 recompiled C, instruments the emulated Win32/D3D9 layer, and iterates on
