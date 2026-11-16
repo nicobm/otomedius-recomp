@@ -58,9 +58,9 @@
             "build-commands": [
                 "mkdir -p /app/bin /app/share/otomedius-recomp/game out/obj",
                 "python3 tools/recomp/recomp.py --exe data/otomedius.exe --out recomp/gen --expect-sha256 \"$(cat recomp/exe.sha256)\"",
-                "find native -name '*.c' -print0 | xargs -0 -P \"$(nproc)\" -I{} sh -c 'f=\"$1\"; cc -O2 -std=c11 -w -Inative $(pkg-config --cflags sdl3) -c \"$f\" -o \"out/obj/$(basename \"$f\" .c).o\"' _ {}",
+                "find native -name '*.c' -print0 | xargs -0 -P \"$(nproc)\" -I{} sh -c 'f=\"$1\"; cc -O2 -std=c11 -w -Inative $(pkg-config --cflags sdl3) $(pkg-config --cflags freetype2) -c \"$f\" -o \"out/obj/$(basename \"$f\" .c).o\"' _ {}",
                 "find recomp/gen -name 'rc_*.c' -print0 | xargs -0 -P \"$(nproc)\" -I{} sh -c 'f=\"$1\"; cc -O2 -std=c11 -w -Inative -c \"$f\" -o \"out/obj/$(basename \"$f\" .c).o\"' _ {}",
-                "cc -O2 -o out/otomedius-recomp out/obj/*.o -lm -lpthread $(pkg-config --libs sdl3)",
+                "cc -O2 -o out/otomedius-recomp out/obj/*.o -lm -lpthread $(pkg-config --libs sdl3) $(pkg-config --libs freetype2)",
                 "install -Dm755 out/otomedius-recomp /app/bin/otomedius-recomp",
                 "cp -a data/. /app/share/otomedius-recomp/game/",
                 "install -Dm644 VERSION /app/share/otomedius-recomp/VERSION",

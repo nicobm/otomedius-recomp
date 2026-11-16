@@ -14,7 +14,7 @@
 #include <string.h>
 #include <stdio.h>
 
-static int g_width = 1024, g_height = 768;
+static int g_width = 1280, g_height = 1024;
 static uint32_t g_clear = 0xFF000000u;
 
 /* software frame buffer, 0xAARRGGBB (BGRA byte order, what SDL wants) */
@@ -241,6 +241,37 @@ static void draw_up_vertices(uint32_t prim, uint32_t prim_count, uint32_t data,
                     fprintf(stderr, " %08x", w32[k]);
             }
             fprintf(stderr, "\n");
+        }
+    }
+
+    /* The game's font renderer passes texture coordinates in *cell* units:
+     * a glyph at column 6, row 4 arrives as u=6.0, v=4.0, and the quad's
+     * second corner is u=6.09375 (one cell).  Treating those as normalised
+     * UVs makes WRAP sample texel 0 for every glyph.  Detect that convention
+     * (out-of-range integer UVs with a sub-cell span) and expand the integer
+     * part with the cell size taken from this quad. */
+    {
+        float minu = vt[0].u, maxu = vt[0].u, minv = vt[0].v, maxv = vt[0].v;
+        float cell_u, cell_v;
+        int cell_uv;
+        for (uint32_t i = 1; i < nverts; i++) {
+            if (vt[i].u < minu) minu = vt[i].u;
+            if (vt[i].u > maxu) maxu = vt[i].u;
+            if (vt[i].v < minv) minv = vt[i].v;
+            if (vt[i].v > maxv) maxv = vt[i].v;
+        }
+        cell_u = maxu - minu;
+        cell_v = maxv - minv;
+        cell_uv = (maxu >= 1.5f || maxv >= 1.5f) &&
+                  cell_u > 0.0f && cell_v > 0.0f &&
+                  cell_u < 1.0f && cell_v < 1.0f;
+        if (cell_uv) {
+            for (uint32_t i = 0; i < nverts; i++) {
+                vt[i].u = floorf(vt[i].u) * cell_u +
+                          (vt[i].u - floorf(vt[i].u));
+                vt[i].v = floorf(vt[i].v) * cell_v +
+                          (vt[i].v - floorf(vt[i].v));
+            }
         }
     }
 

@@ -40,6 +40,11 @@ void platform_set_size(int w, int h)
     if (w > 0 && h > 0) {
         g_w = w;
         g_h = h;
+        /* The game creates its D3D device after the window, so follow the
+         * device resolution (1280x1024 for Otomedius) instead of keeping the
+         * bootstrap size.  The window is resizable and the renderer scales. */
+        if (g_win)
+            SDL_SetWindowSize(g_win, w, h);
     }
 }
 

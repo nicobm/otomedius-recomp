@@ -42,6 +42,48 @@ int x86_patch_call(uint32_t addr)
         cpu->eip = M32(cpu->esp);    /* fake the ret */
         cpu->esp += 4;
         return 1;
+    case 0x418040u:                  /* load-job executor (cdecl, 2 args) */
+        /* The ring worker passes slot[+4] as the "job id", and downstream
+         * code uses it as an index into the 4-entry package registry
+         * (0x5DE098).  Our emulated ring occasionally hands it a value such
+         * as 16 (the slot count, not a package), which reads outside that
+         * table and ends in a call through an invalid vtable pointer in
+         * 0x418190.  Report "job not performed" (al = 0) for ids that cannot
+         * name a package; the worker then just frees the slot. */
+        {
+            uint32_t id = M32(cpu->esp + 4u);
+            if (id >= 4u) {
+                static int fired;
+                if (!fired++)
+                    fprintf(stderr, "config: loader job id %u out of range, "
+                            "skipping\n", id);
+                cpu->eax = 0;
+                cpu->eip = M32(cpu->esp);
+                cpu->esp += 4;
+                return 1;
+            }
+        }
+        return 0;
+    case 0x418190u:                  /* package lookup/commit (cdecl, 1 arg) */
+        /* arg = package index into the four-entry table at 0x5DE098.  When
+         * the emulated loader hands us an out-of-range value (e.g. 16) the
+         * lookup reads past the table and ends in a call through an invalid
+         * vtable pointer.  Do nothing for such an index. */
+        /* The commit walks the package's C++ record vector and eventually
+         * calls a virtual method; our emulated loader leaves that vector in a
+         * state the game's own code cannot walk (the same reason the later
+         * 0x414920 finalise is skipped).  The load itself (file mapping) has
+         * already happened in 0x418040, so skipping the commit is safe and
+         * keeps the worker from dereferencing a stale vtable. */
+        {
+            static int fired;
+            if (!fired++)
+                fprintf(stderr, "config: skipping the package commit step\n");
+            cpu->eax = 0;
+            cpu->eip = M32(cpu->esp);
+            cpu->esp += 4;
+            return 1;
+        }
     case 0x419E30u:                  /* "may the job executor run?" gate */
         /* The executor (0x418040) only proceeds when this returns non-zero,
          * and this returns 1 only while a job thread exists *and*
@@ -56,20 +98,32 @@ int x86_patch_call(uint32_t addr)
         cpu->esp += 4;
         return 1;
     case 0x414920u:                  /* commit/finalise the loaded packages */
-        /* It reads the package registry (0x5DE098) and calls a virtual method
-         * on the entry; when the registry is empty (every package already
-         * destroyed) that is a call through NULL.  Skipping the commit is
-         * strictly better than executing an invalid instruction, and the
-         * original path still runs whenever a package is live. */
-        if (M32(0x5DE098u) == 0) {
-            static int fired;
-            if (!fired++)
-                fprintf(stderr, "config: package registry empty, skipping "
-                        "the finalise step\n");
-            cpu->eax = 1;
-            cpu->eip = M32(cpu->esp);
-            cpu->esp += 4;
-            return 1;
+        /* It calls 0x419690(0) - "first record of package 0" - and then runs
+         * [[record]+0x24].  0x419690 returns `[pkg+0x24] + 0x20`, which is
+         * NULL whenever the package exists but its record vector was never
+         * filled (the normal case in this port, because the async loader is
+         * force-completed by the 0x419530 guard).  Both the missing registry
+         * and the NULL first record end in a call through address 0, so skip
+         * the commit unless there is a real object to commit.  The original
+         * path still runs when the loader produced a complete package. */
+        {
+            uint32_t pkg = M32(0x5DE098u);
+            uint32_t beg = pkg ? M32(pkg + 0x24u) : 0;
+            uint32_t end = pkg ? M32(pkg + 0x28u) : 0;
+            uint32_t obj = 0;
+            if (pkg && beg && end >= beg + 0x38u)
+                obj = M32(beg + 0x20u);
+            if (!obj || !M32(obj)) {
+                static int fired;
+                if (!fired++)
+                    fprintf(stderr, "config: package registry %s, skipping "
+                            "the finalise step\n",
+                            pkg ? "has no live record" : "empty");
+                cpu->eax = 1;
+                cpu->eip = M32(cpu->esp);
+                cpu->esp += 4;
+                return 1;
+            }
         }
         return 0;
     case 0x419530u:                  /* "has the async asset load finished?" */

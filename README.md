@@ -43,22 +43,26 @@ Version: see [`VERSION`](VERSION).
 | `kernel32` (files, heap, threads, TLS, code pages, time, file mappings) | working |
 | Konami AVS layer (`libacio`, `libbms`, `libtouchpanel`) | offline/free-play cabinet emulation |
 | `user32` window + message loop | minimal |
-| `d3d9`/`d3dx9` objects, math, DDS textures | interfaces verified against `d3d9.h`, drawing stubbed |
+| `d3d9`/`d3dx9` objects, math, DDS textures | interfaces verified against `d3d9.h`; texture `LockRect`/upload works by default |
 | `dsound` (device, buffers, lock/play) | interfaces working, silent |
 | `dshow` (opening movie: graph, filter, pin) | interfaces working, video skipped |
-| Renderer (shaders, sprites, playfield) | **in progress**: the game runs its main loop and renders every frame (`BeginScene`/`EndScene`/`Present`); drawing is still stubbed on the Linux side |
+| Fonts / text | **in progress**: FreeType GDI backend (DejaVu Sans by default); the 512×64 font atlas is built and uploaded, but its layout/UV still needs work |
+| Renderer (2D, sprites, playfield) | **in progress**: the game runs its main loop, creates a 1280×1024 device and draws every frame (`BeginScene`/`EndScene`/`Present`), including the 2D console overlay; the sprite/playfield path is still pending |
 | Audio (`dsound` → PulseAudio) | **not started** |
 
 Today the recompiled game boots completely: the MSVC CRT runs, the window is
-created, a Direct3D 9 device is created with valid caps, DirectSound 8 comes
-up, the opening movie's filter graph is driven, the Konami I/O board answers
-its boot handshake and the game enters its main loop, drawing every frame
-(`BeginScene` / `EndScene` / `Present`) with `Esc` or the window button to
-quit.
+created, a Direct3D 9 device is created with valid caps at **1280×1024**,
+DirectSound 8 comes up, the opening movie's filter graph is driven, the Konami
+I/O board answers its boot handshake and the game enters its main loop.  The
+x87 emulation was corrected (`fxch`/pop arithmetic), the software rasteriser
+draws the 2D console overlay, and the real font atlas is generated with
+FreeType and uploaded.  `Esc` or the window button quits cleanly.
 
-What is still missing: the Linux-side renderer (so the screen is black instead
-of showing the game), audio output, and the last few game states that lead to
-loading the level/title assets. The work in progress is listed above.
+What is still missing: the exact `CTexFont` atlas layout/UV convention (the
+text is currently rendered as noisy/striped glyphs), the first real scene
+(`Title`/`Warning`/`KonamiLogo` paks), the sprite/playfield renderer, and audio
+output.  The detailed state and the next three steps are in
+[`docs/HANDOVER.md`](docs/HANDOVER.md).
 
 ## Requirements
 

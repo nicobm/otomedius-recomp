@@ -2,6 +2,7 @@
 
 #define _GNU_SOURCE
 #include "win32.h"
+#include "font.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -46,6 +47,7 @@ static int g_font_h = 24;
 static void g_CreateFontA(void)
 {
     int h = (int)arg32(0);
+    uint32_t fh;
     g_font_h = h < 0 ? -h : (h ? h : 16);
     if (g_font_h < 6)
         g_font_h = 6;
@@ -57,10 +59,19 @@ static void g_CreateFontA(void)
         log_printf("gdi32: CreateFontA(h=%d face=%s)", h,
                    f ? sjis_to_utf8(f, face, sizeof(face)) : "?");
     }
-    RET32(0x0F000001u);
+    fh = font_create(g_font_h, arg_str(13));
+    RET32(fh ? fh : 0x0F000001u);
 }
-static void g_DeleteObject(void) { RET32(1); }
-static void g_SelectObject(void) { RET32(0x0F000002u); }
+static void g_DeleteObject(void)
+{
+    font_destroy(arg32(0));
+    RET32(1);
+}
+static void g_SelectObject(void)
+{
+    font_select(arg32(1));
+    RET32(0x0F000002u);
+}
 
 #define GGO_BITMAP 1u
 #define GGO_NATIVE 2u
@@ -91,23 +102,55 @@ static void glyph_native_outline(uint32_t p, int w, int h)
     put_fixed(p + 44, 1.0f);     put_fixed(p + 48, (float)h);
 }
 
+/* The game calls the GDI import with an extra (7th) argument: a second
+ * GLYPHMETRICS pointer embedded in the CTexFont object at +0x3A.  The Win32
+ * API itself only has six arguments (the local gm at arg3 is the API one),
+ * but CTexFont reads the one at arg6 to size the glyph in its atlas.  Leaving
+ * it untouched made the atlas builder see garbage dimensions, which packed
+ * glyphs over each other and eventually corrupted the heap. */
+static void gm_mirror(uint32_t gm, uint32_t gm2)
+{
+    /* The 7th argument is a second GLYPHMETRICS-shaped buffer inside the
+     * CTexFont object.  It is tempting to mirror the API's gm there, but the
+     * font code pre-fills those fields with its own UV/scale values; leave
+     * them alone until the exact contract is known. */
+    (void)gm;
+    (void)gm2;
+}
+
 static void g_GetGlyphOutlineA(void)
 {
     uint32_t ch = arg32(1), format = arg32(2), gm = arg32(3);
-    uint32_t cb = arg32(4), buf = arg32(5);
+    uint32_t cb = arg32(4), buf = arg32(5), gm2 = arg32(6);
     int h = g_font_h, w = (g_font_h * 2) / 3;
     int stride, size;
 
     {
         static int n;
         if (g_verbose && n++ < 10)
-            fprintf(stderr, "gdi32: GetGlyphOutlineA(ch=%u fmt=%u gm=%08x cb=%u buf=%08x)\n",
-                    ch, format, gm, cb, buf);
+            fprintf(stderr, "gdi32: GetGlyphOutlineA(ch=%u fmt=%u gm=%08x "
+                    "gm2=%08x cb=%u buf=%08x)\n",
+                    ch, format, gm, gm2, cb, buf);
     }
     if (w < 2)
         w = 2;
 
     if (format & GGO_NATIVE) {
+        /* Prefer the real font: the game rasterises these outlines into its
+         * atlas, so a genuine glyph shape is what makes text readable. */
+        uint32_t fsize = 0;
+        int fr = font_glyph_outline(0, ch, format, gm, cb, buf, &fsize);
+        if (fr == 1) {
+            gm_mirror(gm, gm2);
+            RET32(fsize);
+            return;
+        }
+        if (fr == 2) {
+            gm_mirror(gm, gm2);
+            RET32(0xFFFFFFFFu);          /* GDI_ERROR: buffer too small */
+            return;
+        }
+        /* no FreeType/font: fall back to the synthetic rectangle */
         size = GLYPH_NATIVE_SIZE;
         if (gm) {
             M16(gm + 0) = (uint16_t)w;          /* gmBlackBoxX */
@@ -117,6 +160,7 @@ static void g_GetGlyphOutlineA(void)
             M16(gm + 12) = (uint16_t)(w + 1);   /* gmCellIncX */
             M16(gm + 14) = 0;
         }
+        gm_mirror(gm, gm2);
         if (!cb || !buf)
             RET32((uint32_t)size);
         else if (cb < (uint32_t)size)
@@ -139,6 +183,7 @@ static void g_GetGlyphOutlineA(void)
         M16(gm + 12) = (uint16_t)(w + 1);   /* gmCellIncX */
         M16(gm + 14) = 0;
     }
+    gm_mirror(gm, gm2);
     if (format != GGO_BITMAP) {
         RET32(0xFFFFFFFFu);                 /* GDI_ERROR */
         return;
@@ -176,8 +221,15 @@ static void g_GetTextMetricsA(void)
 {
     uint32_t tm = arg32(1);
     int h = g_font_h;
+    if (tm && font_text_metrics(0, tm)) {
+        RET32(1);
+        return;
+    }
     if (tm) {
-        memset(MEM + tm, 0, 64);
+        /* sizeof(TEXTMETRICA) == 56 on Win32.  Do NOT memset 64: the game's
+         * CTexFont passes a 0x3C-byte local at ebp-0x3C, so a 64-byte clear
+         * writes over the saved EBP and the caller returns with ebp = 0. */
+        memset(MEM + tm, 0, 56);
         M32(tm + 0) = (uint32_t)h;               /* tmHeight */
         M32(tm + 4) = (uint32_t)(h - h / 4);     /* tmAscent */
         M32(tm + 8) = (uint32_t)(h / 4);         /* tmDescent */
@@ -198,6 +250,10 @@ static void g_GetCharABCWidthsA(void)
 {
     uint32_t first = arg32(1), last = arg32(2), abc = arg32(3);
     int adv = (g_font_h * 2) / 3 + 1;
+    if (font_abc_widths(0, first, last, abc)) {
+        RET32(1);
+        return;
+    }
     if (abc && last >= first && last - first < 0x10000) {
         for (uint32_t c = first; c <= last; c++) {
             uint32_t p = abc + (c - first) * 6;

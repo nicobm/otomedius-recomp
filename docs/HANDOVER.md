@@ -6,14 +6,17 @@
 > dump. Repository: `https://github.com/nicobm/otomedius-recomp` (branch
 > `master`).
 >
-> Status: **the game boots end-to-end** (loader, Konami boot machine, NVRAM
-> config, scene instantiation) but **nothing is visible yet** because the font
-> atlases are never uploaded. That is the single active blocker. §5 and §6 are
-> the parts to read first.
+> Estado: **el juego arranca de punta a punta** (loader, boot machine de Konami,
+> NVRAM, instanciación de escena), el **x87 está corregido**, los **atlas de
+> fuente se construyen y se suben** y el port es **estable 30 s sin crashes**.
+> El bloqueo activo es el **layout/UV del atlas de `CTexFont`**: el texto se
+> dibuja pero sale como ruido. Lee §5 y §6 primero. Este documento es el prompt
+> de transferencia para una sesión nueva; el repo es
+> `/var/home/vm/Proyectos/SALA DE TRABAJO/otomedius-recomp`.
 
 ---
 
-## 1. Environment and toolchain
+## 1. Entorno y Toolchain
 
 ### 1.1 Target
 
@@ -42,7 +45,11 @@ There is **no CMake and no MSVC**: the build is a single manifest script
 * Helper scripts written this session (outside the repo, `/tmp/opencode/`):
   `build.sh <src.c…>` (recompile natives + link), `gen_build.sh` (recompile the
   85 `rc_*.c` in parallel), `ppm2png.py`, `xdis_dump.py`, `hexdump.py`,
-  `chk.py`, `xtr*.py` (binary xref scanners).
+  `chk.py`, `xtr*.py` (binary xref scanners).  The local `build.sh` also adds
+  `-I$W/freetype_include` and `-L$W/freetype_lib -lfreetype`; those headers
+  were extracted from FreeType 2.13.2 into `.work/` because the agent container
+  is the Platform runtime (no dev headers).  The Flatpak build uses the SDK's
+  `pkg-config freetype2` instead.
 
 ```sh
 # rebuild everything
@@ -80,10 +87,12 @@ Manifest module `otomedius-recomp`, `build-commands` (single script, no helpers)
 python3 tools/recomp/recomp.py --exe data/otomedius.exe --out recomp/gen \
         --expect-sha256 "$(cat recomp/exe.sha256)"
 find native -name '*.c' -print0 | xargs -0 -P "$(nproc)" -I{} sh -c \
-  'f="$1"; cc -O2 -std=c11 -w -Inative $(pkg-config --cflags sdl3) -c "$f" -o "out/obj/$(basename "$f" .c).o"' _ {}
+  'f="$1"; cc -O2 -std=c11 -w -Inative $(pkg-config --cflags sdl3) \
+     $(pkg-config --cflags freetype2) -c "$f" -o "out/obj/$(basename "$f" .c).o"' _ {}
 find recomp/gen -name 'rc_*.c' -print0 | xargs -0 -P "$(nproc)" -I{} sh -c \
   'f="$1"; cc -O2 -std=c11 -w -Inative -c "$f" -o "out/obj/$(basename "$f" .c).o"' _ {}
-cc -O2 -o out/otomedius-recomp out/obj/*.o -lm -lpthread $(pkg-config --libs sdl3)
+cc -O2 -o out/otomedius-recomp out/obj/*.o -lm -lpthread \
+   $(pkg-config --libs sdl3) $(pkg-config --libs freetype2)
 ```
 
 Game data → `/app/share/otomedius-recomp/game/`; the launcher
@@ -117,6 +126,7 @@ otomedius-recomp/
 │   ├── dshow.c           fake DirectShow graph (drives the game's own TextureRenderer filter)
 │   ├── avs.c             Konami libacio/libbms/libtouchpanel replacement (+ touch input)
 │   ├── render.c          software rasteriser, frame stats, PPM dump, renderer self-test
+│   ├── font.c / font.h   NEW: FreeType GDI backend (metrics, ABC, GGO_NATIVE outlines)
 │   └── platform.h/_sdl.c SDL3 window, events, input, framebuffer upload
 ├── tools/recomp/         pe.py (own PE parser), xdis.py (discovery), emit.py (x86→C), recomp.py
 ├── recomp/exe.sha256     c55796ad1f2d6ea9bd0fb0d33ed6b6eb6463d0e3ad8f2e1d7c4608ca9dfcf112
@@ -139,7 +149,8 @@ OTOMEDIUS_DUMP_FB=/tmp/x.ppm     # write one frame (P6) — headless verificatio
 OTOMEDIUS_DUMP_AT=n              # which frame to dump (default 200)
 OTOMEDIUS_TEST_QUAD=1|2          # 1 = full-screen quad test, 2 = texture preview
 OTOMEDIUS_TEST_TEX=0xADDR        # texture object to preview with TEST_QUAD=2
-OTOMEDIUS_TEXTURES=1             # real IDirect3DTexture9::LockRect + surface sharing
+OTOMEDIUS_TEXTURES=1             # real LockRect + surface sharing (now the default)
+OTOMEDIUS_TEXTURES=0             # restore the old "LockRect always fails" path
 OTOMEDIUS_CHKSUM=1               # keep the original ChkSum.bin integrity gate
 OTOMEDIUS_NO_LOADER_GUARD=1      # do not force the async loader to finish
 OTOMEDIUS_LOADER_GUARD=1         # force it on a 7 s stall (now also default, see §4.7)
@@ -150,12 +161,15 @@ OTOMEDIUS_AUTOSTART=1            # pulse start
 OTOMEDIUS_BADTARGET=skip         # report missing functions instead of aborting
 OTOMEDIUS_NOTHREDS=1             # create thread handles but never run them
 OTOMEDIUS_NOMOVIE=1              # force VFW_E_NOT_FOUND
+OTOMEDIUS_NO_FREETYPE=1          # force the synthetic rectangle glyph path
+OTOMEDIUS_FONT=/path/font.ttf    # override the FreeType font (CJK, etc.)
+OTOMEDIUS_TEXDBG=1               # dump each font atlas to /tmp/opencode/tex_*.pgm
 OTOMEDIUS_DIR=path               # game directory
 ```
 
 ---
 
-## 2. Binary and memory map
+## 2. Mapa de Binarios y Memoria
 
 ### 2.1 The dump
 
@@ -274,7 +288,7 @@ gdi32 imports (relevant to the active blocker): `CreateFontA`,
 
 ---
 
-## 3. Recompiled functions and solved subsystems
+## 3. Funciones Recompiladas y Subsystems Resueltos
 
 ### 3.1 Recompiler (`tools/recomp`, own implementation, capstone-based)
 
@@ -416,9 +430,25 @@ Dispatcher extras added this session: `x86_watch_hit`, `x86_peek_dump`,
   alpha blending; `platform_sdl.c` uploads it to a streaming texture each frame;
   `tests/platform_null.c` is a no-op backend.
 
+* **FreeType font backend (`native/font.c`)** – `CreateFontA` opens a system
+  TTF/OTF (DejaVu Sans by default, `OTOMEDIUS_FONT` override, `fc-match` +
+  candidate paths, `/run/host/fonts` CJK fallback), sets the face to `h/4`
+  pixels because `CTexFont` stores glyphs at 1/4 resolution, and implements
+  `GetTextMetricsA` (56-byte TEXTMETRICA), `GetCharABCWidthsA` and
+  `GetGlyphOutlineA` GGO_NATIVE.  Outlines are flattened to short
+  `TT_PRIM_LINE` curves (`LINE_CHUNK=8`) because the game's rasteriser did not
+  digest QSPLINE/CSPLINE or a single huge line curve.  All entry points use a
+  recursive mutex because the async loader also logs through the same font.
+* **x87 correction** – the recompiler emitted every `fxch st(i)` as
+  `x86_fxch(cpu, 0)` (capstone gives two operands, `(st(0), st(i))`) and
+  `x86_fpu_arith` wrote pop results to `st(b)=st(0)` instead of the
+  destination `st(a)`.  Fixed in `tools/recomp/emit.py` and `native/x86rt.c`,
+  then all 85 `rc_*.c` were regenerated.  The 2D setup at `0x401000` now
+  yields `[0x5DB454]=640.0`, `[0x5DB458]=512.0`, `[0x5DB45C]=1.0`.
+
 ---
 
-## 4. Patches and workarounds applied
+## 4. Parches y Workarounds Aplicados
 
 ### 4.1 Konami AVS libraries (`native/avs.c`) — all **cdecl** (`nargs = 0`)
 
@@ -570,169 +600,351 @@ and the call goes through NULL. `x86_patch_call()` returns 1 (skip) when
 * `OTOMEDIUS_BADTARGET=skip` turns an unknown target into a no-op that "returns",
   so one run reports **every** missing function (`[missing] <addr> (caller <addr>)`).
 
-### 4.10 GDI font path (`win32_misc.c`)
+### 4.10 GDI font path — legacy synthetic fallback (`win32_misc.c`)
 
-`CreateFontA` stores the requested height; `GetTextMetricsA` and
-`GetCharABCWidthsA` return coherent metrics; **`GetGlyphOutlineA` implements
-`GGO_NATIVE`** (a closed rectangle contour in `TTPOLYGONHEADER`/`TTPOLYCURVE`
-format, `cb = 52`, 16.16 fixed point, +y upwards) and `GGO_BITMAP`
-(1bpp box). Font face names are logged converted **CP932 → UTF-8** (they are
-Shift-JIS: `ＤＦＧ中太丸ゴシック体`).
+The original synthetic path is still compiled in as a fallback (used when
+FreeType/`OTOMEDIUS_NO_FREETYPE` is unavailable): `CreateFontA` stores the
+requested height; `GetTextMetricsA` and `GetCharABCWidthsA` return coherent
+metrics; `GetGlyphOutlineA` implements `GGO_NATIVE` (a closed rectangle
+contour in `TTPOLYGONHEADER`/`TTPOLYCURVE`, `cb = 52`, 16.16 fixed point,
++y upwards) and `GGO_BITMAP` (1bpp box).  The real path is §4.11.  Font face
+names are logged converted **CP932 → UTF-8** (Shift-JIS:
+`ＤＦＧ中太丸ゴシック体`).
 
 ---
 
-## 5. Current state and active blocker
 
-### 5.1 What works (verified headless and in the Flatpak)
+### 4.11 FreeType font backend (`native/font.c`, `font.h`)
+
+`win32_misc.c` now calls into `font.c` for all GDI font work; the synthetic
+rectangle path remains only as a fallback.  Key points:
+
+* Font selection: `OTOMEDIUS_FONT` → `fc-match sans` → candidate list
+  (`/usr/share/fonts/dejavu/DejaVuSans.ttf`, `/usr/share/fonts/truetype/…`,
+  `/usr/share/fonts/gnu-free/FreeSans.ttf`, ipagothic, Noto CJK,
+  `/run/host/fonts/…`).  DejaVu is preferred because TrueType has no cubics;
+  CJK can be forced with `OTOMEDIUS_FONT`.
+* `FT_Set_Pixel_Sizes(face, 0, (h+3)/4)` — `CTexFont` stores glyphs at 1/4
+  of the screen size (h=24 → 6 px, h=48 → 12 px).  This is the current
+  working hypothesis; §5.2 explains why the atlas is still dense.
+* `GetTextMetricsA` writes exactly **56** bytes (`sizeof(TEXTMETRICA)`), see
+  §4.12.  `GetCharABCWidthsA` currently writes the game's compact 6-byte ABC
+  layout (`a,b,c` as 16-bit) at `abc + i*6`.
+* `GetGlyphOutlineA` GGO_NATIVE: `FT_Load_Glyph(FT_LOAD_NO_BITMAP |
+  FT_LOAD_NO_HINTING)`, fills `GLYPHMETRICS` (`gmBlackBoxX/Y`,
+  `gmptGlyphOrigin`, `gmCellIncX`), flattens conics/cubics to short line
+  segments (`LINE_CHUNK=8`) and emits `TTPOLYGONHEADER` (cb, dwType=24,
+  pfxStart) + `TTPOLYCURVE` (wType=1, cpfx, points) in 16.16 fixed point.
+  Contours are explicitly closed.  The size query (`cb=0`) builds the same
+  buffer and returns its size.
+* Thread safety: `pthread_mutex_t` with `PTHREAD_MUTEX_RECURSIVE`, because
+  the loader thread logs through `0x405120` while the main thread draws.
+* The 7th `GetGlyphOutlineA` argument (`gm2=&[font+0x3A]`) is **not**
+  mirrored: the game pre-fills those fields as UV/scale offsets.  See §5.2.
+
+### 4.12 `TEXTMETRICA` overrun (`win32_misc.c`)
+
+The old `g_GetTextMetricsA` did `memset(MEM + tm, 0, 64)`.  `TEXTMETRICA` is
+**56** bytes; the game's `CTexFont` passes a `0x3C`-byte local at `ebp-0x3C`.
+The 64-byte clear wrote over the saved EBP, so `0x409C00` returned with
+`ebp=0`; the next call used `[ebp+0xC]` = NULL and died with
+`no recompiled code at 00000000` while consuming the synthetic GGO_NATIVE
+contour.  Fixed to `memset(..., 0, 56)`.  This was the first crash in the
+font path.
+
+### 4.13 Loader/package guards (`native/patches.c`)
+
+* `0x414920` (finalise/commit): the original guard only skipped when the
+  registry `0x5DE098` was NULL.  It now also skips when the package exists
+  but its first record (`[pkg+0x24]+0x20`) is NULL or has no vtable, because
+  that also ends in a call through address 0.
+* `0x418040` (load-job executor, cdecl, 2 args): if the job id (`[esp+4]`) is
+  `>= 4` (the package registry has 4 entries), return `eax=0` so the worker
+  treats the job as not performed; this avoids the out-of-range index `0x10`
+  seen in the loader ring.
+* `0x418190` (package lookup/commit, cdecl, 1 arg): **skipped entirely**.
+  The loader's C++ record vector is not in a state the game's code can walk
+  (the same reason `0x414920` is skipped); the file mapping already happened
+  in `0x418040`.  Log: `config: skipping the package commit step`.
+* These guards keep the port stable without the loader crash; they are not
+  the final loader fix.
+
+### 4.14 Adapter mode / 1280×1024 / SDL window
+
+`d9_EnumAdapterModes` used `g_dev.width ? g_dev.width : 1024`; before the
+device exists `g_dev.width` is 0, so it advertised 1024×768 while the game's
+window constants are 1280×1024.  The game then created a 1024×768 backbuffer
+inside a 1280×1024 window, which put all 2D UI coordinates off-screen.
+Now it advertises `render_width()/render_height()` and `render.c` defaults to
+**1280×1024**.  `platform_set_size` calls `SDL_SetWindowSize` so the SDL
+window follows the device resolution.  Log: `CreateDevice(1280x1024)`.
+
+### 4.15 Texture `LockRect` default + UV cell remap
+
+`IDirect3DTexture9::LockRect` now succeeds by default (the game uploads its
+font atlases through it).  `OTOMEDIUS_TEXTURES=0` restores the old
+always-fail behaviour for bisecting.  The atlas upload is visible as:
+
+```
+d3d9: tex LockRect(60040490) 512x64 -> 600404d0
+```
+
+`render.c` also has a heuristic for the game's **cell-index UVs** (u=6.0,
+v=4.0): when the UVs are out of the normalised range with a sub-cell span,
+it maps `u_norm = floor(u)*cell_u + frac(u)` (and the same for V), where
+`cell_u/cell_v` are the max-min of the quad's UVs.  This is required to reach
+the intended atlas cell, but §5.2 shows the atlas packing still disagrees with
+the 48×6 cell size.
+
+## 5. Estado Actual y Bug/Bloqueo Activo
+
+### 5.1 Lo que funciona (verificado en local y en Flatpak)
+
+El port **arranca de punta a punta** y es **estable durante 30 s** con
+`timeout 30` (`exit 124`, **0** líneas `no recompiled code`). El log del
+Flatpak (build `a2ec90e0…`, antes de FreeType) confirma:
 
 ```
 loader: image 00400000-005e9000 entry 00530e2b
 imports: 300 bound, 0 missing
 config: oto.ini: 85 values applied, 0 unknown
-config: async loader ring initialised (16 free slots)
-platform: opengl renderer
-main: entering 00530e2b
-user32: CreateWindowExA(1280x1024) wndproc=00401bb0
-avs: ac_io_avs_boot
 d3d9: Direct3DCreate9(32) -> 60000090
-d3d9: CreateDevice(1024x768) windowed=0
-kernel32: CreateFileA(././HidBoot.id) -> fd
-kernel32: CreateFileA(./oto.ini) -> fd
+d3d9: GetDeviceCaps(...)
+d3d9: CreateDevice(1280x1024) windowed=0
+user32: CreateWindowExA(1280x1024) wndproc=00401bb0
 dsound: DirectSoundCreate8 -> 60040420
-kernel32: CreateFileA(././Data/otomedius.xgs) -> fd
-kernel32: MapViewOfFile(116 bytes) -> 0a000000
+dshow: filter graph created (600e0640)
 gdi32: CreateFontA(h=48 face=ＤＦＧ中太丸ゴシック体)
 gdi32: CreateFontA(h=28 face=ＤＦＧ中太丸ゴシック体)
-kernel32: CreateFileA(././ChkSum.bin) -> fd
-render: frame 120: clear=1 draw=0 up=16 verts=32 fvf=000144 … bbox=(0,-31)-(360,24)
-kernel32: CreateThread(slot=0 handle=00001000 fn=0041b2a0)      # audio mixer
-kernel32: CreateThread(slot=1 handle=00001010 fn=00419d00)      # loader
-kernel32: CreateFileA(././Data/Once.pak) -> fd
-kernel32: MapViewOfFile(29883830 bytes) -> 0a001000
-config: loader stalled in state 1 after 52 polls, forcing completion
-config: package registry empty, skipping the finalise step
-avs: bms_init -> 0 ; bms_init_wait -> 0 ; bms_eventlog_request_init -> 0
-kernel32: CreateFileA(./testmode.bin) -> fd                    # LoadConfig
-kernel32: CreateFileA(./bookkeep.bin) -> fd                    # LoadBookKeep
 gdi32: CreateFontA(h=24 face=ＤＦ中太丸ゴシック体)
-x86: thread end   00530547 (ExitThread)
-render: frame 360: clear=1 draw=0 up=25 verts=50 fvf=000144 … tex0=60040490 bbox=(-631,-5)-(12,0)
+d3d9: tex LockRect(60040490) 512x64 -> 600404d0
+render: frame 360: clear=1 draw=0 up=25 verts=50 fvf=000144
+        tex0=60040490 bbox=(-303352,8)-(2926,319040) onscreen=5
+platform: Esc pressed
 ```
 
-Verified state after the boot: `[0x5E2027] = 0xFF` (load done),
-`[0x5E1F96] = 2` (boot machine ready), `[0x5E1FA5]=5`, `[0x5E1FA6]=3`,
-`[0x5E1FA7]=2`, `[0x5DE220]=0` (no manager suspended), the scene manager
-`[0x5DE228]` alive and its sub-state `[manager+8] = 2`, scene objects created
-once (`0x45F1B0`, `0x439C80`, `0x44D190`).
+Estado de los globals tras el boot (verificado con `OTOMEDIUS_WATCHMEM`/
+`OTOMEDIUS_WATCHCHG`):
 
-Window opens 1280×1024, `Esc`/close quit cleanly through `WM_QUIT`, no crashes,
-`exit 124` under `timeout`.
+| Global | Valor / significado |
+|---|---|
+| `[0x5E2027]` | `0xFF` = carga terminada |
+| `[0x5E1F96]` | `2` = boot machine “ready” |
+| `[0x5E1FA5]` / `[0x5E1FA6]` / `[0x5E1FA7]` | `5` / `3` / `2` |
+| `[0x5DE220]` | `0` (ningún manager suspendido) |
+| `[0x5DE228]` | puntero al manager de escena vivo |
+| `[0x5DB454]` / `[0x5DB458]` | `640.0` / `512.0` (centro 2D correcto) |
+| `[0x5DB45C]` / `[0x5DB460]` | `1.0` / `1.0` |
+| `[0x5E1F88]` / `[0x5E1F8C]` | objetos `CTexFont` 512×64 / 512×256 |
 
-### 5.2 The active blocker: the font atlases are never uploaded
+Las texturas reales están **activadas por defecto** (`OTOMEDIUS_TEXTURES=0`
+restaura el comportamiento antiguo en el que `LockRect` siempre falla). El
+atlas 512×64 (`0x60040490`) **se construye y se sube**; el de 512×256
+(`0x60060570`) también existe. El de la fuente local de escena es
+`0x605e0a40` (1024×512).
 
-What the user sees: **black screen**, a few white pixels top-left that animate
-for ~4 s and then freeze.
+La escena dibuja 25 `DrawPrimitiveUP` por frame. Los 16 quads de texto están
+en `(448,480)-(832,536)` con `tex0=0x60040490`; el marco de la consola de
+depuración es el rectángulo rojo `(372,476)-(907,547)`. Los otros 4 quads
+tienen coordenadas enormes (`bbox=(-303352,8)-(2926,319040)`) y quedan fuera
+de pantalla; son un camino de dibujo aparte, pendiente de revisar.
 
-Measured facts:
+### 5.2 Bloqueo activo: el layout/UV del atlas de `CTexFont`
 
-1. The UI is drawn as **25 `DrawPrimitiveUP` per frame** (`draw=0`: the game
-   never uses `DrawPrimitive`), all with `tex0 = 0x60040490`.
-2. `0x60040490` is **`CreateTexture(512x64, fmt 21 = A8R8G8B8)`** — a **font
-   atlas**. `0x60060570` (512x256) is the second one. **Neither is ever
-   uploaded**: no `texture … uploaded` line is emitted for them (the game-side
-   upload path is `LockRect`, which by default still returns
-   `D3DERR_INVALIDCALL`).
-3. An all-zero atlas means alpha 0 everywhere ⇒ the rasteriser blends nothing ⇒
-   the text is invisible. The few white pixels are the untextured fragments.
-4. The quads' coordinates are `(-403.5, 0.3) … (12.0, -5.7)` (415×6 px bars
-   anchored at `(12,0)`), i.e. **above the top edge**. This is not a viewport
-   bug: the only viewport is `(0,0,1024,768)`; it is an entry animation that
-   never advances because the UI is invisible/frozen.
-5. `[manager+8]` is written **exactly once** (0 → 2) in the whole run
-   (`OTOMEDIUS_WATCHCHG=auto`), so the manager stays in the boot sub-state by
-   design; the real scene state lives in the scene object.
+El texto ya **no es invisible** (el atlas tiene alpha y los glifos son
+reales), pero se ve como **ruido/rayas**. Datos medidos:
 
-**Why the atlas is empty.** The game builds font atlases with GDI:
-`CreateFontA` → `SelectObject` → `GetTextMetricsA`/`GetCharABCWidthsA` →
-**`GetGlyphOutlineA` with `fuFormat = 6` (`GGO_NATIVE|GGO_GRAY2_BITMAP`)** →
-rasterise the outlines itself (`CTexFont`) → upload via
-`IDirect3DTexture9::LockRect` (through the level-0 surface).
+1. Con FreeType el atlas 512×64 tiene **22 717 píxeles** con alpha
+   (`first=17ffffff`, `alpha0=0`). El atlas anterior sintético tenía 324.
+2. El atlas es **denso**: un único componente conexo `(0,18)-(511,63)` con
+   22 299 píxeles; la celda `(288,24)` de 48×6 tiene **273/288** píxeles no
+   cero. Comparado con el atlas sintético (cajas huecas), esto demuestra que
+   los glifos reales se están escribiendo unos encima de otros.
+3. La tabla de fuente del juego (`0x5BE7CC`, entrada del font index 1) es:
+   `+0x00=0` (string), `+0x04=0x60` (96), `+0x08=24.0`, `+0x0C=24.0`,
+   `+0x10=0.09375`, `+0x14=0.09375`, `+0x18=0x10004100` (glyph array).
+   `0.09375 = 48/512 = 6/64`: la celda lógica es **48×6 px**.
+4. Los glyph records son `N=(6,4)`, `O=(7,4)`, `W=(5,5)`, `I=(1,4)`,
+   `T=(2,5)`, `A=(3,3)`, `L=(4,4)`, `Z=(8,5)`, `G=(9,3)`.
+5. El quad de texto pasa `u=6.0..6.09375`, `v=4.0..4.09375`: un **span de
+   celda** de `0.09375` en U (48 px) y `0.09375` en V (6 px).
+6. El atlas empaqueta glifos de **~6 px** de ancho (`gmCellIncX` a `h/4` es
+   ~3 px, a `h=24` ~13 px), pero el span U del quad es **48 px**. Cada quad
+   muestrea entre 4 y 8 glifos en vez de uno → ruido.
 
-With **`OTOMEDIUS_TEXTURES=1`** (real `LockRect` + surface sharing) the game
-attempts the atlas build and then **crashes**:
+Hipótesis, en orden:
+
+1. El **packer de `CTexFont`** (`0x409C00` → `0x409D20`) avanza el lápiz X
+   con `gmCellIncX` (o con el ancho del glifo), no con el ancho de celda de
+   48 px. Hay que instrumentar `0x409D20` y volcar `[edi+0x28]` (pen X),
+   `[edi+0x2C]` (pen Y), `[edi+0x4C]`/`[edi+0x50]` (ancho/alto del glifo)
+   para cada carácter y compararlo con las UVs de los glyph records.
+2. El **tamaño de la `FT_Face`** no es el correcto. Ahora se usa `h/4`
+   (24 → 6 px) porque la celda V es 6 px; pero la celda U es 48 px. Probar
+   `h` y `h*2` y medir el atlas/pen. La proporción 4× puede ser solo vertical.
+3. La **convención UV** del juego puede necesitar una **texture matrix** que
+   no se está aplicando (`SetTransform` no se llama; `D3DTSS_TEXTURETRANSFORMFLAGS`
+   se pone a 0). El remapeo actual en `draw_up_vertices` es una aproximación.
+4. El **7º argumento** de `GetGlyphOutlineA` es un segundo
+   `GLYPHMETRICS`-shaped buffer en `&[font+0x3A]`. El juego lo precalcula como
+   offsets UV; **no se debe espejar** el `gm` de la API ahí (el espejo está
+   desactivado en `gm_mirror`).
+5. El rasterizador `0x409D20` tiene dos caminos seleccionados por
+   `[font+0x38]` y `[font+0x39]` (bitmap/outline y 1bpp/4bpp). Hay que
+   confirmar que GGO_NATIVE entra por el camino de líneas y no por el de
+   bitmap.
+
+El remapeo actual de UVs de celda en `native/render.c` es:
+
+```c
+cell_u = maxu - minu;
+cell_v = maxv - minv;
+cell_uv = (maxu >= 1.5f || maxv >= 1.5f) &&
+          cell_u > 0 && cell_v > 0 && cell_u < 1.0f && cell_v < 1.0f;
+if (cell_uv) {
+    vt[i].u = floorf(vt[i].u) * cell_u + (vt[i].u - floorf(vt[i].u));
+    vt[i].v = floorf(vt[i].v) * cell_v + (vt[i].v - floorf(vt[i].v));
+}
+```
+
+Con `u=6.0`, `cell_u=0.09375` da `u_norm=0.5625` (texel 288) y con
+`6.09375` da `0.65625` (texel 336): un span de 48 texels. Si el atlas real
+empaqueta a 6 px, este span es 8× demasiado grande.
+
+### 5.3 Problemas secundarios y estado del árbol
+
+* **Loader/package commit**: el worker del ring pasa `slot[+4]` como índice
+  de paquete; en nuestra emulación llega `0x10` (16), fuera de la tabla de 4
+  entradas `0x5DE098`, y `0x418190` acaba en un `call` a vtable inválida.
+  Añadidos guards: `0x418040` devuelve `al=0` si `id>=4`; `0x418190` se salta
+  siempre (el commit del paquete). El guard de `0x414920` se amplió para
+  saltar también cuando el registro existe pero no tiene un record vivo.
+  Esto mantiene el port estable; el commit real habrá que entenderlo.
+* **Escena real**: solo se ha cargado `Once.pak`. `0x45EB20` (Title),
+  `0x45FF10` (Warning) y `0x439A8C` (KonamiLogo) **nunca se han llamado**.
+  “NOW INITIALIZING” es la consola de depuración, no la pantalla del juego.
+* **Japonés**: la fuente por defecto es DejaVu Sans (ASCII). Para CJK usar
+  `OTOMEDIUS_FONT=/ruta/NotoSansCJK.ttc` o similar; el runtime tiene DejaVu
+  en `/usr/share/fonts/dejavu/DejaVuSans.ttf`, y `/run/host/fonts` puede
+  aportar Noto CJK si el sandbox lo permite.
+* **4 quads con coordenadas enormes**: bbox `(-303352,8)-(2926,319040)`.
+  Están fuera de pantalla y no bloquean, pero conviene identificar el draw
+  (posiblemente el marco de la consola con una escala mal calculada).
+
+Ficheros modificados/nuevos en el working tree (checkpoint sin commit al
+escribir esto; el commit se hará al cerrar la sesión):
 
 ```
-x86: no recompiled code at 00000000 (eip=00000000 esp=009fee30 ebp=009feeac
-                                    eax=00000000 ebx=00000030 ecx=00000000)
-last returns: 005326de -> 00532a92 / 0053d26e -> 00532a65  (CRT region)
+M io.github.nicobm.OtomediusRecomp.json
+M native/d3d9.c
+M native/d3d9_objects.c
+M native/patches.c
+M native/platform_sdl.c
+M native/render.c
+M native/win32_misc.c
+M native/x86rt.c
+M tools/recomp/emit.py
+?? native/font.c
+?? native/font.h
 ```
 
-i.e. a call through a NULL pointer inside the `CTexFont` rasteriser
-(`0x409C00` region) / CRT helpers `0x532xxx`, while consuming the synthetic
-`GGO_NATIVE` contour. Hypotheses (in order):
+`docs/HANDOVER.md` y `README.md` también se actualizan en el checkpoint.
 
-1. Our `GGO_NATIVE` output is not what `CTexFont` expects (contour count, `cb`
-   fields, fixed-point rounding, or it needs `GGO_GRAY2_BITMAP` too).
-2. The level-0 surface/`LockRect` path still disagrees with the game (pitch,
-   format, or the texture is locked while a surface of a different size is used).
-3. The `GetTextMetricsA`/`GetCharABCWidthsA` numbers are coherent but wrong
-   enough that the atlas layout overflows and corrupts a pointer.
+Artefactos locales (fuera del repo): `.work/gen` regenerado (85 ficheros con
+`--chunk 60`), `.work/obj` reconstruido, `.work/freetype_include` y
+`.work/freetype_lib` extraídos de FreeType 2.13.2 para el contenedor del
+agente. El Flatpak regenera **42** ficheros `rc_*.c` porque el manifiesto no
+pasa `--chunk 60`; no es un bug, pero explica la diferencia con los 85
+locales.
 
----
+## 6. Plan de Acción Inmediato
 
-## 6. Immediate action plan (next 3 steps)
+### Paso 1 — Recompilar el Flatpak y verificar FreeType
 
-1. **Fix the `OTOMEDIUS_TEXTURES=1` crash in the font path.** Reproduce headless
-   (`cd ../.work/oto && OTOMEDIUS_TEXTURES=1 ../obj/otomedius-recomp .`), capture
-   the trace (`last dispatch targets` / `last returns`), and identify which call
-   receives the NULL pointer. The last run showed the fault after CRT helpers
-   `0x5326de -> 0x532a92` / `0x53d26e -> 0x532a65` with `eax=ecx=esi=edi=0`
-   (`esp=009fee30`); the game-side suspect is the `CTexFont` rasteriser around
-   `0x409C00`–`0x409Exx`. Use `OTOMEDIUS_WATCH` on the `CTexFont` entry points
-   plus `OTOMEDIUS_WATCHMEM`/`PEEKREGS` to dump the `this` object. Expected
-   payoff: the atlas gets built and uploaded, and text becomes visible.
-
-2. **Make the glyph path faithful.** Either
-   (a) adjust `g_GetGlyphOutlineA` (`native/win32_misc.c`) so the returned
-   `TTPOLYGONHEADER`/`TTPOLYCURVE` stream matches what `CTexFont` consumes
-   (compare against a real GDI dump; check `cb`, `dwType = 24`,
-   `wType = TT_PRIM_LINE = 1`, `cpfx`, 16.16 fixed point, +y up), or
-   (b) replace the DC font with a **real** one (FreeType + a system TTF), which
-   also fixes Japanese text later. Then confirm with
-   `OTOMEDIUS_LOG=2 | grep 'texture 60040490'` that the 512×64 atlas is uploaded,
-   and dump a frame (`OTOMEDIUS_DUMP_FB`) to verify pixels appear.
-
-3. **Then chase the first real scene.** Once text is visible, watch
-   `0x45EB20` (Title), `0x45FF10` (Warning), `0x439A8C` (KonamiLogo) and the
-   scene object created by `0x42D9F8` (vtable + which methods are called per
-   frame). `[0x5E2027]` is already `0xFF`, so the manager will start loading
-   scene paks as soon as the UI/transition advances. Milestone: a
-   `CreateFileA(./Data/*.pak)` for a scene (not `Once.pak`).
-
-After that: finish the renderer for real content (the sprite path
-`0x40F780`/`0x40FA44`: log vertex data at `DrawPrimitive`/`DrawIndexedPrimitive`),
-audio mixing (`dsound` → PulseAudio), and speed up pak loading (`ReadFile` is
-called in 1024-byte chunks by the CRT `fread`; a read-behind buffer in
-`k_ReadFile` would help).
-
----
-
-### Useful commands
+El Flatpak instalado es **anterior** a FreeType. Recompilar:
 
 ```sh
-# Flatpak build + run
-bash build-game-flatpak.sh /path/to/otomedius.zip
-flatpak run --env=OTOMEDIUS_LOG=1 io.github.nicobm.OtomediusRecomp
-
-# local headless iteration (agent environment)
-cd "<SALA DE TRABAJO>/.work"
-zig/zig cc -std=c11 -O1 -w -I../otomedius-recomp/native -c ../otomedius-recomp/native/X.c -o obj/X.o
-gen: PYTHONPATH=../.work/pylib ../otomedius-recomp/tools/recomp/recomp.py --exe oto/otomedius.exe --out gen --chunk 60
-run: cd oto && timeout 20 env OTOMEDIUS_LOG=1 ../obj/otomedius-recomp .
+bash build-game-flatpak.sh "/ruta/al/Otomedius (2008-04-18)(JPN)[Konami PC][TP].zip"
+flatpak run io.github.nicobm.OtomediusRecomp
 ```
 
-### Attribution
+Comprobar en la salida:
 
-The static recompilation, the reverse engineering and the native Linux layer in
-this repository are being developed with **DeepSeek V4.1 Flash 1017**, served by
-**OpenRouter** and driven through **OpenCode** as the coding agent.
+```
+font: using /usr/share/fonts/dejavu/DejaVuSans.ttf
+d3d9: tex LockRect(60040490) 512x64 -> ...
+render: frame 360: ... tex0=60040490 bbox=(448,480)-(832,536)
+```
+
+Si no aparece `font: using`, revisar que el SDK tenga
+`pkg-config --modversion freetype2` (26.7.20) y que el manifiesto pase
+`$(pkg-config --cflags freetype2)` y `$(pkg-config --libs freetype2)`.
+
+### Paso 2 — Resolver el layout/UV del atlas (bloqueo real)
+
+1. Instrumentar el packer `0x409C00`/`0x409D20` (watch + memoria) y volcar,
+   por carácter: `[edi+0x28]` (pen X), `[edi+0x2C]` (pen Y),
+   `[edi+0x4C]`/`[edi+0x50]` (ancho/alto), y las UVs del glyph record.
+2. Comparar con la tabla de fuente (`0x5BE7CC`, entrada 1): `+0x10=0.09375`,
+   `+0x14=0.09375`; decidir si la celda es 48×6 o 6×6.
+3. Probar variantes controladas:
+   - `FT_Set_Pixel_Sizes` a `h/4`, `h`, `h*2` (ya está `h/4`).
+   - `LINE_CHUNK=8` (líneas cortas; ya está) frente a `QSPLINE`.
+   - desactivar/activar el remapeo de celdas de `render.c`.
+   - `OTOMEDIUS_TEXDBG=1` para volcar `tex_60040490.pgm` y analizar
+     componentes/ocupación de celdas.
+4. Objetivo de aceptación: el atlas debe ser **disperso** (glifos separados)
+   y el frame debe mostrar “NOW INITIALIZING” legible en
+   `(448,480)-(832,536)`. Si el packer no se puede domar, alternativa:
+   **bypass** del atlas: generar un atlas 512×64 con FreeType en la rejilla
+   exacta que espera el juego y sustituir la textura tras `LockRect`.
+
+### Paso 3 — Primera escena real
+
+Con el texto legible, seguir la carga de escena:
+
+```sh
+OTOMEDIUS_LOG=1 OTOMEDIUS_WATCH="45eb20:2,45ff10:2,439a8c:2" \
+  ../obj/otomedius-recomp .
+```
+
+Buscar `CreateFileA(./Data/Title.pak)`, `Warning.pak`, `KonamiLogo.pak`.
+Revisar el manager `0x42D3D0` (sub-estado `[manager+8]`, tabla `0x42DBA4`) y
+la creación de escena `0x42D9F8`. Cuando se entienda el vector de packages,
+retirar el guard de `0x418190` y el de `0x414920` y validar el commit real.
+
+Después de esos 3 pasos: renderer de sprites reales
+(`0x40F780`/`0x40FA44`), audio (`dsound` → PulseAudio), y carga de pak más
+rápida (buffer de lectura en `k_ReadFile`).
+
+---
+
+### Prompt corto para pegar al abrir la sesión nueva
+
+```
+Contexto: repo /var/home/vm/Proyectos/SALA DE TRABAJO/otomedius-recomp
+(recompilación estática de Otomedius, Flatpak + SDL3). Lee docs/HANDOVER.md
+entero antes de tocar nada.
+
+Estado: el juego arranca y es estable 30 s (exit 124, 0 crashes). x87
+corregido (fxch/pop), CreateDevice 1280x1024, texturas reales por defecto,
+atlas 512x64 se construye y sube, FreeType integrado (DejaVu, h/4, mutex).
+BLOQUEO: el atlas de CTexFont se llena de glifos solapados; los quads de
+texto en (448,480)-(832,536) muestrean 48 px de U (0.09375) mientras el
+atlas empaqueta a ~6 px -> ruido. Plan: instrumentar 0x409C00/0x409D20 y
+la tabla 0x5BE7CC, ajustar face size/UV, validar con OTOMEDIUS_TEXDBG.
+Después: escena real (0x45EB20, 0x45FF10, 0x439A8C) y retirar los guards de
+0x418040/0x418190/0x414920.
+
+No reescribas el HANDOVER sin pedirlo. No hagas commits sin pedirlo.
+Build local: sh /tmp/opencode/build.sh <archivo.c ...>; gen:
+PYTHONPATH=../.work/pylib python3 tools/recomp/recomp.py --exe
+../.work/oto/otomedius.exe --out ../.work/gen --chunk 60; run:
+cd ../.work/oto && ../obj/otomedius-recomp .
+```
+
+### Atribución
+
+La recompilación estática, la ingeniería inversa y la capa nativa Linux se
+desarrollan con **DeepSeek V4.1 Flash 1017**, servido por **OpenRouter** y
+usado a través de **OpenCode** como agente de código.

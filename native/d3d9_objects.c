@@ -80,14 +80,16 @@ static void t_LockRect(void)
     uint32_t locked = arg32(2);
     texture_t *t = tex(self);
 
-    /* Real D3D9 succeeds here, and that is what OTOMEDIUS_TEXTURES=1 enables:
-     * the game then builds its font atlases and gets past the 1117 halt, but
-     * it currently dies at 0x409C00 (CTexFont) while rasterising the synthetic
-     * glyph outlines.  Until that is fixed the default keeps the historical
-     * behaviour (failure), which leaves the pak loader running. */
-    if (!getenv("OTOMEDIUS_TEXTURES")) {
-        RET32(0x8876086Au);
-        return;
+    /* Real D3D9 succeeds here and the game builds its font atlases through
+     * this path (CTexFont -> GetGlyphOutline -> LockRect).  That is now the
+     * default; OTOMEDIUS_TEXTURES=0 restores the old "always fail" behaviour
+     * for bisecting the loader/render paths. */
+    {
+        const char *e = getenv("OTOMEDIUS_TEXTURES");
+        if (e && *e && *e == '0') {
+            RET32(0x8876086Au);
+            return;
+        }
     }
     if (!t || !t->data) {
         RET32(0x8876086Au);   /* D3DERR_INVALIDCALL */
@@ -99,13 +101,48 @@ static void t_LockRect(void)
     }
     {
         static int n;
-        if (g_verbose && n++ < 6)
+        if (g_verbose && n++ < 16)
             fprintf(stderr, "d3d9: tex LockRect(%08x) %ux%u -> %08x\n",
                     self, t->w, t->h, t->data);
     }
     RET32(0);
 }
-static void t_UnlockRect(void) { RET32(0); }
+static void t_UnlockRect(void)
+{
+    if (getenv("OTOMEDIUS_TEXDBG")) {
+        texture_t *t = tex(arg32(0));
+        if (t && t->data && t->w && t->h) {
+            const uint32_t *p = (const uint32_t *)(MEM + t->data);
+            uint32_t nz = 0, a0 = 0, first = 0, first_i = 0;
+            for (uint32_t i = 0, n = t->w * t->h; i < n; i++) {
+                uint32_t c = p[i];
+                if (c & 0x00FFFFFFu) {
+                    if (!nz) { first = c; first_i = i; }
+                    nz++;
+                    if (!(c & 0xFF000000u)) a0++;
+                }
+            }
+            fprintf(stderr, "d3d9: unlock tex %08x %ux%u: rgb=%u alpha0=%u "
+                    "first=%08x @%u\n", arg32(0), t->w, t->h, nz, a0, first,
+                    first_i);
+            if (t->w <= 2048 && t->h <= 2048) {
+                char path[160];
+                FILE *fp;
+                snprintf(path, sizeof(path), "/tmp/opencode/tex_%08x.pgm",
+                         arg32(0));
+                fp = fopen(path, "wb");
+                if (fp) {
+                    fprintf(fp, "P5\n%u %u\n255\n", t->w, t->h);
+                    for (uint32_t i = 0, n = t->w * t->h; i < n; i++)
+                        fputc((int)(p[i] >> 24), fp);
+                    fclose(fp);
+                    fprintf(stderr, "d3d9:   wrote %s\n", path);
+                }
+            }
+        }
+    }
+    RET32(0);
+}
 static void t_AddDirtyRect(void) { RET32(0); }
 
 /* The engine uploads pixels through the level-0 surface

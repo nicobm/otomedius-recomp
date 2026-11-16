@@ -869,8 +869,11 @@ void x86_fpu_arith(cpu_t *c, int op, int a, int b, int rev, int pop)
     default: r = (y == 0.0L) ? HUGE_VALL : x / y; break;
     }
     if (pop) {
-        c->st[(c->top + b) & 7] = r;
-        c->tag[(c->top + b) & 7] = 1;
+        /* Pop forms leave the result in the *destination* st(a) and then
+         * discard st(0).  Writing to st(b) (= st0) and popping lost the
+         * result of every `fmulp st(i)` / `faddp st(i)`. */
+        c->st[(c->top + a) & 7] = r;
+        c->tag[(c->top + a) & 7] = 1;
         fpu_pop(c);
     } else {
         c->st[(c->top + a) & 7] = r;

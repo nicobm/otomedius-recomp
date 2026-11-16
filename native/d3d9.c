@@ -142,11 +142,17 @@ static void d9_GetAdapterModeCount(void) { RET32(1); }
 
 static void d9_EnumAdapterModes(void)
 {
-    uint32_t p = arg32(4);      /* (this, Adapter, Format, Mode, pMode) */
+    /* (this, Adapter, Format, Mode, pMode).  The game enumerates the adapter
+     * modes and picks the one closest to the 1280x1024 it wants (the window
+     * constants in .data).  Before a device exists g_dev.width is 0, so the
+     * old code advertised 1024x768 and the game created a 1024x768 backbuffer
+     * inside a 1280x1024 window: every 2D UI coordinate was then off-screen.
+     * Advertise the real desktop/window size instead. */
+    uint32_t p = arg32(4);
     if (p) {
         memset(MEM + p, 0, 16);
-        M32(p + 0) = g_dev.width ? g_dev.width : 1024;
-        M32(p + 4) = g_dev.height ? g_dev.height : 768;
+        M32(p + 0) = g_dev.width ? g_dev.width : (uint32_t)render_width();
+        M32(p + 4) = g_dev.height ? g_dev.height : (uint32_t)render_height();
         M32(p + 8) = 60;
         M32(p + 12) = 22;  /* D3DFMT_X8R8G8B8 */
     }
@@ -440,6 +446,15 @@ static void dev_Clear(void)
 static void dev_SetTransform(void)
 {
     uint32_t state = arg32(1), m = arg32(2);
+    if (g_verbose > 1) {
+        static int n;
+        if (n++ < 12 && m) {
+            const float *f = (const float *)(MEM + m);
+            fprintf(stderr, "d3d9: SetTransform(state=%u) "
+                    "[%.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f]\n",
+                    state, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
+        }
+    }
     if (m)
         render_set_transform(state, MEM + m);
     RET32(0);
@@ -511,7 +526,16 @@ static void dev_SetTexture(void)
 }
 
 static void dev_GetTextureStageState(void) { RET32(0); }
-static void dev_SetTextureStageState(void) { RET32(0); }
+static void dev_SetTextureStageState(void)
+{
+    if (g_verbose > 1) {
+        static int n;
+        if (n++ < 24)
+            fprintf(stderr, "d3d9: SetTextureStageState(stage=%u type=%u value=%u)\n",
+                    arg32(1), arg32(2), arg32(3));
+    }
+    RET32(0);
+}
 static void dev_GetSamplerState(void) { RET32(0); }
 
 static void dev_SetSamplerState(void)

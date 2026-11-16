@@ -665,8 +665,15 @@ class Emitter:
                 return ["x86_fist_mem(cpu, %s, %d, 0);" % (self.ea(memop), memop[2] * 8)]
             return None
         if m == "fxch":
-            i = st_index(ops[0]) if ops else 1
-            return ["x86_fxch(cpu, %d);" % (i if i is not None else 1)]
+            # capstone exposes `fxch st(i)` as two operands, (st(0), st(i));
+            # older decoders give only st(i).  The exchange index is the
+            # operand that is not st(0), never ops[0] (which is always st(0)).
+            i = st_index(ops[1]) if len(ops) > 1 else None
+            if i is None and ops:
+                i = st_index(ops[0])
+            if i is None:
+                i = 1
+            return ["x86_fxch(cpu, %d);" % i]
         if m in ("fadd", "faddp", "fsub", "fsubp", "fsubr", "fsubrp", "fmul", "fmulp",
                  "fdiv", "fdivp", "fdivr", "fdivrp", "fiadd", "fisub", "fisubr", "fimul",
                  "fidiv", "fidivr"):
@@ -731,8 +738,15 @@ class Emitter:
         if memop:
             return "x86_fpu_arith_mem(cpu, %d, %s, %d, %d, %d);" % (
                 opid, self.ea(memop), memop[2] * 8, int(rev), int(pop))
-        a = st_index(ops[0]) or 0
+        # pop forms (`faddp st(1)` and the implicit `faddp`) use st(1) as the
+        # destination and st(0) as the popped operand when no operand is
+        # decoded explicitly.
+        a = st_index(ops[0]) if ops else (1 if pop else 0)
+        if a is None:
+            a = 1 if pop else 0
         b = st_index(ops[1]) if len(ops) > 1 else 0
+        if b is None:
+            b = 0
         return "x86_fpu_arith(cpu, %d, %d, %d, %d, %d);" % (opid, a, b, int(rev), int(pop))
 
     # -------------------------------------------------------------- SSE
