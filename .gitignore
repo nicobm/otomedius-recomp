@@ -1,0 +1,21 @@
+# The game is never part of this repository
+game.zip
+*.zip
+data/
+game/
+out/
+build-dir/
+repo/
+.flatpak-builder/
+
+# Generated code and build products
+recomp/gen/
+*.o
+*.a
+*.so
+version.h
+__pycache__/
+*.pyc
+
+# Dependencies fetched by the build wrapper
+flatpak/wheels/

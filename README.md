@@ -1,0 +1,164 @@
+# Otomedius — native Linux recompilation
+
+A native **Linux x86-64** port of the 2008 Konami arcade shooter *Otomedius*,
+built by **static recompilation** (AOT translation, not emulation): the
+original 32-bit Windows executable is translated **ahead of time** into C on
+your machine and linked against a hand-written Linux system layer (SDL3,
+Vulkan, pthreads). No Wine, no emulator, no JIT, no interpreter, no
+TeknoParrot.
+
+What "static" means here, precisely:
+
+* Every instruction of the game is decoded once, at build time, and becomes C
+  code. At run time there is **no instruction decoder and no interpreter
+  loop**: the CPU executes native x86-64 code produced by your C compiler.
+* There is no emulated guest CPU state machine stepping through opcodes: the
+  game's registers live in a plain C structure, its branches are C `goto`s and
+  its calls are native calls plus a small dispatcher for computed targets.
+* The only "emulated" thing that survives is the **32-bit address space**:
+  the game keeps its original pointers, so its memory is mapped inside a
+  reserved 4 GiB window of the 64-bit process.
+* The result is a normal 64-bit Linux ELF binary: no 32-bit multilib, no
+  i386 SDK, no compatibility layer.
+
+> **Legal notice.** This repository contains **no part of the game**: no
+> executable, no `.pak`/audio/video data, no DLLs, no code generated from the
+> game. You need your own copy of the arcade dump. The build translates *your*
+> executable on *your* machine and the result stays on your machine.
+> Otomedius is © Konami Digital Entertainment. This project is not affiliated
+> with, endorsed by or supported by Konami. Do not open issues asking where to
+> find the game.
+
+Version: see [`VERSION`](VERSION).
+
+## Status
+
+**Work in progress — not playable yet.** What exists today:
+
+| Component | State |
+|---|---|
+| PE loader + 4 GiB emulated address space | working |
+| x86 → C recompiler (`tools/recomp`) | working: ~5 000 functions, ~380 000 instructions, **95 %** of the code section translated |
+| Native runtime (CPU state, dispatcher, x87, SSE2, string ops) | working |
+| `kernel32` (files, heap, threads, TLS, code pages, time, file mappings) | working |
+| Konami AVS layer (`libacio`, `libbms`, `libtouchpanel`) | offline/free-play cabinet emulation |
+| `user32` window + message loop | minimal |
+| `d3d9`/`d3dx9` objects, math, DDS textures | interfaces verified against `d3d9.h`, drawing stubbed |
+| `dsound` (device, buffers, lock/play) | interfaces working, silent |
+| `dshow` (opening movie: graph, filter, pin) | interfaces working, video skipped |
+| Renderer (shaders, sprites, playfield) | **in progress**: the game runs its main loop and renders every frame (`BeginScene`/`EndScene`/`Present`); drawing is still stubbed on the Linux side |
+| Audio (`dsound` → PulseAudio) | **not started** |
+
+Today the recompiled game boots completely: the MSVC CRT runs, the window is
+created, a Direct3D 9 device is created with valid caps, DirectSound 8 comes
+up, the opening movie's filter graph is driven, the Konami I/O board answers
+its boot handshake and the game enters its main loop, drawing every frame
+(`BeginScene` / `EndScene` / `Present`) with `Esc` or the window button to
+quit.
+
+What is still missing: the Linux-side renderer (so the screen is black instead
+of showing the game), audio output, and the last few game states that lead to
+loading the level/title assets. The work in progress is listed above.
+
+## Requirements
+
+- Linux with Flatpak (Wayland recommended; X11/XWayland works through
+  `fallback-x11`).
+- Your own copy of the Otomedius arcade dump (the `.zip` used with
+  TeknoParrot). The build checks its SHA-256 and the executable hash.
+
+Nothing else: the SDK, SDL3 3.4.20 and the Python build dependency are fetched
+by the build script.
+
+## Build
+
+```sh
+git clone https://github.com/nicobm/otomedius-recomp
+cd otomedius-recomp
+./build-game-flatpak.sh /path/to/your/otomedius.zip
+```
+
+The script:
+
+1. detects missing `flatpak` / `flatpak-builder` and prints the install command
+   for your distribution (Fedora, Debian/Ubuntu, Arch, openSUSE, …);
+2. verifies the SHA-256 of the archive and of `otomedius.exe`;
+3. installs the Freedesktop runtime **and SDK 26.08** if they are missing;
+4. downloads the pinned `capstone` wheel (the Flatpak build itself has **no
+   network access**);
+5. recompiles the game, builds the native layer, and installs the Flatpak for
+   the current user.
+
+Then launch **Otomedius (recompiled)** from your application menu or with:
+
+```sh
+flatpak run io.github.nicobm.OtomediusRecomp
+```
+
+See [`FLATPAK.md`](FLATPAK.md) for the package names per distribution and for
+what the sandbox is allowed to access.
+
+## Controls
+
+| Action | Keyboard | Gamepad |
+|---|---|---|
+| Move | Arrows or W A S D | D-pad / left stick |
+| Shot | Z or J | A (south) |
+| Power-up / bomb | X or K | B (east) |
+| Option / rapid | C or L | X (west) |
+| Special | V or I | Y (north) |
+| Start | Enter | Start |
+| Coin | 5 or 6 | Back |
+| Quit | Esc | — |
+
+Letter keys are read by physical position, so they stay in the same place on
+AZERTY, QWERTZ and other layouts.
+
+## How it works
+
+```
+ otomedius.exe ──tools/recomp/recomp.py──▶ recomp/gen/rc_*.c   (one C function
+       │                                        │                 per x86 function)
+       │                                        │
+       └── native/ (kernel32, user32, d3d9, d3dx9, AVS) ──cc──▶ out/otomedius-recomp
+                SDL3 + Vulkan (Flatpak runtime 26.08)
+```
+
+- The original image is mapped at its original base address inside a reserved
+  4 GiB region, so every 32-bit pointer the game stored in its own memory keeps
+  working.
+- Every discovered x86 function becomes a C function. Registers and flags live
+  in a per-thread `cpu_t`; branches inside a function are C `goto`s.
+- `call`, `ret`, indirect jumps and tail jumps leave the generated function and
+  come back through a dispatcher that maps a 32-bit address to a
+  (function, continuation) pair, so return addresses are first-class entry
+  points.
+- `fs:` is intercepted for the Windows TEB/SEH chain; x87 uses `long double`
+  (80-bit) and the SSE2 registers are modelled per thread.
+- Imports are bound to native thunks: `call dword ptr [IAT]` becomes a direct
+  call into the Linux implementation, with the Win32 stdcall cleanup applied by
+  the wrapper table.
+
+## Layout
+
+| Path | Content |
+|---|---|
+| `tools/recomp/` | PE reader, x86 discovery/decoder, C emitter, driver |
+| `native/` | native Linux system layer (runtime, Win32, Konami AVS, D3D9) |
+| `recomp/exe.sha256` | hash of the executable the port is validated against |
+| `flatpak/`, `*.json` | Flatpak packaging (manifest, icon, launcher) |
+| `tests/` | headless platform backend used while debugging |
+
+## Environment variables
+
+| Variable | Effect |
+|---|---|
+| `OTOMEDIUS_LOG=1` | loader/import tracing |
+| `OTOMEDIUS_LOG=2` | also log every Win32 call |
+| `OTOMEDIUS_LOG=3` | also log every dispatcher transfer |
+| `OTOMEDIUS_DIR=path` | game directory (default: the current directory) |
+
+## License
+
+MIT for the code in this repository (see [`LICENSE`](LICENSE), © 2026 nicobm).
+The game itself is not covered and not distributed.

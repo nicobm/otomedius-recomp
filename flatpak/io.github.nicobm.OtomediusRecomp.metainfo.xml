@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.nicobm.OtomediusRecomp</id>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Otomedius</name>
+  <summary>Native Linux recompilation of the Otomedius arcade shooter</summary>
+  <developer id="io.github.nicobm">
+    <name>nicobm</name>
+  </developer>
+  <description>
+    <p>
+      A native Linux recompilation of the 2008 Konami arcade shooter
+      Otomedius. The original 32-bit Windows code is translated to C on your
+      own machine, from your own copy of the game, and runs without Wine,
+      without an emulator and without an interpreter.
+    </p>
+    <p>
+      This package contains no part of the game: no original executable, no
+      data files and no generated code. You need your own copy of the arcade
+      dump to build it.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.nicobm.OtomediusRecomp.desktop</launchable>
+  <url type="homepage">https://github.com/nicobm/otomedius-recomp</url>
+  <url type="bugtracker">https://github.com/nicobm/otomedius-recomp/issues</url>
+  <categories>
+    <category>Game</category>
+  </categories>
+  <keywords>
+    <keyword>otomedius</keyword>
+    <keyword>konami</keyword>
+    <keyword>shmup</keyword>
+    <keyword>arcade</keyword>
+    <keyword>shooter</keyword>
+  </keywords>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-11-16">
+      <description>
+        <p>First build of the recompilation pipeline.</p>
+      </description>
+    </release>
+  </releases>
+</component>

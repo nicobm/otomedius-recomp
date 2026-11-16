@@ -1,0 +1,21 @@
+#!/bin/sh
+# Launcher: the game data lives read-only inside the Flatpak; the game wants
+# to write its bookkeeping files next to it, so work on a private copy in the
+# sandbox's writable data directory.
+set -eu
+
+GAME_SRC=/app/share/otomedius-recomp/game
+GAME_DIR="${XDG_DATA_HOME:-$HOME/.var/app/io.github.nicobm.OtomediusRecomp/data}/otomedius"
+
+if [ ! -d "$GAME_DIR" ]; then
+    mkdir -p "$(dirname "$GAME_DIR")"
+    cp -a "$GAME_SRC" "$GAME_DIR"
+fi
+
+# The game opens "oto.ini"; the arcade dump ships the same file as
+# "otomedius.ini", so provide the name the game expects.
+if [ ! -f "$GAME_DIR/oto.ini" ] && [ -f "$GAME_DIR/otomedius.ini" ]; then
+    cp -f "$GAME_DIR/otomedius.ini" "$GAME_DIR/oto.ini"
+fi
+
+exec /app/bin/otomedius-recomp "$GAME_DIR"

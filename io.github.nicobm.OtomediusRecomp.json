@@ -1,0 +1,101 @@
+{
+    "app-id": "io.github.nicobm.OtomediusRecomp",
+    "runtime": "org.freedesktop.Platform",
+    "runtime-version": "26.08",
+    "sdk": "org.freedesktop.Sdk",
+    "command": "otomedius-recomp-launch",
+    "finish-args": [
+        "--socket=wayland",
+        "--socket=fallback-x11",
+        "--socket=pulseaudio",
+        "--device=dri",
+        "--device=input",
+        "--nofilesystem=home",
+        "--nofilesystem=host",
+        "--unshare=network"
+    ],
+    "modules": [
+        {
+            "name": "python-capstone",
+            "buildsystem": "simple",
+            "build-commands": [
+                "mkdir -p /app/lib/python/site-packages",
+                "python3 -m pip install --no-index --no-build-isolation --find-links=. --target=/app/lib/python/site-packages capstone"
+            ],
+            "sources": [
+                {
+                    "type": "file",
+                    "path": "flatpak/wheels/capstone-5.0.9-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+                }
+            ]
+        },
+        {
+            "name": "sdl3",
+            "buildsystem": "cmake-ninja",
+            "config-opts": [
+                "-DSDL_TESTS=OFF",
+                "-DSDL_INSTALL_TESTS=OFF",
+                "-DSDL_SHARED=ON",
+                "-DSDL_STATIC=OFF",
+                "-DSDL_WERROR=OFF"
+            ],
+            "sources": [
+                {
+                    "type": "archive",
+                    "url": "https://github.com/libsdl-org/SDL/releases/download/release-3.4.20/SDL3-3.4.20.tar.gz",
+                    "sha256": "f3bb06f55bed9557227a700af2ea62e49497ebdf58037732a731a5fb3ef8581f"
+                }
+            ]
+        },
+        {
+            "name": "otomedius-recomp",
+            "buildsystem": "simple",
+            "build-options": {
+                "env": {
+                    "PYTHONPATH": "/app/lib/python/site-packages"
+                }
+            },
+            "build-commands": [
+                "mkdir -p /app/bin /app/share/otomedius-recomp/game out/obj",
+                "python3 tools/recomp/recomp.py --exe data/otomedius.exe --out recomp/gen --expect-sha256 \"$(cat recomp/exe.sha256)\"",
+                "find native -name '*.c' -print0 | xargs -0 -P \"$(nproc)\" -I{} sh -c 'f=\"$1\"; cc -O2 -std=c11 -w -Inative $(pkg-config --cflags sdl3) -c \"$f\" -o \"out/obj/$(basename \"$f\" .c).o\"' _ {}",
+                "find recomp/gen -name 'rc_*.c' -print0 | xargs -0 -P \"$(nproc)\" -I{} sh -c 'f=\"$1\"; cc -O2 -std=c11 -w -Inative -c \"$f\" -o \"out/obj/$(basename \"$f\" .c).o\"' _ {}",
+                "cc -O2 -o out/otomedius-recomp out/obj/*.o -lm -lpthread $(pkg-config --libs sdl3)",
+                "install -Dm755 out/otomedius-recomp /app/bin/otomedius-recomp",
+                "cp -a data/. /app/share/otomedius-recomp/game/",
+                "install -Dm644 VERSION /app/share/otomedius-recomp/VERSION",
+                "install -Dm644 recomp/exe.sha256 /app/share/otomedius-recomp/exe.sha256",
+                "install -Dm755 flatpak/otomedius-recomp-launch /app/bin/otomedius-recomp-launch",
+                "install -Dm644 flatpak/io.github.nicobm.OtomediusRecomp.desktop /app/share/applications/io.github.nicobm.OtomediusRecomp.desktop",
+                "install -Dm644 flatpak/io.github.nicobm.OtomediusRecomp.svg /app/share/icons/hicolor/scalable/apps/io.github.nicobm.OtomediusRecomp.svg",
+                "install -Dm644 flatpak/io.github.nicobm.OtomediusRecomp.metainfo.xml /app/share/metainfo/io.github.nicobm.OtomediusRecomp.metainfo.xml"
+            ],
+            "sources": [
+                {
+                    "type": "dir",
+                    "path": ".",
+                    "skip": [
+                        ".git",
+                        ".flatpak-builder",
+                        "build-dir",
+                        "repo",
+                        "out",
+                        "data",
+                        "game.zip",
+                        "*.zip",
+                        "flatpak/wheels",
+                        "recomp/gen",
+                        "**/__pycache__",
+                        "*.o"
+                    ]
+                },
+                {
+                    "type": "archive",
+                    "path": "game.zip",
+                    "dest": "data",
+                    "strip-components": 0
+                }
+            ]
+        }
+    ]
+}

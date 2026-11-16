@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="Otomedius">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1b1440"/>
+      <stop offset="0.55" stop-color="#120a2c"/>
+      <stop offset="1" stop-color="#06040f"/>
+    </linearGradient>
+    <linearGradient id="hull" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f2f7ff"/>
+      <stop offset="0.55" stop-color="#9fc4e8"/>
+      <stop offset="1" stop-color="#4a6fa5"/>
+    </linearGradient>
+    <linearGradient id="laser" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#6be3ff" stop-opacity="0"/>
+      <stop offset="0.35" stop-color="#6be3ff" stop-opacity="0.95"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="1"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.62" r="0.55">
+      <stop offset="0" stop-color="#7fd4ff" stop-opacity="0.30"/>
+      <stop offset="1" stop-color="#7fd4ff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="trail" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffb3ec" stop-opacity="0.95"/>
+      <stop offset="1" stop-color="#ff6b9d" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" rx="104" fill="url(#bg)"/>
+  <rect width="512" height="512" rx="104" fill="url(#glow)"/>
+
+  <!-- starfield -->
+  <g fill="#ffffff">
+    <circle cx="96" cy="116" r="3" opacity="0.85"/>
+    <circle cx="142" cy="72" r="2" opacity="0.55"/>
+    <circle cx="188" cy="150" r="2.5" opacity="0.65"/>
+    <circle cx="84" cy="222" r="2" opacity="0.45"/>
+    <circle cx="410" cy="104" r="3" opacity="0.8"/>
+    <circle cx="368" cy="158" r="2" opacity="0.5"/>
+    <circle cx="440" cy="216" r="2.5" opacity="0.6"/>
+    <circle cx="120" cy="330" r="2" opacity="0.4"/>
+    <circle cx="402" cy="330" r="2" opacity="0.45"/>
+    <circle cx="256" cy="60" r="2" opacity="0.5"/>
+  </g>
+
+  <!-- laser beams -->
+  <rect x="216" y="150" width="12" height="230" rx="6" fill="url(#laser)"/>
+  <rect x="284" y="150" width="12" height="230" rx="6" fill="url(#laser)"/>
+
+  <!-- engine trails -->
+  <path d="M214 352 L214 440 L232 410 L232 352 Z" fill="url(#trail)" opacity="0.9"/>
+  <path d="M298 352 L298 440 L280 410 L280 352 Z" fill="url(#trail)" opacity="0.9"/>
+
+  <!-- ship -->
+  <g>
+    <path d="M256 96 L322 268 L286 254 L256 336 L226 254 L190 268 Z"
+          fill="url(#hull)" stroke="#eaf4ff" stroke-width="9" stroke-linejoin="round"/>
+    <path d="M256 150 L282 232 L256 220 L230 232 Z" fill="#2b3f66"/>
+    <circle cx="256" cy="248" r="15" fill="#6be3ff" stroke="#eaf4ff" stroke-width="5"/>
+    <path d="M190 268 L154 300 L214 300 Z" fill="#ffb3ec" opacity="0.95"/>
+    <path d="M322 268 L358 300 L298 300 Z" fill="#ffb3ec" opacity="0.95"/>
+  </g>
+
+  <!-- small enemies -->
+  <g fill="#ff8f6b" opacity="0.9">
+    <path d="M112 168 l22 34 h-44 z"/>
+    <path d="M400 168 l22 34 h-44 z"/>
+  </g>
+  <g fill="#9dff8a" opacity="0.75">
+    <circle cx="120" cy="270" r="10"/>
+    <circle cx="392" cy="270" r="10"/>
+  </g>
+</svg>

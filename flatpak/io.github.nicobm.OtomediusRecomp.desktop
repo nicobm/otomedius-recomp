@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Otomedius
+GenericName=Arcade Shooter
+Comment=Native Linux recompilation of the Konami arcade shooter
+Exec=otomedius-recomp-launch
+Icon=io.github.nicobm.OtomediusRecomp
+Terminal=false
+Categories=Game;ArcadeGame;
+Keywords=otomedius;konami;shmup;arcade;shooter;gradius;
+StartupNotify=false
