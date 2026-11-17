@@ -26,12 +26,39 @@ static int g_fb_w, g_fb_h;
 static float g_vp_x, g_vp_y, g_vp_w = 1280.0f, g_vp_h = 1024.0f;
 static float *g_zbuf;
 static int g_zb_w, g_zb_h;
+static size_t g_zb_cap;
 /* Framebuffer lives in emulated memory (see render_init).  g_fb is the
  * current render target: the back buffer, or a bound scene texture. */
 static uint32_t g_fb_guest;
 static size_t g_fb_bytes;
 static uint8_t *g_fb_primary;
 static void fb_fill(uint32_t color);
+
+/* Depth buffer bound to the current render target.  Its stride has to follow
+ * the target's width: draw_tri() indexes the z buffer with the target width,
+ * so drawing into a smaller texture while keeping the back-buffer stride read
+ * depth from the wrong rows. */
+static void zbuf_bind(void)
+{
+    size_t n = (size_t)g_fb_w * (size_t)g_fb_h;
+    if (n > g_zb_cap) {
+        float *z = (float *)realloc(g_zbuf, n * sizeof(float));
+        if (!z) {
+            free(g_zbuf);
+            g_zbuf = NULL;
+            g_zb_cap = 0;
+            n = 0;
+        } else {
+            g_zbuf = z;
+            g_zb_cap = n;
+        }
+    }
+    g_zb_w = g_fb_w;
+    g_zb_h = g_fb_h;
+    if (g_zbuf)
+        for (size_t i = 0; i < n; i++)
+            g_zbuf[i] = 1.0f;
+}
 
 /* ------------------------------------------------- renderer bring-up stats
  * Everything the game submits is counted per frame so a single log line says
@@ -43,14 +70,27 @@ static struct {
     unsigned onscreen;
     unsigned model_draws, model_faces;
     int model_minx, model_miny, model_maxx, model_maxy;
+    unsigned model_clip, model_zout;   /* faces dropped / outside the z range */
+    unsigned long px, px_model;        /* pixels written into the target */
 } g_stat;
+/* Set while render_draw_model() rasterises, so fb_write() can attribute the
+ * pixels to the model instead of the 2D HUD. */
+static int g_in_model;
 static int g_cur_ntex;
 static uint32_t g_fvf, g_stream_stride, g_stream_vb, g_tex0;
 static uint32_t g_first_draw_logged;
-/* OTOMEDIUS_ORDERDBG=1: submission order (clears, 2D quads, model draws). */
+/* OTOMEDIUS_ORDERDBG=1: submission order (clears, 2D quads, model draws).
+ * OTOMEDIUS_ORDERDBG=<present>: only from that present on, which keeps the
+ * log small when the interesting window is late in the attract. */
 static int g_orderdbg;
+static unsigned g_order_from;
 static unsigned g_order_seq;
 static unsigned g_last_model_draws;
+
+static int order_on(void)
+{
+    return g_orderdbg && g_stat.presents >= g_order_from;
+}
 
 int render_width(void) { return g_width; }
 int render_height(void) { return g_height; }
@@ -59,7 +99,9 @@ static void render_state_defaults(void);
 
 void render_init(int w, int h)
 {
-    g_orderdbg = getenv("OTOMEDIUS_ORDERDBG") != NULL;
+    const char *odb = getenv("OTOMEDIUS_ORDERDBG");
+    g_orderdbg = odb != NULL;
+    g_order_from = odb ? (unsigned)atoi(odb) : 0u;
     render_state_defaults();
     if (w > 0 && h > 0) {
         g_width = (int)w;
@@ -83,13 +125,7 @@ void render_init(int w, int h)
     g_fb = g_fb_primary;
     g_fb_w = g_width;
     g_fb_h = g_height;
-    free(g_zbuf);
-    g_zbuf = (float *)malloc((size_t)g_fb_w * g_fb_h * sizeof(float));
-    g_zb_w = g_fb_w;
-    g_zb_h = g_fb_h;
-    if (g_zbuf)
-        for (size_t i = 0, n = (size_t)g_fb_w * g_fb_h; i < n; i++)
-            g_zbuf[i] = 1.0f;
+    zbuf_bind();
     g_vp_x = g_vp_y = 0.0f;
     g_vp_w = (float)g_fb_w;
     g_vp_h = (float)g_fb_h;
@@ -125,15 +161,22 @@ uint32_t render_framebuffer_guest(void) { return g_fb_guest; }
  * a scene texture this way and then composites it under the 2D HUD. */
 void render_set_target(uint32_t guest, int w, int h)
 {
-    if (!guest || w <= 0 || h <= 0) {
+    int bb = (!guest || w <= 0 || h <= 0);
+    if (bb) {
         g_fb = g_fb_primary;
         g_fb_w = g_width;
         g_fb_h = g_height;
-        return;
+        zbuf_bind();
+    } else {
+        g_fb = MEM + guest;
+        g_fb_w = w;
+        g_fb_h = h;
+        zbuf_bind();
     }
-    g_fb = MEM + guest;
-    g_fb_w = w;
-    g_fb_h = h;
+    if (getenv("OTOMEDIUS_RTDBG"))
+        fprintf(stderr, "render: target %s %dx%d guest=%08x present=%u\n",
+                bb ? "backbuffer" : "texture", g_fb_w, g_fb_h,
+                bb ? 0u : guest, g_stat.presents);
 }
 
 void render_dump_fb(const char *path)
@@ -216,7 +259,15 @@ enum { RS_ZENABLE = 7, RS_ZWRITEENABLE = 14, RS_ALPHATESTENABLE = 15,
 
 static void render_state_defaults(void)
 {
+    static const float ident[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
     memset(g_rs, 0, sizeof g_rs);
+    /* D3D9 defaults: WORLD/VIEW/PROJECTION start as identity and GetTransform
+     * returns them.  The game copies the device VIEW into the shader's "View"
+     * constant, so a zeroed matrix here made every 3D vertex collapse. */
+    memcpy(g_xform[0], ident, sizeof ident);
+    memcpy(g_xform[1], ident, sizeof ident);
+    memcpy(g_xform[2], ident, sizeof ident);
+    memset(g_effect_xform, 0, sizeof g_effect_xform);
     g_rs[RS_SRCBLEND] = 2;           /* ONE */
     g_rs[RS_DESTBLEND] = 1;          /* ZERO */
     g_rs[RS_ALPHAFUNC] = 8;          /* ALWAYS */
@@ -366,6 +417,9 @@ static void fb_write(int x, int y, uint32_t src)
             return;
     }
     d = &((uint32_t *)g_fb)[(size_t)y * g_fb_w + x];
+    g_stat.px++;
+    if (g_in_model)
+        g_stat.px_model++;
     if (!g_rs[RS_ALPHABLENDENABLE]) {
         *d = src | 0xFF000000u;
         return;
@@ -457,14 +511,19 @@ static void draw_tri(const svtx_t *a, const svtx_t *b, const svtx_t *c,
                 z = a->z * l0 + b->z * l1 + c->z * l2;
                 if (g_rs[RS_ZENABLE] && g_zbuf) {
                     zf = g_zbuf[zi];
+                    /* D3DCMP_* values: 1 NEVER, 2 LESS, 3 EQUAL, 4 LESSEQUAL,
+                     * 5 GREATER, 6 NOTEQUAL, 7 GREATEREQUAL, 8 ALWAYS.  The
+                     * old table was shifted by one, so the default LESSEQUAL
+                     * behaved as GREATEREQUAL: every 3D vertex in front of the
+                     * far plane was culled and the composite quad (z = 0) too. */
                     switch (g_rs[RS_ZFUNC]) {
-                    case 1: if (!(z < zf)) continue; break;       /* LESS */
-                    case 2: if (!(z <= zf)) continue; break;      /* LESSEQUAL */
+                    case 1: continue;                             /* NEVER */
+                    case 2: if (!(z < zf)) continue; break;       /* LESS */
                     case 3: if (!(z == zf)) continue; break;      /* EQUAL */
-                    case 4: if (!(z >= zf)) continue; break;      /* GREATEREQUAL */
+                    case 4: if (!(z <= zf)) continue; break;      /* LESSEQUAL */
                     case 5: if (!(z > zf)) continue; break;       /* GREATER */
                     case 6: if (!(z != zf)) continue; break;      /* NOTEQUAL */
-                    case 7: continue;                             /* NEVER */
+                    case 7: if (!(z >= zf)) continue; break;      /* GREATEREQUAL */
                     default: break;                               /* ALWAYS */
                     }
                 }
@@ -1060,29 +1119,79 @@ void render_draw_ship(const float *world)
     }
 }
 
+/* Effect light constants.  The engine binds "LightDir" and "LightCol" through
+ * ID3DXEffect::SetMatrix (see d3dx9.c), row 0 of each matrix being the first
+ * directional light, so the model shading can use the scene's own light
+ * instead of a hardcoded one. */
+static float g_light_dir[3] = {-0.42f, 0.66f, -0.62f};
+static float g_light_col[3] = {1.0f, 1.0f, 1.0f};
+
+void render_set_effect_light(const char *which, const float *m)
+{
+    if (!which || !m)
+        return;
+    if (!strcmp(which, "LightDir")) {
+        g_light_dir[0] = m[0];
+        g_light_dir[1] = m[1];
+        g_light_dir[2] = m[2];
+    } else if (!strcmp(which, "LightCol")) {
+        g_light_col[0] = m[0];
+        g_light_col[1] = m[1];
+        g_light_col[2] = m[2];
+    }
+}
+
+/* The .x inside Player02.pak carries no TextureFilename entries; the engine
+ * binds the pak textures per material in its own container draw.  Until that
+ * path is replicated, bind the textures the port knows by name (see
+ * texture_by_name) to the meshes they belong to; OTOMEDIUS_MODELTEX=<file.dds>
+ * overrides the mapping for experiments. */
+extern uint32_t texture_by_name(const char *name);
+
+static uint32_t model_texture(int mesh)
+{
+    const char *n = xmodel_mesh_name(mesh);
+    const char *ov = getenv("OTOMEDIUS_MODELTEX");
+    if (ov && *ov)
+        return texture_by_name(ov);
+    if (!n)
+        return 0;
+    if (strstr(n, "bike"))
+        return texture_by_name("p02_bike01.dds");
+    if (strstr(n, "gun"))
+        return texture_by_name("p02_gun01.dds");
+    if (strstr(n, "body") || strstr(n, "hand"))
+        return texture_by_name("p02_body01.dds");
+    if (strstr(n, "transparence"))
+        return texture_by_name("p02_hair.dds");
+    return 0;
+}
+
 /* Draw a mesh parsed from the game's own .x file (see native/xmodel.c).
  *
  * The HLE container replaces the game's mesh container, so the texture stages
- * it would bind never reach this path: the model is shaded with a fixed
+ * it would bind never reach this path: the model is shaded with the scene's
  * directional light and the material's diffuse colour instead.  `world` is the
  * node matrix the game passes to the container draw. */
 void render_draw_model(const float *world, int mesh)
 {
     static const float ident[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
-    static const float light[3] = {-0.42f, 0.66f, -0.62f};
-    float view[16], proj[16], wv[16], wvp[16], wc[16];
+    float light[3] = {g_light_dir[0], g_light_dir[1], g_light_dir[2]};
+    float view[16], proj[16], wv[16], wvp[16];
     const float *wp = world ? world : ident;
     const float *pos, *nrm, *uv;
     const uint32_t *idx, *fmat;
+    const uint32_t *tpx = NULL;
+    uint32_t tw2 = 0, th2 = 0;
     int nv, nf, have_view = 0, have_proj = 0;
     static int dbg;
 
     if (!g_fb || mesh < 0)
         return;
     g_stat.model_draws++;
-    if (g_orderdbg)
-        fprintf(stderr, "order %u MODEL %s\n", ++g_order_seq,
-                xmodel_mesh_name(mesh));
+    if (order_on())
+        fprintf(stderr, "order %u MODEL %s present=%u\n", ++g_order_seq,
+                xmodel_mesh_name(mesh), g_stat.presents);
     nv = xmodel_mesh_nverts(mesh);
     nf = xmodel_mesh_nfaces(mesh);
     pos = xmodel_mesh_pos(mesh);
@@ -1092,20 +1201,20 @@ void render_draw_model(const float *world, int mesh)
     fmat = xmodel_mesh_facemat(mesh);
     if (nv <= 0 || nf <= 0 || !pos || !idx)
         return;
+    {
+        uint32_t mtex = model_texture(mesh);
+        if (mtex)
+            tpx = texture_argb(mtex, &tw2, &th2);
+    }
     for (int i = 0; i < 16; i++) {
         if (g_xform[0][i] != 0.0f) have_view = 1;
         if (g_xform[1][i] != 0.0f) have_proj = 1;
     }
-    if (have_view) memcpy(view, g_xform[0], sizeof view); else default_view(view);
+    /* The engine zeroes the device VIEW and hands that zero matrix to the
+     * effect's "View" parameter, so the node matrices are already in camera
+     * space: an absent VIEW means identity, not a fallback camera. */
+    if (have_view) memcpy(view, g_xform[0], sizeof view); else memcpy(view, ident, sizeof view);
     if (have_proj) memcpy(proj, g_xform[1], sizeof proj); else default_proj(proj);
-    /* Same workaround as the synthetic ship: the shader-path VIEW is not
-     * captured yet, so centre the node matrix on screen when it is missing. */
-    if (!have_view && !(getenv("OTOMEDIUS_SHIP_CENTER") &&
-                        *getenv("OTOMEDIUS_SHIP_CENTER") == '0')) {
-        memcpy(wc, wp, sizeof wc);
-        wc[12] = wc[13] = wc[14] = 0.0f;
-        wp = wc;
-    }
     mat_mul_row(wv, wp, view);
     mat_mul_row(wvp, wv, proj);
     if (getenv("OTOMEDIUS_3DDBG") && dbg < 4) {
@@ -1172,7 +1281,9 @@ void render_draw_model(const float *world, int mesh)
             } else {
                 inten = 0.6f;
             }
-            r = mc[0] * inten; g = mc[1] * inten; b = mc[2] * inten;
+            r = mc[0] * inten * g_light_col[0];
+            g = mc[1] * inten * g_light_col[1];
+            b = mc[2] * inten * g_light_col[2];
             vt[i].x = g_vp_x + (cx / cw + 1.0f) * 0.5f * g_vp_w;
             vt[i].y = g_vp_y + (1.0f - cy / cw) * 0.5f * g_vp_h;
             vt[i].z = cz / cw;
@@ -1187,6 +1298,10 @@ void render_draw_model(const float *world, int mesh)
         }
         if (ok) {
             g_stat.model_faces++;
+            if (vt[0].z < 0.0f || vt[0].z > 1.0f ||
+                vt[1].z < 0.0f || vt[1].z > 1.0f ||
+                vt[2].z < 0.0f || vt[2].z > 1.0f)
+                g_stat.model_zout++;
             for (i = 0; i < 3; i++) {
                 int sx = (int)vt[i].x, sy = (int)vt[i].y;
                 if (sx < g_stat.model_minx) g_stat.model_minx = sx;
@@ -1194,7 +1309,11 @@ void render_draw_model(const float *world, int mesh)
                 if (sy < g_stat.model_miny) g_stat.model_miny = sy;
                 if (sy > g_stat.model_maxy) g_stat.model_maxy = sy;
             }
-            raster_array(vt, 3, 4, NULL, 0, 0, 1);
+            g_in_model = 1;
+            raster_array(vt, 3, 4, (uint32_t *)tpx, tw2, th2, 1);
+            g_in_model = 0;
+        } else {
+            g_stat.model_clip++;
         }
     }
 }
@@ -1502,16 +1621,21 @@ test_done:
         fprintf(stderr,
                 "render: frame %u: clear=%u draw=%u up=%u verts=%u "
                 "fvf=%06x stride=%u vb=%08x tex0=%08x bbox=(%d,%d)-(%d,%d) "
-                "onscreen=%u model=%u/%u mbox=(%d,%d)-(%d,%d)\n",
+                "onscreen=%u model=%u/%u mbox=(%d,%d)-(%d,%d) "
+                "clip=%u zout=%u px=%lu/%lu target=%dx%d\n",
                 g_stat.presents, g_stat.clears, g_stat.draws, g_stat.draw_ups,
                 g_stat.verts, g_fvf, g_stream_stride, g_stream_vb, g_tex0,
                 g_stat.minx, g_stat.miny, g_stat.maxx, g_stat.maxy,
                 g_stat.onscreen, g_stat.model_draws, g_stat.model_faces,
                 g_stat.model_minx, g_stat.model_miny,
-                g_stat.model_maxx, g_stat.model_maxy);
+                g_stat.model_maxx, g_stat.model_maxy,
+                g_stat.model_clip, g_stat.model_zout,
+                g_stat.px, g_stat.px_model, g_fb_w, g_fb_h);
     g_last_model_draws = g_stat.model_draws;
     g_stat.clears = g_stat.draws = g_stat.draw_ups = g_stat.verts = 0;
     g_stat.model_draws = g_stat.model_faces = 0;
+    g_stat.model_clip = g_stat.model_zout = 0;
+    g_stat.px = g_stat.px_model = 0;
     g_stat.model_minx = g_stat.model_miny = 0x7FFFFFFF;
     g_stat.model_maxx = g_stat.model_maxy = -0x7FFFFFFF;
     g_stat.minx = g_stat.miny = 0x7FFFFFFF;
@@ -1558,9 +1682,9 @@ void render_clear(int count, uint32_t rects, uint32_t flags, uint32_t color)
     (void)count;
     (void)rects;
     g_stat.clears++;
-    if (g_orderdbg)
-        fprintf(stderr, "order %u CLEAR flags=%x color=%08x count=%d\n",
-                ++g_order_seq, flags, color, count);
+    if (order_on())
+        fprintf(stderr, "order %u CLEAR flags=%x color=%08x count=%d present=%u\n",
+                ++g_order_seq, flags, color, count, g_stat.presents);
     if (flags & 1) {
         g_clear = color & 0x00FFFFFFu;
         fb_fill(g_clear);
@@ -1592,7 +1716,27 @@ void render_set_transform(uint32_t state, const void *matrix)
     int slot = state == 2 ? 0 : state == 3 ? 1 : state == 256 ? 2 : -1;
     if (slot >= 0 && matrix)
         memcpy(g_xform[slot], matrix, 16 * sizeof(float));
+    if (getenv("OTOMEDIUS_VPDBG") && slot >= 0) {
+        static unsigned n;
+        const float *f = (const float *)(slot >= 0 && matrix ? matrix : NULL);
+        if (n++ < 60)
+            fprintf(stderr, "render: SetTransform state=%u slot=%d [%s%.3f %.3f %.3f %.3f]\n",
+                    state, slot, f ? "" : "(null) ",
+                    f ? f[0] : 0.0f, f ? f[1] : 0.0f, f ? f[2] : 0.0f,
+                    f ? f[3] : 0.0f);
+    }
     platform_transform(state, matrix);
+}
+
+/* GetTransform: the game reads the device VIEW back (0x414e96) and feeds it to
+ * the effect's "View" parameter, so this has to return the real state. */
+int render_get_transform(uint32_t state, void *out)
+{
+    int slot = state == 2 ? 0 : state == 3 ? 1 : state == 256 ? 2 : -1;
+    if (slot < 0 || !out)
+        return 0;
+    memcpy(out, g_xform[slot], 16 * sizeof(float));
+    return 1;
 }
 
 void render_set_effect_matrix(const void *matrix)
@@ -1617,8 +1761,19 @@ void render_set_sampler(uint32_t stage, uint32_t type, uint32_t value)
 
 void render_set_texture(uint32_t stage, uint32_t tex)
 {
-    if (stage == 0)
+    if (stage == 0) {
         g_tex0 = tex;
+        if (getenv("OTOMEDIUS_TEXDBG")) {
+            static unsigned n;
+            extern unsigned render_presents(void);
+            unsigned p = render_presents();
+            if (n < 400 && p >= 4200 && p < 4400) {
+                n++;
+                fprintf(stderr, "render: SetTexture(0, %08x) present=%u\n",
+                        tex, p);
+            }
+        }
+    }
     platform_texture(stage, tex);
 }
 
@@ -1676,9 +1831,9 @@ void render_draw_up(uint32_t prim, uint32_t count, uint32_t data, uint32_t strid
     (void)fvf;
     g_stat.draw_ups++;
     g_stat.verts += count;
-    if (g_orderdbg)
-        fprintf(stderr, "order %u UP prim=%u count=%u tex=%08x fvf=%06x\n",
-                ++g_order_seq, prim, count, g_tex0, fvf);
+    if (order_on())
+        fprintf(stderr, "order %u UP prim=%u count=%u tex=%08x fvf=%06x present=%u\n",
+                ++g_order_seq, prim, count, g_tex0, fvf, g_stat.presents);
     if (g_verbose > 1 && g_first_draw_logged < 8) {
         g_first_draw_logged++;
         fprintf(stderr,

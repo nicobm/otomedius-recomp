@@ -2387,6 +2387,160 @@ M docs/HANDOVER_PROMPT.md  prompt de la sesión siguiente
 
 ---
 
+## 14. Sesión 2026-11-17 (octava parte): el modelo 3D se ve y está texturado
+
+> **Esta sección manda sobre §1–§13.** El bloqueo de §13.8.1 está resuelto: el
+> modelo del jugador se dibuja en el back buffer, con la cámara y la luz de la
+> escena, **y con sus texturas**. En el camino aparecieron tres bugs que
+> afectaban a toda la capa gráfica. El smoke de 4700 sigue pasando.
+
+### 14.1 Por qué no se veía: cuatro causas
+
+1. **Tabla de `D3DCMP_*` corrida** (`native/render.c`, `draw_tri`). Los valores
+   usados eran los de `D3DCMP_LESS=1`; los reales son `NEVER=1, LESS=2,
+   EQUAL=3, LESSEQUAL=4, GREATER=5, NOTEQUAL=6, GREATEREQUAL=7, ALWAYS=8`. El
+   valor por defecto (4) se interpretaba como `GREATEREQUAL`, así que con el
+   z-buffer a 1.0 **todas** las caras 3D se descartaban (`px_model = 0` en
+   todos los frames) y también el quad de composición (z=0). Corregido; el
+   contador nuevo `px=`/`px_model=` lo demuestra (≈6 000–300 000 píxeles).
+2. **`GetTransform` no devolvía nada** (`native/d3d9.c`). El motor hace
+   `GetTransform(D3DTS_VIEW)` (0x414e96) y se lo pasa al efecto como `View`. En
+   D3D9 las tres matrices arrancan en identidad; `render_state_defaults()` las
+   inicializa y `render_get_transform()` las devuelve.
+3. **La matriz del draw es cámara→mundo** (`native/d3dx9.c`). `0x415846` llama
+   al draw del contenedor con `(escena, nodo+0x30, nodo+0x20)`; `nodo+0x30` es
+   la matriz cámara→mundo (fila 3 = posición de cámara, empieza en `-74.7,0,0`
+   y se mueve cada frame). El modelo se compone como
+   `frameWorld × inverse_rígida(cámara)`. Antes se usaba una cámara de
+   fallback (`default_view`, cámara en z=-8) y se centraba la matriz: con eso
+   el modelo caía detrás del plano cercano.
+4. **Stride del z-buffer** atado al target (`zbuf_bind()`): antes se indexaba
+   con el ancho del target nuevo pero el stride del back buffer.
+
+La cámara es real: el juego monta `D3DXMatrixPerspectiveFovLH(fovy=1.7921,
+aspect=1.25, zn=30, zf=3000)` cada frame en `0x5e26f0` y `SetTransform(PROJ,
+0x5e31f0)`. El VIEW del dispositivo es **cero** a propósito (el efecto recibe
+una `View` nula), de modo que la cámara entra solo por la matriz del nodo.
+
+### 14.2 El target de 256×256 era un falso positivo
+
+`OTOMEDIUS_RTDBG` con `present` (nuevo) demuestra que las 6 mallas se dibujan
+**antes** del `SetRenderTarget` de la textura de escena:
+
+```
+present=4300 CLEAR(7) -> MODEL×6 -> SetRenderTarget(256×256) -> CLEAR(1) -> UP…
+```
+
+El target de 256×256 es otra pasada (el quad de `0x450190` compone 0..w,0..h
+arriba a la izquierda). El modelo va directo al back buffer: no hay que tocar
+`render_set_target` para la nave. El `Clear(flags=1)` posterior es del HUD y no
+borra el modelo.
+
+Cuando la cámara del attract se acerca a menos de `zn=30` el modelo se recorta:
+es correcto (ocurre al final de la órbita, ≈present 4430, y en la escena
+siguiente). El `viewport` nunca se cambia (1280×1024).
+
+### 14.3 Texturas del modelo: de dónde salen y cómo se enlazan
+
+- El `.x` de `Player02.pak` **no tiene `TextureFilename`** (ni cadenas `.dds`):
+  el pak está comprimido y el motor enlaza las texturas por material en su
+  propio draw de contenedor (0x416220 usa una tabla en `contenedor+0x60`).
+- El motor **descomprime el pak entero en memoria emulada**. Con
+  `OTOMEDIUS_PAKDBG` se ve: chunk `MESH` con `Player02.x` (4 059 860 bytes) y
+  chunks `TXGP` seguidos de `DDS `; justo antes del header está el nombre
+  (`p02_bike01.dds\0`).
+- Texturas del jugador encontradas en la imagen: `p02_bike01/02`,
+  `p02_body01/02`, `p02_face`, `p02_gun01/02`, `p02_hair`, `p02_bomb_b00`,
+  `facewindow_p02_*`, además de los logos/warning/`main_visual` de boot.
+- Implementado: `native/d3dx9.c` recuerda el nombre de cada textura que crea
+  `D3DXCreateTextureFromFileInMemoryEx` (`<nombre>.dds` antes del header) y,
+  si un nombre no aparece, hace **un** barrido de los 4 GiB buscando `DDS `
+  (la memoria es `MAP_NORESERVE`) y decodifica bajo demanda
+  (`tex_name_add`, `pak_harvest`, `harvest_decode`, `texture_by_name`).
+- `native/render.c` enlaza por nombre de malla: `bike*`→`p02_bike01.dds`,
+  `gun*`→`p02_gun01.dds`, `body*`/`hand*`→`p02_body01.dds`,
+  `transparence`→`p02_hair.dds`; `OTOMEDIUS_MODELTEX=<file.dds>` fuerza otra.
+- **Bug de DXT1/3/5 corregido** (`native/d3d9_objects.c`): los colores de
+  mezcla 1/3 y 2/3 se calculaban sobre el valor RGB565 empaquetado, de modo que
+  los canales se llevaban entre sí; todas las texturas DXT tenían motas de
+  color (se veía en `p02_hair`/`p02_gun01`). Ahora se interpola por canal.
+
+### 14.4 Efecto: parámetros y luz reales
+
+`ID3DXEffect` devolvía un único handle (`0xe0000001`) para todos los
+parámetros. `GetParameterByName` (índice 9) recibe ahora el nombre en `arg32(2)`
+y cada parámetro tiene su handle; el juego pide `View`, `Proj`, `LightDir`,
+`LightCol`, `SeaParam`, `FogParam`, `FogColor`. El modelo usa la luz de la
+escena (`LightDir` fila 0 = 0.577,0.577,-0.577; `LightCol` = 1,1,1) en lugar de
+una fija, y `render_draw_model` ya no centra la matriz.
+
+### 14.5 Ficheros de esta sesión
+
+```
+M native/render.c        tabla D3DCMP, identidad por defecto, zbuf por target,
+                         texturas por malla, luz del efecto, contadores
+                         clip/zout/px/px_model/target, ORDERDBG=<present>
+M native/d3dx9.c         handles por parámetro, luz, inverse_rígida de la
+                         cámara, nombres de textura, pak_harvest/PAKDBG/
+                         PAKSCAN/PAKDUMP/HARVESTDUMP, EFFECTDUMP, TEXDBG
+M native/d3d9.c          GetTransform real, SetViewport/TEXDBG, SetTexture log
+M native/d3d9_objects.c  interpolación DXT por canal (1/3 y 2/3)
+M README.md              estado 3D + variables nuevas
+M docs/BOOKLET.md        esta sección
+M docs/HANDOVER_PROMPT.md prompt de la sesión siguiente
+```
+
+### 14.6 Estado verificado
+
+- `tests/smoke.sh` (4700 presentes, audio dummy): **PASS**, `DEMO state=5`,
+  `CGameMan ctor … mask220=00000000`, sin `no recompiled code`.
+- `render: frame 4320 … model=6/7998 … clip=0 zout=0 px=… px_model=…`: las
+  caras entran en el z range y escriben píxeles.
+- Dump en `/tmp/opencode/tx4.ppm` (present 4360): la jinete con su moto, pelo y
+  armas **texturados**, sobre el HUD 2D.
+- Comparación independiente del decode DXT1 (`p02_gun01`): 0.8 % de píxeles
+  distintos (redondeo), frente a 16 % con motas antes del arreglo.
+
+### 14.7 Bloqueos y próximos pasos
+
+1. **Cartel de red**: el banner rojo superior es el mensaje del propio juego
+   «ネットワーク接続状況確認中» (comprobando red), no el bug de texto largo.
+   Desaparecerá cuando el HLE de `libbms`/red simule una conexión válida.
+2. **`REPLAY RAND ERROR %d/%d`** en rojo sobre el attract: el juego valida la
+   secuencia aleatoria de la repetición y no coincide. Revisar la RNG del CRT
+   recompilado y el estado que el attract guarda/restaura.
+3. **Modelo con el mapeo real**: ahora se enlazan texturas por nombre de malla.
+   La vía correcta es replicar el contenedor del motor (tabla `+0x60`, manager
+   `+0x20`, init `0x4163e0`, draw `0x416220`) para obtener material→textura y
+   el blending/alpha del material.
+4. **Escenario/enemigos**: `xmodel.c` guarda **un** modelo global (8 mallas,
+   8192 vértices) y `D3DXLoadMeshHierarchyFromXInMemory` solo construye el del
+   jugador (los otros ~80 `.x` agotaban el heap del juego). Para dibujar el
+   escenario hace falta un store por modelo (instancia) y una tabla de
+   contenedores dinámica (`HLE_MAX_CONTAINERS` = 16).
+5. **Texto largo del warning** y **logos "warpeados"** del boot siguen abiertos
+   (§4.3, §13.8).
+6. **Rendimiento**: ~26–36 fps; el barrido de texturas es único (una vez por
+   ejecución, al primer nombre desconocido).
+
+### 14.8 Diagnóstico nuevo
+
+- `OTOMEDIUS_ORDERDBG=<present>`: orden de envío desde ese present.
+- `OTOMEDIUS_RTDBG=1`: bindings de render target, incluido el back buffer.
+- `OTOMEDIUS_VPDBG=1`: `SetViewport`, `SetTransform`, `PerspectiveFovLH`.
+- `OTOMEDIUS_3DDBG=1`: draw del contenedor (matriz del motor y del frame), una
+  línea por present; `SetMatrix` con `ret=` y `GetParameterByName` con nombre.
+- `OTOMEDIUS_TEXDBG=1`: `CreateTexture`, nombres de textura, `SetTexture` en la
+  ventana del attract.
+- `OTOMEDIUS_EFFECTDUMP=dir`: vuelca los blobs de efecto.
+- `OTOMEDIUS_PAKDBG=path` / `PAKDUMP=path`: chunks alrededor del `.x`.
+- `OTOMEDIUS_PAKSCAN=<present>`: lista de `TXGP` (nombres) en memoria.
+- `OTOMEDIUS_HARVESTDUMP=1`: vuelca cada textura decodificada.
+- `OTOMEDIUS_MODELTEX=<file.dds>`: fuerza la textura del modelo.
+- Línea de frame: `clip=`, `zout=`, `px=`, `px_model=`, `target=`.
+
+---
+
 ### Atribución
 
 La recompilación estática, la ingeniería inversa y la capa nativa Linux se

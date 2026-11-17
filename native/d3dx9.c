@@ -210,6 +210,12 @@ static void d3dx_MatrixPerspectiveFovLH(void)
     float fovy = farg(1), aspect = farg(2), zn = farg(3), zf = farg(4);
     float h = 1.0f / tanf(fovy * 0.5f);
     float w = h / aspect;
+    if (getenv("OTOMEDIUS_3DDBG") || getenv("OTOMEDIUS_VPDBG")) {
+        static unsigned n;
+        if (n++ < 20)
+            fprintf(stderr, "d3dx9: PerspectiveFovLH dst=%08x fovy=%.4f "
+                    "aspect=%.4f zn=%.4f zf=%.4f\n", d, fovy, aspect, zn, zf);
+    }
     memset(MEM + d, 0, 64);
     MF32(d + 0) = w;
     MF32(d + 20) = h;
@@ -530,6 +536,195 @@ static int decode_dds(const uint8_t *d, uint32_t size, image_t *out)
     return 0;
 }
 
+/* ---- texture names ------------------------------------------------------
+ * The pak loader hands D3DXCreateTextureFromFileInMemoryEx a pointer into the
+ * decompressed pak image; the chunk keeps "<file>.dds" (NUL terminated) right
+ * before the DDS header.  Remember it so the model path can bind the player's
+ * textures by name (the .x itself has no TextureFilename entries). */
+#define TEX_NAME_MAX 64
+#define TEX_NAME_SLOTS 256
+static struct {
+    uint32_t tex;
+    char name[TEX_NAME_MAX];
+} g_tex_names[TEX_NAME_SLOTS];
+static unsigned g_tex_name_n;
+
+static void tex_name_add(uint32_t tex, const char *name)
+{
+    if (!tex || !name || !*name || g_tex_name_n >= TEX_NAME_SLOTS)
+        return;
+    g_tex_names[g_tex_name_n].tex = tex;
+    snprintf(g_tex_names[g_tex_name_n].name, TEX_NAME_MAX, "%s", name);
+    g_tex_name_n++;
+    if (getenv("OTOMEDIUS_TEXDBG"))
+        fprintf(stderr, "d3dx9: texture %08x <- %s\n", tex, name);
+}
+
+static void tex_name_record(uint32_t tex, uint32_t src)
+{
+    char name[TEX_NAME_MAX];
+    int i, j;
+    if (!tex || src < 4)
+        return;
+    if (MEM[src - 1] != 0)                    /* no name before the header */
+        return;
+    j = (int)src - 2;
+    i = j;
+    while (i > 0 && (src - (uint32_t)i) < TEX_NAME_MAX &&
+           MEM[i] >= 32 && MEM[i] < 127)
+        i--;
+    i++;
+    if (j - i < 4 || j - i >= TEX_NAME_MAX)
+        return;
+    memcpy(name, MEM + i, (size_t)(j - i + 1));
+    name[j - i + 1] = 0;
+    tex_name_add(tex, name);
+}
+
+const char *texture_name_lookup(uint32_t tex)
+{
+    for (unsigned i = 0; i < g_tex_name_n; i++)
+        if (g_tex_names[i].tex == tex)
+            return g_tex_names[i].name;
+    return NULL;
+}
+
+/* Textures harvested straight out of the decompressed pak image: the engine
+ * keeps every pak image in emulated memory, and each texture chunk stores
+ * "<file>.dds" right before the DDS header.  Scan the window around the player
+ * .x once and create port-side textures for every one we can decode, so the
+ * model path can bind them by name. */
+/* Harvested texture headers: name -> DDS address.  Decoding is lazy so a full
+ * memory scan does not allocate a texture per DDS in the game. */
+#define HARVEST_MAX 128
+static struct {
+    char name[TEX_NAME_MAX];
+    uint32_t dds;
+    uint32_t tex;
+} g_harvest[HARVEST_MAX];
+static int g_harvest_n;
+
+static void pak_harvest(void)
+{
+    static int done;
+    uint64_t base;
+    if (done)
+        return;
+    done = 1;
+    /* The decompressed pak images can sit anywhere in the 4 GiB space and the
+     * heap moves between runs, so walk everything once (memory is a NORESERVE
+     * mapping, reading untouched pages is free). */
+    for (base = 0; base < 0xF0000000ull && g_harvest_n < HARVEST_MAX;
+         base += 0x4000000ull) {
+        uint64_t p = base;
+        uint64_t end = base + 0x4000000ull;
+        while (p + 4 < end && g_harvest_n < HARVEST_MAX) {
+            void *q = memmem(MEM + p, (size_t)(end - p), "DDS ", 4);
+            uint32_t va;
+            if (!q)
+                break;
+            va = (uint32_t)((uint8_t *)q - MEM);
+            if (va > 8 && MEM[va - 1] == 0) {
+                int end = (int)va - 1;
+                int e, b;
+                while (end > (int)va - 8 && MEM[end] == 0)
+                    end--;
+                e = end - 3;                 /* the '.' in ".dds" */
+                if (e > 2 && MEM[e] == '.' && MEM[end] == 's' &&
+                    MEM[end - 1] == 'd' && MEM[end - 2] == 'd') {
+                    b = e - 1;
+                    while (b > 0 && (va - (uint32_t)b) < 64 &&
+                           MEM[b] >= 32 && MEM[b] < 127)
+                        b--;
+                    b++;
+                    if (end - b + 1 >= 5 && end - b + 1 < TEX_NAME_MAX) {
+                        char name[TEX_NAME_MAX];
+                        int k, len = end - b + 1;
+                        for (k = 0; k < len; k++)
+                            name[k] = (char)MEM[b + k];
+                        name[len] = 0;
+                        snprintf(g_harvest[g_harvest_n].name, TEX_NAME_MAX,
+                                 "%s", name);
+                        g_harvest[g_harvest_n].dds = va;
+                        g_harvest_n++;
+                    }
+                }
+            }
+            p = (uint64_t)va + 4;
+        }
+    }
+    if (getenv("OTOMEDIUS_TEXDBG"))
+        fprintf(stderr, "d3dx9: pak_harvest: %d DDS chunk(s)\n", g_harvest_n);
+}
+
+static int name_matches(const char *rec, const char *want)
+{
+    size_t lr = strlen(rec), lw = strlen(want);
+    if (!strcmp(rec, want))
+        return 1;
+    /* Some chunks pad the name with a printable prefix ("UUUUp02_gun01.dds"). */
+    return lr >= lw && !strcmp(rec + (lr - lw), want);
+}
+
+static uint32_t harvest_decode(int i)
+{
+    image_t img;
+    uint32_t tex;
+    if (i < 0 || i >= g_harvest_n)
+        return 0;
+    if (g_harvest[i].tex)                 /* already decoded */
+        return g_harvest[i].tex;
+    if (decode_dds(MEM + g_harvest[i].dds,
+                   (uint32_t)(0xF0000000u - g_harvest[i].dds), &img) != 0)
+        return 0;
+    if (!img.w || !img.h || img.w > 4096 || img.h > 4096)
+        return 0;
+    tex = texture_create(img.w, img.h, 1, 0, 0x15 /* A8R8G8B8 */, 0);
+    texture_upload(tex, img.pixels,
+                   (uint32_t)(0xF0000000u - g_harvest[i].dds) - 128, img.fmt);
+    tex_name_add(tex, g_harvest[i].name);
+    g_harvest[i].tex = tex;
+    if (getenv("OTOMEDIUS_HARVESTDUMP")) {
+        uint32_t w = 0, h = 0;
+        const uint32_t *p = texture_argb(tex, &w, &h);
+        if (p && w && h) {
+            char path[256];
+            FILE *f;
+            snprintf(path, sizeof path, "/tmp/opencode/htex_%s.ppm",
+                     g_harvest[i].name);
+            f = fopen(path, "wb");
+            if (f) {
+                fprintf(f, "P6\n%u %u\n255\n", w, h);
+                for (uint32_t k = 0; k < w * h; k++) {
+                    uint32_t c = p[k];
+                    fputc((int)((c >> 16) & 255), f);
+                    fputc((int)((c >> 8) & 255), f);
+                    fputc((int)(c & 255), f);
+                }
+                fclose(f);
+            }
+        }
+    }
+    return tex;
+}
+
+uint32_t texture_by_name(const char *name)
+{
+    if (!name || !*name)
+        return 0;
+    for (unsigned i = 0; i < g_tex_name_n; i++)
+        if (!strcmp(g_tex_names[i].name, name))
+            return g_tex_names[i].tex;
+    pak_harvest();
+    for (int i = 0; i < g_harvest_n; i++)
+        if (name_matches(g_harvest[i].name, name))
+            return harvest_decode(i);
+    for (unsigned i = 0; i < g_tex_name_n; i++)
+        if (name_matches(g_tex_names[i].name, name))
+            return g_tex_names[i].tex;
+    return 0;
+}
+
 static void d3dx_CreateTextureFromFileInMemoryEx(void)
 {
     /* long argument list; the relevant ones are the device, the source and
@@ -549,6 +744,7 @@ static void d3dx_CreateTextureFromFileInMemoryEx(void)
                         M32(src + 96), M32(src + 100), M32(src + 104));
             tex = texture_create(img.w, img.h, 1, 0, 0x15 /* A8R8G8B8 */, 0);
             texture_upload(tex, img.pixels, size - 128, img.fmt);
+            tex_name_record(tex, src);
         } else if (getenv("OTOMEDIUS_TEXFMT")) {
             fprintf(stderr, "d3dx9: UNSUPPORTED texture magic=%.4s size=%u pf=%08x fourcc=%.4s\n",
                     (const char *)d, size, M32(src + 80), (const char *)(d + 84));
@@ -665,6 +861,68 @@ static void eff_get_handle(void)
     }
     RET32(EFFECT_HANDLE);
 }
+
+/* The effect parameters carry distinct handles so SetMatrix can tell them
+ * apart: the engine binds "View", "Proj", "LightDir" and "LightCol" through
+ * GetParameterByName and then SetMatrix for each one, in that order.  With a
+ * single handle the port could only keep the last matrix (see §13). */
+#define EFF_MAX_PARAMS 24
+#define EFF_NAME_MAX 48
+static struct {
+    uint32_t handle;
+    char name[EFF_NAME_MAX];
+    float mat[16];
+    int has_mat;
+} g_eff_params[EFF_MAX_PARAMS];
+static unsigned g_eff_nparams;
+
+static uint32_t eff_param_handle(uint32_t name_ptr)
+{
+    const char *name = name_ptr ? (const char *)(MEM + name_ptr) : "";
+    unsigned i;
+    for (i = 0; i < g_eff_nparams; i++)
+        if (!strcmp(g_eff_params[i].name, name))
+            return g_eff_params[i].handle;
+    if (g_eff_nparams >= EFF_MAX_PARAMS)
+        return EFFECT_HANDLE;
+    snprintf(g_eff_params[i].name, EFF_NAME_MAX, "%s", name);
+    g_eff_params[i].handle = EFFECT_HANDLE + i;
+    g_eff_params[i].has_mat = 0;
+    g_eff_nparams++;
+    return g_eff_params[i].handle;
+}
+
+/* GetParameterByName(hScope, pName) / GetParameterBySemantic(hScope, pSem). */
+static void eff_get_param_by_name(void)
+{
+    uint32_t name = arg32(2);
+    uint32_t h = eff_param_handle(name);
+    if (getenv("OTOMEDIUS_3DDBG")) {
+        static unsigned n;
+        if (n++ < 48)
+            fprintf(stderr, "3ddbg: effect GetParameterByName handle=%08x "
+                    "name=%s\n", h, name ? (const char *)(MEM + name) : "(null)");
+    }
+    RET32(h);
+}
+
+static void eff_param_set_matrix(uint32_t h, const float *m)
+{
+    for (unsigned i = 0; i < g_eff_nparams; i++) {
+        if (g_eff_params[i].handle != h)
+            continue;
+        memcpy(g_eff_params[i].mat, m, 64);
+        g_eff_params[i].has_mat = 1;
+        if (!strcmp(g_eff_params[i].name, "LightDir") ||
+            !strcmp(g_eff_params[i].name, "LightCol")) {
+            extern void render_set_effect_light(const char *which,
+                                                const float *m);
+            render_set_effect_light(g_eff_params[i].name, m);
+        }
+        return;
+    }
+}
+
 static void eff_current_technique(void) { RET32(EFFECT_HANDLE); }
 static void eff_set_technique(void) { RET32(0); }
 static void eff_get_pool(void)
@@ -711,13 +969,15 @@ static void eff_set_matrix(void)
     if (m) {
         extern void render_set_effect_matrix(const void *matrix);
         render_set_effect_matrix(MEM + m);
+        eff_param_set_matrix(h, (const float *)(MEM + m));
         if (getenv("OTOMEDIUS_3DDBG")) {
             static unsigned n;
             const float *f = (const float *)(MEM + m);
             if (n++ < 24)
-                fprintf(stderr, "3ddbg: effect SetMatrix h=%08x [%.3f %.3f %.3f %.3f | "
+                fprintf(stderr, "3ddbg: effect SetMatrix #%u h=%08x ret=%08x [%.3f %.3f %.3f %.3f | "
                         "%.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f]\n",
-                        h, f[0],f[1],f[2],f[3],f[4],f[5],f[6],f[7],
+                        n, h, M32(x86_cpu()->esp),
+                        f[0],f[1],f[2],f[3],f[4],f[5],f[6],f[7],
                         f[8],f[9],f[10],f[11],f[12],f[13],f[14],f[15]);
         }
     }
@@ -753,8 +1013,8 @@ static const method_t effect_methods[] = {
     {eff_desc2, 3},            /* 6  GetPassDesc */
     {eff_desc2, 3},            /* 7  GetFunctionDesc */
     {eff_get_handle, 3},       /* 8  GetParameter */
-    {eff_get_handle, 3},       /* 9  GetParameterByName */
-    {eff_get_handle, 3},       /* 10 GetParameterBySemantic */
+    {eff_get_param_by_name, 3},/* 9  GetParameterByName */
+    {eff_get_param_by_name, 3},/* 10 GetParameterBySemantic */
     {eff_get_handle, 3},       /* 11 GetParameterElement */
     {eff_get_handle, 2},       /* 12 GetTechnique */
     {eff_get_handle, 2},       /* 13 GetTechniqueByName */
@@ -861,6 +1121,27 @@ static void d3dx_CreateEffect(void)
                     n, len, src, buf);
         }
     }
+    /* OTOMEDIUS_EFFECTDUMP=<dir>: write every effect source the game compiles.
+     * These are the game's own HLSL programs; they say how the vertex path
+     * really transforms (order of World/View/Proj, any extra scale). */
+    {
+        const char *dir = getenv("OTOMEDIUS_EFFECTDUMP");
+        uint32_t src = arg32(1), len = arg32(2);
+        static unsigned n;
+        if (dir && *dir && src && len && n < 64) {
+            char path[512];
+            FILE *f;
+            snprintf(path, sizeof path, "%s/effect_%02u.hlsl", dir, n);
+            f = fopen(path, "wb");
+            if (f) {
+                fwrite(MEM + src, 1, len, f);
+                fclose(f);
+                fprintf(stderr, "d3dx9: effect source #%u -> %s (%u bytes)\n",
+                        n, path, len);
+            }
+            n++;
+        }
+    }
     RET32(0);   /* S_OK */
 }
 static void d3dx_CreateEffectPool(void)
@@ -951,29 +1232,68 @@ static const float *hle_cont_world_of(uint32_t container)
     return NULL;
 }
 
+/* Inverse of a rigid row-vector matrix (rotation + translation): the engine
+ * hands the container draw the camera *to world* matrix (row 3 is the camera
+ * position, e.g. -74.7, 0, 0), so the view transform is its inverse. */
+static void hle_mat_invert_rigid(float *out, const float *m)
+{
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 3; c++)
+            out[r * 4 + c] = m[c * 4 + r];
+    out[3] = out[7] = out[11] = 0.0f;
+    for (int c = 0; c < 3; c++)
+        out[12 + c] = -(m[12] * out[c] + m[13] * out[4 + c] +
+                        m[14] * out[8 + c]);
+    out[15] = 1.0f;
+}
+
+static void pak_scan_full(void);   /* OTOMEDIUS_PAKSCAN, defined below */
+
 static void hle_mesh_draw(void)
 {
     uint32_t w = arg32(0);
     uint32_t self = x86_cpu()->ecx;
     int mesh = hle_cont_lookup(self);
+    const float *game = w ? (const float *)(MEM + w) : NULL;
+    const float *fw = hle_cont_world_of(self);
+    {
+        const char *ps = getenv("OTOMEDIUS_PAKSCAN");
+        if (ps && *ps) {
+            extern unsigned render_presents(void);
+            if (render_presents() >= (unsigned)atoi(ps))
+                pak_scan_full();
+        }
+    }
     /* Which engine function walks the nodes and calls us?  OTOMEDIUS_3DDBG. */
     if (getenv("OTOMEDIUS_3DDBG")) {
-        static unsigned n;
-        if (n++ < 6)
-            fprintf(stderr, "3ddbg: container draw ret=%08x self=%08x world=%08x "
-                    "mesh=%d\n", M32(x86_cpu()->esp), self, w, mesh);
+        static unsigned n, last_p = ~0u;
+        extern unsigned render_presents(void);
+        unsigned p = render_presents();
+        if (p != last_p && n++ < 800) {
+            last_p = p;
+            const float *g = w ? (const float *)(MEM + w) : NULL;
+            fprintf(stderr, "3ddbg: present=%u mesh=%d ret=%08x "
+                    "game0=(%.2f %.2f %.2f) game2=(%.2f %.2f %.2f) "
+                    "game3=(%.2f %.2f %.2f) fw3=(%.2f %.2f %.2f)\n",
+                    p, mesh, M32(x86_cpu()->esp),
+                    g ? g[0] : 0.0f, g ? g[1] : 0.0f, g ? g[2] : 0.0f,
+                    g ? g[8] : 0.0f, g ? g[9] : 0.0f, g ? g[10] : 0.0f,
+                    g ? g[12] : 0.0f, g ? g[13] : 0.0f, g ? g[14] : 0.0f,
+                    fw ? fw[12] : 0.0f, fw ? fw[13] : 0.0f, fw ? fw[14] : 0.0f);
+        }
     }
     extern void render_draw_ship(const float *world);
     extern void render_draw_model(const float *world, int mesh);
-    const float *game = w ? (const float *)(MEM + w) : NULL;
-    const float *fw = hle_cont_world_of(self);
     float world[16];
-    extern int render_has_view(void);
-    /* The game hands every node the same scene matrix and the shader-path
-     * VIEW is not captured yet, so applying it would only rotate the model
-     * edge-on to the fallback camera.  Use it once a real VIEW exists. */
-    if (fw && game && render_has_view()) {
-        hle_mat_mul(world, fw, game);
+    /* The node matrix the engine passes down (0x415846 -> nodo+0x30) is the
+     * camera *to world* matrix: row 3 is the camera position (it starts at
+     * -74.7, 0, 0) and it moves every frame.  The vertex shader gets a zero
+     * "View" (the engine feeds it the device VIEW, which it never sets), so
+     * the view transform has to come from here: inverse(camera) * frameW. */
+    if (fw && game) {
+        float inv[16];
+        hle_mat_invert_rigid(inv, game);
+        hle_mat_mul(world, fw, inv);
         game = world;
     } else if (fw) {
         game = fw;
@@ -1122,6 +1442,126 @@ static int hle_build_from_x(uint32_t allocator, uint32_t src, uint32_t size,
     return 1;
 }
 
+/* OTOMEDIUS_PAKSCAN=<present>: at that present, walk all of emulated memory
+ * looking for TXGP chunks (the engine keeps every decompressed pak image
+ * around) and print each texture's file name and DDS header.  This is how the
+ * p02_* textures that belong to the player model are found. */
+static void pak_scan_full(void)
+{
+    static int done;
+    uint64_t p;
+    unsigned hits = 0;
+    if (done)
+        return;
+    done = 1;
+    fprintf(stderr, "pakscan: start\n");
+    for (p = 0; p + 4 < 0xF0000000ull;) {
+        void *q = memmem(MEM + p, (size_t)(0x4000000ull), "TXGP", 4);
+        uint32_t va;
+        if (!q) {
+            p += 0x4000000ull;
+            continue;
+        }
+        va = (uint32_t)((uint8_t *)q - MEM);
+        /* name: first printable string ending in ".dds" within 256 bytes */
+        {
+            char name[96] = "";
+            unsigned i;
+            for (i = 0; i + 3 < 256; i++) {
+                if (M8(va + i) == '.' && M8(va + i + 1) == 'd' &&
+                    M8(va + i + 2) == 'd' && M8(va + i + 3) == 's') {
+                    int j = (int)i - 1;
+                    while (j > 0 && M8(va + j - 1) >= 32 && M8(va + j - 1) < 127)
+                        j--;
+                    {
+                        unsigned n = (unsigned)(i + 4 - j);
+                        if (n >= sizeof name)
+                            n = sizeof name - 1;
+                        for (unsigned k = 0; k < n; k++)
+                            name[k] = (char)M8(va + j + k);
+                        name[n] = 0;
+                    }
+                    break;
+                }
+            }
+            if (name[0])
+                fprintf(stderr, "pakscan: TXGP %08x %s\n", va, name);
+        }
+        hits++;
+        p = (uint64_t)va + 4;
+    }
+    fprintf(stderr, "pakscan: %u TXGP chunk(s)\n", hits);
+}
+
+/* OTOMEDIUS_PAKDBG=<path>: once, when the player .x is handed over, look for
+ * chunk tags around it and dump what is found.  The pak is packed (no plain
+ * "xof"/"TXGP" in the file), so the engine must decompress it; if the whole
+ * image is in emulated memory the tags show up here. */
+static void pak_scan(uint32_t src, uint32_t size)
+{
+    static int done;
+    const char *path = getenv("OTOMEDIUS_PAKDBG");
+    static const char *tags[] = {"TXGP", "MESH", "xof ", "DDS ", "TXG "};
+    uint64_t lo, hi;
+    if (!path || !*path || done || !src)
+        return;
+    done = 1;
+    lo = src > 0x2000000u ? (uint64_t)src - 0x2000000u : 0u;
+    hi = (uint64_t)src + size + 0x2000000u;
+    if (hi > 0xF0000000ull)
+        hi = 0xF0000000ull;
+    fprintf(stderr, "pakdbg: scanning %08x..%08x (x at %08x, %u bytes)\n",
+            (unsigned)lo, (unsigned)hi, src, size);
+    {
+        const char *dump = getenv("OTOMEDIUS_PAKDUMP");
+        if (dump && *dump) {
+            char dpath[512];
+            FILE *f;
+            snprintf(dpath, sizeof dpath, "%s.bin", dump);
+            f = fopen(dpath, "wb");
+            if (f) {
+                fwrite(MEM + lo, 1, (size_t)(hi - lo), f);
+                fclose(f);
+                fprintf(stderr, "pakdbg: image %08x..%08x -> %s\n",
+                        (unsigned)lo, (unsigned)hi, dpath);
+            }
+        }
+    }
+    {
+        char dpath[512];
+        FILE *f;
+        snprintf(dpath, sizeof dpath, "%s.x", path);
+        f = fopen(dpath, "wb");
+        if (f) {
+            fwrite(MEM + src, 1, size, f);
+            fclose(f);
+            fprintf(stderr, "pakdbg: .x image -> %s\n", dpath);
+        }
+    }
+    for (unsigned t = 0; t < sizeof tags / sizeof tags[0]; t++) {
+        uint64_t p = lo;
+        int hits = 0;
+        while (p + 4 < hi && hits < 12) {
+            void *q = memmem(MEM + p, (size_t)(hi - p), tags[t], 4);
+            uint32_t va;
+            if (!q)
+                break;
+            va = (uint32_t)((uint8_t *)q - MEM);
+            fprintf(stderr, "pakdbg: %s at %08x  [%02x %02x %02x %02x "
+                    "%02x %02x %02x %02x | %02x %02x %02x %02x %02x %02x %02x %02x]\n",
+                    tags[t], va,
+                    M8(va - 8), M8(va - 7), M8(va - 6), M8(va - 5),
+                    M8(va - 4), M8(va - 3), M8(va - 2), M8(va - 1),
+                    M8(va), M8(va + 1), M8(va + 2), M8(va + 3),
+                    M8(va + 4), M8(va + 5), M8(va + 6), M8(va + 7));
+            hits++;
+            p = (uint64_t)va + 4;
+        }
+        if (hits)
+            fprintf(stderr, "pakdbg: %s: %d hit(s)\n", tags[t], hits);
+    }
+}
+
 static void d3dx_LoadMeshHierarchyFromXInMemory(void)
 {
     uint32_t allocator = arg32(4), src = arg32(0), size = arg32(1);
@@ -1156,6 +1596,7 @@ static void d3dx_LoadMeshHierarchyFromXInMemory(void)
         RET32(0);
         return;
     }
+    pak_scan(src, size);
     if (!allocator || !ppFrame) {
         RET32(0x80004005u);
         return;

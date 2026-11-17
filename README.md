@@ -62,7 +62,7 @@ what to do without guessing (full rules in [`AGENTS.md`](AGENTS.md)):
 | `dsound` (device, buffers, lock/play) | working; voices are mixed to SDL3 (volume/pan/rate/loop) |
 | `dshow` (opening movie: graph, filter, pin) | interfaces working; the WMV3 intro is decoded with the runtime's ffmpeg and uploaded into the game's own video texture |
 | Fonts / text | working: `GGO_GRAY8_BITMAP`/`GGO_BITMAP` implemented; `AddFontMemResourceEx` registers the game's own fonts (DFGothic/DFMincho/DFPOP…) and `SysFont.dds`/`gradius_font.dds` load through a real `D3DXCreateTextureFromFileExA` |
-| Renderer (2D, sprites, playfield) | 2D path working (signed-area fix in `draw_tri`); the game runs its main loop, creates a 1280×1024 device and draws every frame (`BeginScene`/`EndScene`/`Present`); the attract HUD is visible; the 3D XYZ pipeline (`W*V*P`, `/w`, viewport, z-buffer, perspective-correct UVs, `DrawPrimitive`/`DrawIndexedPrimitive`) works; the **real `.x` parser** (`native/xmodel.c`) builds the player's 58-frame hierarchy and the renderer draws its 6 meshes (7 998 faces) with directional shading. The model is still erased by the game's own post-scene `Clear`, so it is not visible yet (see booklet §13.8) |
+| Renderer (2D, sprites, playfield) | 2D path working (signed-area fix in `draw_tri`); the game runs its main loop, creates a 1280×1024 device and draws every frame (`BeginScene`/`EndScene`/`Present`); the attract HUD is visible; the 3D XYZ pipeline (`W*V*P`, `/w`, viewport, z-buffer, perspective-correct UVs, `DrawPrimitive`/`DrawIndexedPrimitive`) works; the **real `.x` parser** (`native/xmodel.c`) builds the player's 58-frame hierarchy and the renderer draws all six textured meshes (7 998 faces) with the scene's own camera and light. DXT1/3/5 colour-block interpolation was fixed (per-channel, no more colour speckles) |
 | Audio | `dsound` voices are mixed to SDL3 (volume/pan/rate/loop); the intro movie track (WMAv2) plays cleanly through the same stream |
 
 Today the recompiled game boots completely: the MSVC CRT runs, the window is
@@ -119,19 +119,33 @@ lists), shares one COM vtable per class (a per-object vtable exhausted the
 fixed native-thunk table after a few thousand frames), and implements
 `GetBackBuffer`/`GetDesc`.
 
-What is still missing: **showing** the 3D layer. The binary `.x` inside
-`Player02.pak` is now parsed (`native/xmodel.c`: templates, shared scalar
-lists, flattened inline templates, frames, meshes, materials, normals and
-UVs), `D3DXLoadMeshHierarchyFromXInMemory` builds the game's real 58-frame
-hierarchy through its own allocator, and the renderer draws all six meshes
-(7 375 vertices, 7 998 faces) with the XYZ pipeline and directional shading.
-Back-buffer read-back and render targets are implemented too. The remaining
-blocker is ordering: every attract frame runs `Clear → MODEL → Clear(TARGET) →
-HUD`, so the model is drawn and immediately erased; the engine's
-"scene-to-texture" path has to be located. The shader camera/VIEW, the model
-textures and the long warning text are still to do. The software rasteriser
-runs at ~26–36 fps. The detailed state and the next steps are in
-[`docs/BOOKLET.md`](docs/BOOKLET.md) (section 13); the ready-to-paste
+The player model is now **drawn and visible**: the cause of the "drawn and
+erased" behaviour was a broken depth-compare table (the D3D `D3DCMP_*` values
+were shifted by one, so the default `LESSEQUAL` acted as `GREATEREQUAL` and
+every 3D pixel was rejected). On top of that, `GetTransform` did not return the
+device transforms (D3D9 defaults to identity), the container draw's matrix is
+the engine's camera-to-world matrix, so the model is composed as
+`frameWorld × inverse(camera)`, and the depth buffer now follows the bound
+render target. The engine's camera and light come from the scene itself
+(`GetTransform(PROJECTION)` and the effect's `LightDir`/`LightCol`, which now
+have distinct parameter handles).
+
+The model is **textured** too: the engine keeps every decompressed pak image in
+emulated memory, so the port scans it once for `DDS` chunks (the chunk stores
+`<file>.dds` right before the header), decodes the player's atlases
+(`p02_body01`, `p02_bike01`, `p02_gun01`, `p02_hair`, …) and binds them to the
+meshes by name. A long-standing bug in the DXT1/3/5 decoder was fixed at the
+same time: the 1/3 and 2/3 blend colours were computed on the packed 24-bit
+value, so the channels carried into each other and every DXT texture had
+coloured speckles.
+
+Still open: the network-status banner (`ネットワーク接続状況確認中`), the
+`REPLAY RAND ERROR` overlay the game prints in the attract, the long warning
+text, the environment/enemy `.x` models (the parser holds a single model, so
+loading all of them needs a per-model mesh store) and drawing the model with
+the game's own material/texture mapping instead of the by-name heuristic. The
+software rasteriser runs at ~26–36 fps. The detailed state and the next steps
+are in [`docs/BOOKLET.md`](docs/BOOKLET.md) (section 14); the ready-to-paste
 next-session prompt is [`docs/HANDOVER_PROMPT.md`](docs/HANDOVER_PROMPT.md).
 
 ## Requirements
@@ -286,6 +300,16 @@ AZERTY, QWERTZ and other layouts.
 | `OTOMEDIUS_DSDBG=1` | log DirectSound buffer creation, Play/Stop, volume, frequency and Lock calls |
 | `OTOMEDIUS_AUDIO_DUMP=file.raw` | dump the mixed dsound output (S16LE 48 kHz stereo) for analysis |
 | `OTOMEDIUS_AUDIO_STREAM_DUMP=file.raw` | dump the final SDL audio stream (movie + dsound) |
+| `OTOMEDIUS_3DDBG=1` | trace the container draw (mesh, engine matrix), effect `SetMatrix`/`GetParameterByName`, `D3DXMatrixPerspectiveFovLH` and the model's composed world matrix |
+| `OTOMEDIUS_ORDERDBG=1` | submission order per frame; `OTOMEDIUS_ORDERDBG=<present>` only from that present on (keeps the attract log small) |
+| `OTOMEDIUS_RTDBG=1` | log every render-target bind, including back-buffer restores, with the present number |
+| `OTOMEDIUS_VPDBG=1` | log `SetViewport`, `SetTransform` and `D3DXMatrixPerspectiveFovLH` |
+| `OTOMEDIUS_EFFECTDUMP=dir` | write every effect blob the game compiles to `dir/effect_NN.hlsl` |
+| `OTOMEDIUS_PAKDBG=path` | at the player `.x` load, scan around it for `TXGP`/`MESH`/`DDS` tags and dump the `.x` image |
+| `OTOMEDIUS_PAKDUMP=path` | also dump the whole scanned image (~70 MB) for offline analysis |
+| `OTOMEDIUS_PAKSCAN=<present>` | at that present, list every `TXGP` chunk (texture file name) in emulated memory |
+| `OTOMEDIUS_HARVESTDUMP=1` | write every harvested/decoded texture to `/tmp/opencode/htex_<name>.ppm` |
+| `OTOMEDIUS_MODELTEX=file.dds` | force the texture bound to every model mesh (mapping experiments) |
 
 ## License
 

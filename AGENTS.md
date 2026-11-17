@@ -140,11 +140,13 @@ SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy \
 
 - El juego arranca de punta a punta: loader → boot Konami → NVRAM → logos →
   Warning → vídeo → Title → eye-catch → attract con `CGameMan` y state 5.
-- El HUD 2D se dibuja; el 3D propio del juego (`.x`) sigue pendiente. La sesión
-  actual añadió el pipeline XYZ y una jerarquía HLE de frames con una nave
-  sintética para validar la cadena.
+- El HUD 2D se dibuja y **el modelo 3D del jugador se ve y está texturado**:
+  `.x` real parseado (`native/xmodel.c`), cámara y luz de la escena, atlases
+  `p02_*.dds` decodificados desde la imagen del pak en memoria.
+- Falta el escenario/enemigos (store por modelo), el mapeo material→textura del
+  motor, el cartel de red y el texto largo.
 - Los bloqueos y el plan inmediato están en `docs/HANDOVER_PROMPT.md` §4–§5 y
-  en la última sección de `docs/BOOKLET.md`.
+  en la última sección de `docs/BOOKLET.md` (§14).
 
 ---
 

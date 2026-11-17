@@ -370,6 +370,14 @@ static void dev_CreateTexture(void)
     uint32_t tex = texture_create(w, h, levels, usage, format, pool);
     if (pp)
         M32(pp) = tex;
+    if (getenv("OTOMEDIUS_TEXDBG")) {
+        static unsigned n;
+        if (n++ < 60)
+            fprintf(stderr, "d3d9: CreateTexture %ux%u lv=%u usage=%x fmt=%x "
+                    "pool=%u -> %08x pp=%08x<%08x> ret=%08x\n",
+                    w, h, levels, usage, format, pool, tex, pp,
+                    pp ? M32(pp) : 0, M32(x86_cpu()->esp));
+    }
     RET32(0);
 }
 
@@ -529,9 +537,9 @@ static void dev_Clear(void)
 static void dev_SetTransform(void)
 {
     uint32_t state = arg32(1), m = arg32(2);
-    if (g_verbose > 1) {
+    if ((g_verbose > 1 || getenv("OTOMEDIUS_VPDBG")) && m) {
         static int n;
-        if (n++ < 12 && m) {
+        if (n++ < 40) {
             const float *f = (const float *)(MEM + m);
             fprintf(stderr, "d3d9: SetTransform(state=%u) "
                     "[%.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f]\n",
@@ -543,7 +551,14 @@ static void dev_SetTransform(void)
     RET32(0);
 }
 
-static void dev_GetTransform(void) { RET32(0); }
+static void dev_GetTransform(void)
+{
+    uint32_t state = arg32(1), m = arg32(2);
+    extern int render_get_transform(uint32_t state, void *out);
+    if (m)
+        render_get_transform(state, MEM + m);
+    RET32(0);
+}
 
 static void dev_MultiplyTransform(void) { RET32(0); }
 
@@ -559,6 +574,10 @@ static void dev_SetViewport(void)
         vp[4] = M32(p + 16);
         vp[5] = M32(p + 20);
         render_set_viewport(vp[0], vp[1], vp[2], vp[3]);
+        if (g_verbose > 1 || getenv("OTOMEDIUS_VPDBG"))
+            fprintf(stderr, "d3d9: SetViewport %u,%u %ux%u minz=%g maxz=%g\n",
+                    vp[0], vp[1], vp[2], vp[3],
+                    *(float *)&vp[4], *(float *)&vp[5]);
     }
     RET32(0);
 }

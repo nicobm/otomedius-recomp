@@ -575,6 +575,22 @@ static uint32_t rgb565(uint32_t c)
 }
 
 /* one 4x4 colour block (8 bytes) */
+static uint32_t mix2(uint32_t a, uint32_t b)   /* (a + b) / 2 per channel */
+{
+    uint32_t r = (((a >> 16) & 255) + ((b >> 16) & 255)) >> 1;
+    uint32_t g = (((a >> 8) & 255) + ((b >> 8) & 255)) >> 1;
+    uint32_t bl = ((a & 255) + (b & 255)) >> 1;
+    return 0xFF000000u | (r << 16) | (g << 8) | bl;
+}
+
+static uint32_t mix3(uint32_t a, uint32_t b)   /* (2a + b) / 3 per channel */
+{
+    uint32_t r = (2 * ((a >> 16) & 255) + ((b >> 16) & 255)) / 3;
+    uint32_t g = (2 * ((a >> 8) & 255) + ((b >> 8) & 255)) / 3;
+    uint32_t bl = (2 * (a & 255) + (b & 255)) / 3;
+    return 0xFF000000u | (r << 16) | (g << 8) | bl;
+}
+
 static void dxt_color_block(const uint8_t *b, uint32_t *out, int stride,
                             int force4, uint32_t alpha_or)
 {
@@ -583,14 +599,14 @@ static void dxt_color_block(const uint8_t *b, uint32_t *out, int stride,
     uint32_t p[4];
     p[0] = rgb565(c0) | alpha_or;
     p[1] = rgb565(c1) | alpha_or;
+    /* The 1/3- and 2/3-blend colours must be interpolated per channel: doing
+     * the arithmetic on the packed 0xRRGGBB value divided as one 24-bit
+     * integer makes the three channels carry into each other, which showed up
+     * as coloured speckles in every DXT1/3/5 texture (the p02_* atlases). */
+    p[2] = mix2(p[0], p[1]);
     if (force4 || c0 > c1) {
-        p[2] = 0xFF000000u | (((rgb565(c0) & 0xFEFEFEu) >> 1) +
-                              ((rgb565(c1) & 0xFEFEFEu) >> 1));
-        p[3] = 0xFF000000u | (((rgb565(c0) & 0xFEFEFEu) * 2 / 3) +
-                              ((rgb565(c1) & 0xFEFEFEu) / 3));
+        p[3] = mix3(p[0], p[1]);
     } else {
-        p[2] = 0xFF000000u | (((rgb565(c0) & 0xFEFEFEu) >> 1) +
-                              ((rgb565(c1) & 0xFEFEFEu) >> 1));
         p[3] = 0;   /* transparent black */
     }
     uint32_t bits = (uint32_t)b[4] | ((uint32_t)b[5] << 8) |
