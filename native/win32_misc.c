@@ -290,10 +290,10 @@ static void g_GetCharABCWidthsA(void)
     }
     if (abc && last >= first && last - first < 0x10000) {
         for (uint32_t c = first; c <= last; c++) {
-            uint32_t p = abc + (c - first) * 6;
-            M16(p + 0) = 0;                     /* a: left side bearing */
-            M16(p + 2) = (uint16_t)adv;         /* b: black width */
-            M16(p + 4) = 0;                     /* c: right side bearing */
+            uint32_t p = abc + (c - first) * 12;
+            M32(p + 0) = 0;                     /* a: left side bearing */
+            M32(p + 4) = (uint32_t)adv;         /* b: black width */
+            M32(p + 8) = 0;                     /* c: right side bearing */
         }
     }
     RET32(1);

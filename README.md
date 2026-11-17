@@ -31,6 +31,20 @@ What "static" means here, precisely:
 
 Version: see [`VERSION`](VERSION).
 
+## Working on this repo (session protocol)
+
+This repository uses an explicit session protocol so a new AI session knows
+what to do without guessing (full rules in [`AGENTS.md`](AGENTS.md)):
+
+- **`INICIAR`** + GitHub account/repo/email/token: read `AGENTS.md`, the latest
+  section of [`docs/BOOKLET.md`](docs/BOOKLET.md) and
+  [`docs/HANDOVER_PROMPT.md`](docs/HANDOVER_PROMPT.md), check `git status` and
+  run the smoke test before changing code.
+- **`TERMINAR`**: run the tests, update `README.md`, the booklet and the next
+  session prompt, then commit and push. **No commit/push without this signal.**
+- The GitHub token is never written to a file; the push uses `GIT_ASKPASS` +
+  an environment variable.
+
 ## Status
 
 **Work in progress — not playable yet.** What exists today:
@@ -47,7 +61,7 @@ Version: see [`VERSION`](VERSION).
 | `dsound` (device, buffers, lock/play) | working; voices are mixed to SDL3 (volume/pan/rate/loop) |
 | `dshow` (opening movie: graph, filter, pin) | interfaces working; the WMV3 intro is decoded with the runtime's ffmpeg and uploaded into the game's own video texture |
 | Fonts / text | working: `GGO_GRAY8_BITMAP`/`GGO_BITMAP` implemented; `AddFontMemResourceEx` registers the game's own fonts (DFGothic/DFMincho/DFPOP…) and `SysFont.dds`/`gradius_font.dds` load through a real `D3DXCreateTextureFromFileExA` |
-| Renderer (2D, sprites, playfield) | 2D path working (signed-area fix in `draw_tri`); the game runs its main loop, creates a 1280×1024 device and draws every frame (`BeginScene`/`EndScene`/`Present`); the attract HUD is visible; the 3D playfield path (XYZ + `.x` meshes) is still pending |
+| Renderer (2D, sprites, playfield) | 2D path working (signed-area fix in `draw_tri`); the game runs its main loop, creates a 1280×1024 device and draws every frame (`BeginScene`/`EndScene`/`Present`); the attract HUD is visible; the 3D XYZ pipeline (`W*V*P`, `/w`, viewport, z-buffer, perspective-correct UVs, `DrawPrimitive`/`DrawIndexedPrimitive`) works and a HLE frame hierarchy draws a synthetic player ship; the real `.x` mesh parser and the shader camera are still pending |
 | Audio | `dsound` voices are mixed to SDL3 (volume/pan/rate/loop); the intro movie track (WMAv2) plays cleanly through the same stream |
 
 Today the recompiled game boots completely: the MSVC CRT runs, the window is
@@ -104,14 +118,14 @@ lists), shares one COM vtable per class (a per-object vtable exhausted the
 fixed native-thunk table after a few thousand frames), and implements
 `GetBackBuffer`/`GetDesc`.
 
-What is still missing: the **3D layer**. The attract scene expects `.x` model
-and animation data from `D3DXLoadMeshHierarchyFromXInMemory` (a stub here) and
-the XYZ vertex path (FVF `0x142`/`0x144`, transforms, z-buffer) is not complete,
-so the background and the player ship are absent. The HUD text strip is also
-still mis-scaled, and the software rasteriser runs at ~26–36 fps. The detailed
-state and the next three steps are in [`docs/HANDOVER.md`](docs/HANDOVER.md)
-(section 11); the ready-to-paste next-session prompt is
-[`docs/HANDOVER_PROMPT.md`](docs/HANDOVER_PROMPT.md).
+What is still missing: the **real 3D layer**. The XYZ vertex path (FVF
+`0x142`/`0x144`, `W*V*P`, z-buffer, viewport and perspective-correct UVs) now
+works and is verified with a rotating cube, and a HLE frame hierarchy draws a
+synthetic player ship while the `.x` parser is pending. The real `.x` mesh,
+the shader camera/VIEW and the long warning text are still to do. The software
+rasteriser runs at ~26–36 fps. The detailed state and the next three steps are
+in [`docs/BOOKLET.md`](docs/BOOKLET.md) (section 12); the ready-to-paste
+next-session prompt is [`docs/HANDOVER_PROMPT.md`](docs/HANDOVER_PROMPT.md).
 
 ## Requirements
 
@@ -283,4 +297,4 @@ recompiled C, instruments the emulated Win32/D3D9 layer, and iterates on
 same kind of port (Konami PC arcade titles share the `libacio`/`libbms`/
 `libtouchpanel` stack, Direct3D 9 and a statically linked MSVC 2005 runtime),
 that combination is a practical starting point - the tooling and the notes in
-[`docs/HANDOVER.md`](docs/HANDOVER.md) are what made it tractable here.
+[`docs/BOOKLET.md`](docs/BOOKLET.md) are what made it tractable here.

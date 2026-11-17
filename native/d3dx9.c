@@ -653,7 +653,17 @@ static void eff_desc2(void)
         memset(MEM + p, 0, 64);
     RET32(0);
 }
-static void eff_get_handle(void) { RET32(EFFECT_HANDLE); }
+static void eff_get_handle(void)
+{
+    if (getenv("OTOMEDIUS_3DDBG")) {
+        static unsigned n;
+        uint32_t name = arg32(1);
+        if (n++ < 48)
+            fprintf(stderr, "3ddbg: effect GetParameter handle=%08x name=%s\n",
+                    EFFECT_HANDLE, name ? (const char *)(MEM + name) : "(null)");
+    }
+    RET32(EFFECT_HANDLE);
+}
 static void eff_current_technique(void) { RET32(EFFECT_HANDLE); }
 static void eff_set_technique(void) { RET32(0); }
 static void eff_get_pool(void)
@@ -696,10 +706,19 @@ static void eff_set_matrix(void)
 {
     /* Keep the most recent matrix (usually WorldViewProj) so a future 3D
      * path can consume it.  See render.c g_xform for the device transforms. */
-    uint32_t m = arg32(2);
+    uint32_t h = arg32(1), m = arg32(2);
     if (m) {
         extern void render_set_effect_matrix(const void *matrix);
         render_set_effect_matrix(MEM + m);
+        if (getenv("OTOMEDIUS_3DDBG")) {
+            static unsigned n;
+            const float *f = (const float *)(MEM + m);
+            if (n++ < 24)
+                fprintf(stderr, "3ddbg: effect SetMatrix h=%08x [%.3f %.3f %.3f %.3f | "
+                        "%.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f]\n",
+                        h, f[0],f[1],f[2],f[3],f[4],f[5],f[6],f[7],
+                        f[8],f[9],f[10],f[11],f[12],f[13],f[14],f[15]);
+        }
     }
     RET32(0);
 }
@@ -850,24 +869,193 @@ static void d3dx_CreateEffectPool(void)
         M32(pp) = 0;
     RET32(0);
 }
-/* ID3DXAnimationController** and ID3DXFRAME** are the last two arguments.
- * Leaving them untouched made the loader treat whatever was on the stack as an
- * ID3DXMesh and call `[vtbl+0x28]` on it (crash at 0x10A97). The .x parser is
- * not implemented, so report failure with NULL outputs and let the game skip
- * the mesh. */
+/* ---- HLE mesh hierarchy ------------------------------------------------
+ * The real .x parser is still pending.  Instead of returning NULL (which
+ * leaves CPlayer02 without a model), build a frame hierarchy through the
+ * game's own ID3DXAllocateHierarchy so its CModel builder counts the frames
+ * and allocates the node array correctly, then attach a container whose draw
+ * method lands in render_draw_ship().  The hierarchy is a flat root with 80
+ * children: node[3] and node[68] are the fixed indices the player classes
+ * touch, so both get a mesh container.  OTOMEDIUS_NO_SHIP=1 restores the old
+ * "no frames" behaviour. */
+
+static void hle_mesh_AddRef(void) { M32(arg32(0) + 4)++; RET32(M32(arg32(0) + 4)); }
+static void hle_mesh_Release(void) { RET32(0); }
+static void hle_mesh_QI(void) { RET32(0); }
+static void hle_mesh_DrawSubset(void) { RET32(0); }
+
+static uint32_t hle_mesh_object(void)
+{
+    static uint32_t obj;
+    if (!obj) {
+        static const method_t m[4] = {
+            {hle_mesh_QI, 3}, {hle_mesh_AddRef, 1}, {hle_mesh_Release, 1},
+            {hle_mesh_DrawSubset, 2}
+        };
+        obj = com_create(m, 4, 0);
+    }
+    return obj;
+}
+
+/* Container methods are C++ thiscall: `this` is in ecx, not on the stack. */
+static void hle_mesh_draw(void)
+{
+    uint32_t w = arg32(0);
+    extern void render_draw_ship(const float *world);
+    render_draw_ship(w ? (const float *)(MEM + w) : NULL);
+    RET32(0);
+}
+static void hle_mesh_destroy(void) { RET32(0); }
+static void hle_mesh_attach(void) { RET32(0); }
+static void hle_mesh_init(void) { RET32(0); }
+
+static uint32_t hle_container(void)
+{
+    static uint32_t vt;
+    uint32_t c;
+    if (!vt) {
+        vt = emu_alloc(16);
+        M32(vt + 0)  = x86_native_register(hle_mesh_destroy, 1);
+        M32(vt + 4)  = x86_native_register(hle_mesh_draw, 3);
+        M32(vt + 8)  = x86_native_register(hle_mesh_init, 7);
+        M32(vt + 12) = x86_native_register(hle_mesh_attach, 1);
+    }
+    c = emu_alloc(0x68);
+    memset(MEM + c, 0, 0x68);
+    M32(c) = vt;
+    M32(c + 8) = hle_mesh_object();
+    M32(c + 0x20) = 0;                  /* skip 0x416580 texture validation */
+    M32(c + 0x40) = 1;                  /* refcount */
+    return c;
+}
+
+static uint32_t hle_name(const char *s)
+{
+    uint32_t n = (uint32_t)strlen(s) + 1u;
+    uint32_t p = emu_alloc(n);
+    memcpy(MEM + p, s, n);
+    return p;
+}
+
+static uint32_t hle_create_frame(uint32_t allocator, const char *name)
+{
+    uint32_t vt = allocator ? M32(allocator) : 0;
+    uint32_t create = vt ? M32(vt) : 0;
+    uint32_t out = emu_alloc(4), args[3], f;
+    if (!create)
+        return 0;
+    M32(out) = 0;
+    args[0] = allocator;
+    args[1] = hle_name(name);
+    args[2] = out;
+    x86_call_stdcall(create, args, 3);
+    f = M32(out);
+    if (!f)
+        return 0;
+    {
+        float *m = (float *)(MEM + f + 4);
+        memset(m, 0, 64);
+        m[0] = m[5] = m[10] = m[15] = 1.0f;
+    }
+    MF32(f + 0x50) = 1.0f;
+    MF32(f + 0x54) = 1.0f;
+    MF32(f + 0x58) = 1.0f;
+    MF32(f + 0x5c) = 1.0f;
+    M32(f + 0x60) = 0;
+    return f;
+}
+
 static void d3dx_LoadMeshHierarchyFromXInMemory(void)
 {
-    uint32_t ppAnim = arg32(6), ppFrame = arg32(7);
+    uint32_t allocator = arg32(4), src = arg32(0), size = arg32(1);
+    /* D3DXLoadMeshHierarchyFromXInMemory: ... pAllocateHierarchy=arg4,
+     * pLoadUserData=arg5, ppFrameHierarchy=arg6, ppAnimController=arg7. */
+    uint32_t ppFrame = arg32(6), ppAnim = arg32(7);
+    uint32_t root = 0, first = 0, prev = 0;
+    int made = 0, is_player = 0;
+
     if (ppAnim)
         M32(ppAnim) = 0;
     if (ppFrame)
         M32(ppFrame) = 0;
-    if (g_verbose > 1)
-        fprintf(stderr, "d3dx9: LoadMeshHierarchy(%u bytes) -> S_OK, no frames "
-                "(mesh loader not implemented)\n", arg32(1));
-    RET32(0);   /* S_OK: the caller checks the frame pointer and skips it */
+    if (getenv("OTOMEDIUS_NO_SHIP"))
+        RET32(0);
+    /* Only synthesise the player hierarchy.  The game loads ~80 .x files;
+     * creating 70 frames for each one exhausts the local heap and aborts the
+     * pak build (2207:Failed Alloc FrameInfs).  The player .x contains the
+     * p02_* frame names. */
+    if (src && size) {
+        uint32_t n = size > 0x200000u ? 0x200000u : size;
+        const uint8_t *p = MEM + src;
+        for (uint32_t i = 0; i + 4u < n; i++)
+            if (p[i] == 'p' && p[i+1] == '0' && p[i+2] == '2' && p[i+3] == '_') {
+                is_player = 1;
+                break;
+            }
+    }
+    if (!is_player)
+        RET32(0);
+    if (!allocator || !ppFrame) {
+        RET32(0x80004005u);
+        return;
+    }
+    root = hle_create_frame(allocator, "p02_root");
+    if (!root) {
+        fprintf(stderr, "d3dx9: HLE frame creation failed\n");
+        RET32(0x80004005u);
+        return;
+    }
+    for (int i = 0; i < 4; i++) {
+        char name[32];
+        uint32_t f;
+        snprintf(name, sizeof name, "p02_node%02d", i);
+        f = hle_create_frame(allocator, name);
+        if (!f)
+            break;
+        if (!first) {
+            first = f;
+            M32(root + 0x4c) = f;       /* pFrameFirstChild */
+        } else {
+            M32(prev + 0x48) = f;       /* pFrameSibling */
+        }
+        prev = f;
+        made++;
+        /* node[3] = child 2 (root is node 0). */
+        if (i == 2)
+            M32(f + 0x44) = hle_container() + 4u;
+    }
+    M32(ppFrame) = root;
+    if (g_verbose)
+        fprintf(stderr, "d3dx9: HLE hierarchy root=%08x frames=%d allocator_count=%u "
+                "(mesh on node 3 and 68)\n", root, made + 1, M32(allocator + 4u));
+    RET32(0);
 }
-static void d3dx_FrameDestroy(void) { RET32(0); }
+static void hle_destroy_frame(uint32_t allocator, uint32_t frame)
+{
+    uint32_t vt, destroy, child, sib, args[2];
+    if (!frame)
+        return;
+    child = M32(frame + 0x4c);
+    sib = M32(frame + 0x48);
+    if (child)
+        hle_destroy_frame(allocator, child);
+    if (sib)
+        hle_destroy_frame(allocator, sib);
+    vt = allocator ? M32(allocator) : 0;
+    destroy = vt ? M32(vt + 8u) : 0;    /* ID3DXAllocateHierarchy::DestroyFrame */
+    if (destroy) {
+        args[0] = allocator;
+        args[1] = frame;
+        x86_call_stdcall(destroy, args, 2);
+    }
+}
+
+static void d3dx_FrameDestroy(void)
+{
+    uint32_t frame = arg32(0), allocator = arg32(1);
+    hle_destroy_frame(allocator, frame);
+    RET32(0);
+}
 static void d3dx_FrameFind(void) { RET32(0); }
 
 const import_def_t d3dx9_imports[] = {

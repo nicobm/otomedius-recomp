@@ -21,6 +21,10 @@ static uint32_t g_clear = 0xFF000000u;
 /* software frame buffer, 0xAARRGGBB (BGRA byte order, what SDL wants) */
 static uint8_t *g_fb;
 static int g_fb_w, g_fb_h;
+/* Viewport (D3DVIEWPORT9) and depth buffer for the XYZ vertex path. */
+static float g_vp_x, g_vp_y, g_vp_w = 1280.0f, g_vp_h = 1024.0f;
+static float *g_zbuf;
+static int g_zb_w, g_zb_h;
 static void fb_fill(uint32_t color);
 
 /* ------------------------------------------------- renderer bring-up stats
@@ -52,6 +56,16 @@ void render_init(int w, int h)
     g_fb_w = g_width;
     g_fb_h = g_height;
     g_fb = (uint8_t *)calloc((size_t)g_fb_w * g_fb_h, 4);
+    free(g_zbuf);
+    g_zbuf = (float *)malloc((size_t)g_fb_w * g_fb_h * sizeof(float));
+    g_zb_w = g_fb_w;
+    g_zb_h = g_fb_h;
+    if (g_zbuf)
+        for (size_t i = 0, n = (size_t)g_fb_w * g_fb_h; i < n; i++)
+            g_zbuf[i] = 1.0f;
+    g_vp_x = g_vp_y = 0.0f;
+    g_vp_w = (float)g_fb_w;
+    g_vp_h = (float)g_fb_h;
     fb_fill(g_clear);
     g_stat.minx = g_stat.miny = 0x7FFFFFFF;
     g_stat.maxx = g_stat.maxy = -0x7FFFFFFF;
@@ -129,7 +143,10 @@ static inline void fb_blend(int x, int y, uint32_t src)
 
 typedef struct {
     float x, y, u, v;
+    float z;        /* NDC depth 0..1 for the 3D path */
+    float iw;       /* 1/w, for perspective-correct UV interpolation */
     uint32_t color;
+    int valid;      /* 0 when the vertex was clipped (w <= 0) */
 } svtx_t;
 
 /* ---- fixed-function state the software rasteriser honours ---------------
@@ -143,9 +160,11 @@ static float g_xform[3][16];
 /* Last matrix bound through ID3DXEffect::SetMatrix (the effect path uses it
  * instead of SetTransform; kept for the future 3D vertex path). */
 static float g_effect_xform[16];
-enum { RS_ALPHATESTENABLE = 15, RS_SRCBLEND = 19, RS_DESTBLEND = 20,
-       RS_ALPHAREF = 24, RS_ALPHAFUNC = 25, RS_ALPHABLENDENABLE = 27,
-       RS_TEXTUREFACTOR = 60 };
+/* Index buffer bound by SetIndices and the vertex stream offset. */
+static uint32_t g_ib, g_ib_base, g_stream_off;
+enum { RS_ZENABLE = 7, RS_ZWRITEENABLE = 14, RS_ALPHATESTENABLE = 15,
+       RS_SRCBLEND = 19, RS_DESTBLEND = 20, RS_ZFUNC = 23, RS_ALPHAREF = 24,
+       RS_ALPHAFUNC = 25, RS_ALPHABLENDENABLE = 27, RS_TEXTUREFACTOR = 60 };
 
 static void render_state_defaults(void)
 {
@@ -154,6 +173,9 @@ static void render_state_defaults(void)
     g_rs[RS_DESTBLEND] = 1;          /* ZERO */
     g_rs[RS_ALPHAFUNC] = 8;          /* ALWAYS */
     g_rs[RS_TEXTUREFACTOR] = 0xFFFFFFFFu;
+    g_rs[RS_ZENABLE] = 1;            /* TRUE */
+    g_rs[RS_ZWRITEENABLE] = 1;       /* TRUE */
+    g_rs[RS_ZFUNC] = 4;              /* D3DCMP_LESSEQUAL */
     memset(g_tss, 0, sizeof g_tss);
     g_tss[1] = 4;                    /* COLOROP   = MODULATE */
     g_tss[2] = 2;                    /* COLORARG1 = TEXTURE */
@@ -314,12 +336,14 @@ static void fb_write(int x, int y, uint32_t src)
 
 
 static void draw_tri(const svtx_t *a, const svtx_t *b, const svtx_t *c,
-                     const uint32_t *tex, uint32_t tw, uint32_t th)
+                     const uint32_t *tex, uint32_t tw, uint32_t th, int depth)
 {
     float minx = a->x, maxx = a->x, miny = a->y, maxy = a->y;
     float area;
     int x0, y0, x1, y1;
 
+    if (!a->valid || !b->valid || !c->valid)
+        return;
     if (b->x < minx) minx = b->x;
     if (c->x < minx) minx = c->x;
     if (b->x > maxx) maxx = b->x;
@@ -354,15 +378,51 @@ static void draw_tri(const svtx_t *a, const svtx_t *b, const svtx_t *c,
             float w1 = ((c->x - px) * (a->y - py) - (c->y - py) * (a->x - px));
             float w2 = ((a->x - px) * (b->y - py) - (a->y - py) * (b->x - px));
             float l0, l1, l2, u, v;
+            float iw, z = 0.0f;
             uint32_t col;
 
-            if (w0 < 0 && w1 < 0 && w2 < 0)
-                continue;
-            if (w0 > 0 && w1 > 0 && w2 > 0)
+            /* Barycentric inside test.  w0/w1/w2 all have the same sign as
+             * the triangle area for a point inside it; a mixed-sign set is
+             * outside.  (The old test skipped the inside and drew the
+             * complement, which made single triangles disappear and made
+             * every quad's two halves sample the other triangle's UVs.) */
+            if (!((w0 >= 0.0f && w1 >= 0.0f && w2 >= 0.0f) ||
+                  (w0 <= 0.0f && w1 <= 0.0f && w2 <= 0.0f)))
                 continue;
             l0 = w0 / area; l1 = w1 / area; l2 = w2 / area;
-            u = a->u * l0 + b->u * l1 + c->u * l2;
-            v = a->v * l0 + b->v * l1 + c->v * l2;
+            /* Perspective-correct texture coordinates: interpolate u/w and
+             * v/w linearly in screen space, then divide by the interpolated
+             * 1/w.  The 2D path stores iw = 1, so this is a no-op there. */
+            iw = a->iw * l0 + b->iw * l1 + c->iw * l2;
+            if (iw > 1e-12f || iw < -1e-12f) {
+                u = (a->u * a->iw * l0 + b->u * b->iw * l1 +
+                     c->u * c->iw * l2) / iw;
+                v = (a->v * a->iw * l0 + b->v * b->iw * l1 +
+                     c->v * c->iw * l2) / iw;
+            } else {
+                u = a->u * l0 + b->u * l1 + c->u * l2;
+                v = a->v * l0 + b->v * l1 + c->v * l2;
+            }
+            if (depth) {
+                size_t zi = (size_t)y * (size_t)g_fb_w + (size_t)x;
+                float zf;
+                z = a->z * l0 + b->z * l1 + c->z * l2;
+                if (g_rs[RS_ZENABLE] && g_zbuf) {
+                    zf = g_zbuf[zi];
+                    switch (g_rs[RS_ZFUNC]) {
+                    case 1: if (!(z < zf)) continue; break;       /* LESS */
+                    case 2: if (!(z <= zf)) continue; break;      /* LESSEQUAL */
+                    case 3: if (!(z == zf)) continue; break;      /* EQUAL */
+                    case 4: if (!(z >= zf)) continue; break;      /* GREATEREQUAL */
+                    case 5: if (!(z > zf)) continue; break;       /* GREATER */
+                    case 6: if (!(z != zf)) continue; break;      /* NOTEQUAL */
+                    case 7: continue;                             /* NEVER */
+                    default: break;                               /* ALWAYS */
+                    }
+                }
+                if (g_rs[RS_ZWRITEENABLE] && g_zbuf)
+                    g_zbuf[zi] = z;
+            }
 
             {
                 uint32_t texel = 0xFFFFFFFFu, diff, cur, res, ares;
@@ -419,13 +479,154 @@ static void drawdbg_skip(const char *why, uint32_t prim, uint32_t count,
     }
 }
 
+/* ---- FVF layout and the XYZ (non-RHW) vertex pipeline ------------------
+ * The 3D path reads the vertex stream from the buffers bound with
+ * SetStreamSource/SetIndices, transforms XYZ positions by WORLD*VIEW*PROJ
+ * (D3D row-vector convention), divides by w, maps through the viewport and
+ * interpolates UVs perspective-correctly.  The 2D path (XYZRHW) keeps the
+ * original screen-space behaviour. */
+typedef struct {
+    uint32_t fvf;
+    int pos3d;
+    uint32_t pos_size, diff_off, tex_off;
+    int has_diff, ntex;
+    uint32_t min_stride;
+} fvfinfo_t;
+
+static void fvf_parse(uint32_t fvf, fvfinfo_t *fi)
+{
+    uint32_t pos = fvf & 0x00Eu, off;
+    memset(fi, 0, sizeof *fi);
+    fi->fvf = fvf;
+    if (pos == 0x004u) {                     /* XYZRHW */
+        off = 16u;
+    } else {                                 /* XYZ / XYZB1..XYZB5 */
+        uint32_t nblend = pos >= 0x006u ? (pos - 0x004u) / 2u : 0u;
+        fi->pos3d = 1;
+        off = 12u + nblend * 4u;
+    }
+    fi->pos_size = off;
+    if (fvf & 0x010u) off += 12u;            /* NORMAL */
+    if (fvf & 0x020u) off += 4u;             /* PSIZE */
+    if (fvf & 0x040u) { fi->has_diff = 1; fi->diff_off = off; off += 4u; }
+    if (fvf & 0x080u) off += 4u;             /* SPECULAR */
+    fi->ntex = (int)((fvf >> 8) & 15u);
+    fi->tex_off = off;
+    off += (uint32_t)fi->ntex * 8u;          /* 2D texture coordinates */
+    fi->min_stride = off;
+}
+
+static void mat_mul_row(float *out, const float *a, const float *b)
+{
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) {
+            float s = 0.0f;
+            for (int k = 0; k < 4; k++)
+                s += a[r * 4 + k] * b[k * 4 + c];
+            out[r * 4 + c] = s;
+        }
+}
+
+/* Build WORLD*VIEW*PROJ.  Returns 0 when no usable matrix is bound. */
+static int xform_wvp(float *out)
+{
+    float wv[16];
+    const char *e = getenv("OTOMEDIUS_USE_EFFECT_XFORM");
+    int have_world = 0, have_view = 0, have_proj = 0;
+    for (int i = 0; i < 16; i++) {
+        if (g_xform[2][i] != 0.0f) have_world = 1;
+        if (g_xform[0][i] != 0.0f) have_view = 1;
+        if (g_xform[1][i] != 0.0f) have_proj = 1;
+    }
+    if (e && *e && *e != '0') {
+        memcpy(out, g_effect_xform, sizeof g_effect_xform);
+        return 1;
+    }
+    if (!have_proj) {
+        /* Effect-only scenes may only provide a combined WorldViewProj. */
+        memcpy(out, g_effect_xform, sizeof g_effect_xform);
+        return have_world || have_view;
+    }
+    if (!have_world) {
+        static const float ident[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+        mat_mul_row(wv, ident, g_xform[0]);
+    } else {
+        mat_mul_row(wv, g_xform[2], g_xform[0]);
+    }
+    mat_mul_row(out, wv, g_xform[1]);
+    return 1;
+}
+
+static void make_svtx(const uint8_t *v, const fvfinfo_t *fi, const float *wvp,
+                      int use_wvp, svtx_t *out)
+{
+    const float *f = (const float *)v;
+    memset(out, 0, sizeof *out);
+    out->color = fi->has_diff ? M32((uint32_t)(v - MEM) + fi->diff_off)
+                              : 0xFFFFFFFFu;
+    out->iw = 1.0f;
+    out->valid = 1;
+    if (fi->pos3d && use_wvp) {
+        float x = f[0], y = f[1], z = f[2];
+        float cx = x * wvp[0] + y * wvp[4] + z * wvp[8]  + wvp[12];
+        float cy = x * wvp[1] + y * wvp[5] + z * wvp[9]  + wvp[13];
+        float cz = x * wvp[2] + y * wvp[6] + z * wvp[10] + wvp[14];
+        float cw = x * wvp[3] + y * wvp[7] + z * wvp[11] + wvp[15];
+        if (cw <= 1e-6f) {                   /* behind the eye: clipped */
+            out->valid = 0;
+            return;
+        }
+        out->x = g_vp_x + (cx / cw + 1.0f) * 0.5f * g_vp_w;
+        out->y = g_vp_y + (1.0f - cy / cw) * 0.5f * g_vp_h;
+        out->z = cz / cw;
+        out->iw = 1.0f / cw;
+        if (fi->ntex > 0) {
+            const float *t = (const float *)(v + fi->tex_off);
+            out->u = t[0] * out->iw;
+            out->v = t[1] * out->iw;
+        }
+        return;
+    }
+    /* Screen-space path (XYZRHW): the game already divided by w. */
+    out->x = f[0];
+    out->y = f[1];
+    out->z = f[2];
+    if (fi->ntex > 0) {
+        const float *t = (const float *)(v + fi->tex_off);
+        out->u = t[0];
+        out->v = t[1];
+    }
+}
+
+static void raster_array(svtx_t *vt, uint32_t nverts, uint32_t prim,
+                         uint32_t *tex, uint32_t tw, uint32_t th, int depth)
+{
+    if (prim == 4) {
+        for (uint32_t i = 0; i + 2 < nverts; i += 3)
+            draw_tri(&vt[i], &vt[i + 1], &vt[i + 2], tex, tw, th, depth);
+    } else if (prim == 5) {
+        for (uint32_t i = 0; i + 2 < nverts; i++) {
+            if (i & 1)
+                draw_tri(&vt[i + 1], &vt[i], &vt[i + 2], tex, tw, th, depth);
+            else
+                draw_tri(&vt[i], &vt[i + 1], &vt[i + 2], tex, tw, th, depth);
+        }
+    } else if (prim == 6) {
+        for (uint32_t i = 1; i + 1 < nverts; i++)
+            draw_tri(&vt[0], &vt[i], &vt[i + 1], tex, tw, th, depth);
+    }
+}
+
+/* Rasterise an immediate vertex array (DrawPrimitiveUP). */
 static void draw_up_vertices(uint32_t prim, uint32_t prim_count, uint32_t data,
                              uint32_t stride)
 {
     const uint8_t *base;
-    uint32_t nverts, *tex;
-    uint32_t tw = 0, th = 0;
+    uint32_t nverts, *tex = NULL, tw = 0, th = 0;
     svtx_t *vt;
+    fvfinfo_t fi;
+    float wvp[16];
+    int use_wvp = 0;
 
     if (!g_fb || !data || !stride) {
         drawdbg_skip("no-data", prim, prim_count, data, stride, 0);
@@ -439,94 +640,41 @@ static void draw_up_vertices(uint32_t prim, uint32_t prim_count, uint32_t data,
     case 6: nverts = prim_count + 2; break;            /* triangle fan */
     default: drawdbg_skip("prim", prim, prim_count, data, stride, 0); return;
     }
-    if (nverts < 3 || nverts > 4096) {
+    if (nverts < 3 || nverts > 65536) {
         drawdbg_skip("nverts", prim, prim_count, data, stride, nverts);
         return;
     }
-
+    fvf_parse(g_fvf ? g_fvf : 0x144u, &fi);
+    if (stride < fi.min_stride) {
+        drawdbg_skip("stride", prim, prim_count, data, stride, nverts);
+        return;
+    }
+    if (fi.pos3d) {
+        use_wvp = xform_wvp(wvp);
+        if (!use_wvp) {
+            drawdbg_skip("no-wvp", prim, prim_count, data, stride, nverts);
+            return;
+        }
+    }
     vt = (svtx_t *)calloc(nverts, sizeof(*vt));
     if (!vt) {
         drawdbg_skip("calloc", prim, prim_count, data, stride, nverts);
         return;
     }
     base = MEM + data;
-    {
-        /* FVF layout: XYZRHW (x,y,z,rhw) | DIFFUSE | SPECULAR | TEXn */
-        uint32_t fvf = g_fvf ? g_fvf : 0x144u;
-        uint32_t off_diff = 16, off_tex = 16;
-        int has_diff = (fvf & 0x40) != 0, ntex = (int)((fvf >> 8) & 15);
-        if (has_diff) off_tex += 4;
-        if (fvf & 0x80) off_tex += 4;
-        if (!(fvf & 4) || (ntex == 0 && stride < 20)) {
-            static int dbg = -2;
-            static unsigned nd;
-            if (dbg == -2)
-                dbg = getenv("OTOMEDIUS_DRAWDBG") ? 1 : 0;
-            if (dbg && nd < 40) {
-                const float *f = (const float *)(base);
-                nd++;
-                fprintf(stderr, "drawdbg[%u]: DISCARD prim=%u n=%u fvf=%x "
-                        "stride=%u v0=(%.3f,%.3f,%.3f,%.3f) v1=(%.3f,%.3f,%.3f,%.3f)\n",
-                        g_stat.presents, prim, nverts, fvf, stride,
-                        f[0], f[1], f[2], f[3],
-                        f[stride / 4], f[stride / 4 + 1], f[stride / 4 + 2],
-                        f[stride / 4 + 3]);
-                if (nd <= 2) {
-                    static const char *nm[3] = { "WORLD", "VIEW", "PROJ" };
-                    for (int s = 0; s < 3; s++) {
-                        const float *m = g_xform[s];
-                        fprintf(stderr, "  %s [%.4f %.4f %.4f %.4f | "
-                                "%.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | "
-                                "%.4f %.4f %.4f %.4f]\n", nm[s],
-                                m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7],
-                                m[8], m[9], m[10], m[11], m[12], m[13], m[14],
-                                m[15]);
-                    }
-                }
-            }
-            free(vt);
-            return;
-        }
-        for (uint32_t i = 0; i < nverts; i++) {
-            const uint8_t *v = base + (size_t)i * stride;
-            const float *f = (const float *)v;
-            vt[i].x = f[0];
-            vt[i].y = f[1];
-            vt[i].color = has_diff ? M32(data + i * stride + off_diff) : 0xFFFFFFFFu;
-            if (ntex > 0) {
-                const float *t = (const float *)(v + off_tex);
-                vt[i].u = t[0];
-                vt[i].v = t[1];
-            }
-        }
-        g_cur_ntex = ntex;
-    }
+    for (uint32_t i = 0; i < nverts; i++)
+        make_svtx(base + (size_t)i * stride, &fi, wvp, use_wvp, &vt[i]);
+    g_cur_ntex = fi.ntex;
+
     if (getenv("OTOMEDIUS_VERTDBG")) {
-        /* print the first draw of every 120th frame so the coordinates can be
-         * compared against the expected layout */
         static unsigned frame_no;
         if ((frame_no++ % 120) == 0) {
-            fprintf(stderr, "render: verts prim=%u n=%u stride=%u:", prim,
-                    nverts, stride);
+            fprintf(stderr, "render: verts prim=%u n=%u stride=%u fvf=%x:",
+                    prim, nverts, stride, fi.fvf);
             for (uint32_t i = 0; i < nverts && i < 4; i++)
-                fprintf(stderr, " (%.1f,%.1f uv=%.2f,%.2f)", vt[i].x, vt[i].y,
-                        vt[i].u, vt[i].v);
+                fprintf(stderr, " (%.1f,%.1f z=%.3f uv=%.2f,%.2f)", vt[i].x,
+                        vt[i].y, vt[i].z, vt[i].u, vt[i].v);
             fprintf(stderr, "  fb=%dx%d\n", g_fb_w, g_fb_h);
-        }
-    }
-    if (g_verbose > 2) {
-        static int dbg;
-        if (dbg < 2) {
-            dbg++;
-            fprintf(stderr, "render: verts prim=%u n=%u stride=%u:",
-                    prim, nverts, stride);
-            for (uint32_t i = 0; i < nverts && i < 32; i++) {
-                const uint32_t *w32 = (const uint32_t *)(base + (size_t)i * stride);
-                fprintf(stderr, "\n   v%u:", i);
-                for (uint32_t k = 0; k < stride / 4; k++)
-                    fprintf(stderr, " %08x", w32[k]);
-            }
-            fprintf(stderr, "\n");
         }
     }
 
@@ -535,8 +683,9 @@ static void draw_up_vertices(uint32_t prim, uint32_t prim_count, uint32_t data,
      * second corner is u=6.09375 (one cell).  Treating those as normalised
      * UVs makes WRAP sample texel 0 for every glyph.  Detect that convention
      * (out-of-range integer UVs with a sub-cell span) and expand the integer
-     * part with the cell size taken from this quad. */
-    {
+     * part with the cell size taken from this quad.  Only for 2D draws: the
+     * 3D path uses real normalised coordinates. */
+    if (!fi.pos3d) {
         float minu = vt[0].u, maxu = vt[0].u, minv = vt[0].v, maxv = vt[0].v;
         float cell_u, cell_v;
         int cell_uv;
@@ -561,7 +710,6 @@ static void draw_up_vertices(uint32_t prim, uint32_t prim_count, uint32_t data,
         }
     }
 
-    tex = NULL;
     tw = th = 0;
     if (g_tex0 && g_cur_ntex > 0) {
         uint32_t w = 0, h = 0;
@@ -611,14 +759,18 @@ static void draw_up_vertices(uint32_t prim, uint32_t prim_count, uint32_t data,
         }
         if (dbg_at >= 0 && g_stat.presents == (unsigned)dbg_at) {
             fprintf(stderr, "drawdbg[%u]: prim=%u n=%u fvf=%x stride=%u tex=%08x %ux%u "
-                    "rs(ab=%u src=%u dst=%u at=%u) tss(cop=%u c1=%u c2=%u aop=%u) "
-                    "ss(u=%u v=%u mag=%u) v0=(%.0f,%.0f uv %.3f,%.3f c=%08x) "
+                    "rs(ab=%u src=%u dst=%u at=%u z=%u/%u/%u) "
+                    "tss(cop=%u c1=%u c2=%u aop=%u) "
+                    "ss(u=%u v=%u mag=%u) v0=(%.0f,%.0f z%.3f uv %.3f,%.3f c=%08x) "
                     "v2=(%.0f,%.0f uv %.3f,%.3f)\n",
                     g_stat.presents, prim, nverts, g_fvf, stride, g_tex0, tw, th,
                     g_rs[RS_ALPHABLENDENABLE], g_rs[RS_SRCBLEND], g_rs[RS_DESTBLEND],
-                    g_rs[RS_ALPHATESTENABLE], g_tss[1], g_tss[2], g_tss[3], g_tss[4],
-                    g_ss[1], g_ss[2], g_ss[5], vt[0].x, vt[0].y, vt[0].u, vt[0].v,
-                    vt[0].color, vt[nverts > 2 ? 2 : 0].x, vt[nverts > 2 ? 2 : 0].y,
+                    g_rs[RS_ALPHATESTENABLE], g_rs[RS_ZENABLE],
+                    g_rs[RS_ZWRITEENABLE], g_rs[RS_ZFUNC],
+                    g_tss[1], g_tss[2], g_tss[3], g_tss[4],
+                    g_ss[1], g_ss[2], g_ss[5], vt[0].x, vt[0].y, vt[0].z,
+                    vt[0].u, vt[0].v, vt[0].color,
+                    vt[nverts > 2 ? 2 : 0].x, vt[nverts > 2 ? 2 : 0].y,
                     vt[nverts > 2 ? 2 : 0].u, vt[nverts > 2 ? 2 : 0].v);
         }
     }
@@ -640,23 +792,215 @@ static void draw_up_vertices(uint32_t prim, uint32_t prim_count, uint32_t data,
             g_stat.onscreen++;
     }
 
-    if (prim == 4) {
-        for (uint32_t i = 0; i + 2 < nverts; i += 3)
-            draw_tri(&vt[i], &vt[i + 1], &vt[i + 2], tex, tw, th);
-    } else if (prim == 5) {
-        for (uint32_t i = 0; i + 2 < nverts; i++) {
-            if (i & 1)
-                draw_tri(&vt[i + 1], &vt[i], &vt[i + 2], tex, tw, th);
-            else
-                draw_tri(&vt[i], &vt[i + 1], &vt[i + 2], tex, tw, th);
-        }
-    } else if (prim == 6) {
-        for (uint32_t i = 1; i + 1 < nverts; i++)
-            draw_tri(&vt[0], &vt[i], &vt[i + 1], tex, tw, th);
-    } else {
-        drawdbg_skip("prim-draw", prim, prim_count, data, stride, nverts);
-    }
+    raster_array(vt, nverts, prim, tex, tw, th, fi.pos3d);
     free(vt);
+}
+
+/* Vertex/index-buffer path used by DrawPrimitive / DrawIndexedPrimitive. */
+static void draw_vb(uint32_t prim, uint32_t base_vertex, uint32_t min_index,
+                    uint32_t num_vertices, uint32_t start_index, int indexed,
+                    uint32_t prim_count)
+{
+    const uint8_t *vbd, *ibd = NULL;
+    uint32_t vbsize = 0, ibsize = 0, ibfmt = 0, nverts, *tex = NULL;
+    uint32_t tw = 0, th = 0, stride = g_stream_stride, isz = 2;
+    svtx_t *vt;
+    fvfinfo_t fi;
+    float wvp[16];
+    int use_wvp = 0;
+
+    (void)min_index;
+    (void)num_vertices;
+    if (!g_fb || !g_stream_vb || !stride)
+        return;
+    vbd = (const uint8_t *)buffer_data(g_stream_vb, &vbsize, NULL, NULL);
+    if (!vbd)
+        return;
+    switch (prim) {
+    case 2: nverts = prim_count * 2; break;
+    case 3: nverts = prim_count + 1; break;
+    case 4: nverts = prim_count * 3; break;
+    case 5: nverts = prim_count + 2; break;
+    case 6: nverts = prim_count + 2; break;
+    default: return;
+    }
+    if (nverts < 3 || nverts > 262144)
+        return;
+    if (indexed) {
+        int is_index = 0;
+        ibd = (const uint8_t *)buffer_data(g_ib, &ibsize, &is_index, &ibfmt);
+        if (!ibd || !is_index)
+            return;
+        isz = (ibfmt == 102u) ? 4u : 2u;      /* D3DFMT_INDEX32 */
+        if ((size_t)(start_index + nverts) * isz > ibsize)
+            return;
+    }
+    fvf_parse(g_fvf, &fi);
+    if (stride < fi.min_stride)
+        return;
+    if (fi.pos3d) {
+        use_wvp = xform_wvp(wvp);
+        if (!use_wvp)
+            return;
+    }
+    vt = (svtx_t *)calloc(nverts, sizeof(*vt));
+    if (!vt)
+        return;
+    for (uint32_t i = 0; i < nverts; i++) {
+        uint32_t vidx;
+        if (indexed) {
+            uint32_t raw = (isz == 4u)
+                ? M32((uint32_t)(ibd - MEM) + (start_index + i) * 4u)
+                : (uint32_t)M16((uint32_t)(ibd - MEM) + (start_index + i) * 2u);
+            vidx = raw + base_vertex;
+        } else {
+            vidx = base_vertex + i;
+        }
+        if ((size_t)g_stream_off + (size_t)vidx * stride + fi.min_stride > vbsize) {
+            vt[i].valid = 0;
+            continue;
+        }
+        make_svtx(vbd + g_stream_off + (size_t)vidx * stride, &fi, wvp,
+                  use_wvp, &vt[i]);
+    }
+    g_cur_ntex = fi.ntex;
+    if (g_tex0 && fi.ntex > 0) {
+        uint32_t w = 0, h = 0;
+        const uint32_t *px = texture_argb(g_tex0, &w, &h);
+        if (px) { tex = (uint32_t *)px; tw = w; th = h; }
+    }
+    if (getenv("OTOMEDIUS_DRAWDBG")) {
+        static unsigned n;
+        if (n++ < 20)
+            fprintf(stderr, "drawdbg-vb[%u]: prim=%u n=%u fvf=%x stride=%u "
+                    "vb=%08x off=%u ib=%08x start=%u base=%u tex=%08x %ux%u\n",
+                    g_stat.presents, prim, nverts, g_fvf, stride, g_stream_vb,
+                    g_stream_off, g_ib, start_index, base_vertex, g_tex0, tw, th);
+    }
+    raster_array(vt, nverts, prim, tex, tw, th, fi.pos3d);
+    free(vt);
+}
+
+/* ---------------------------------------------------------------- HLE ship
+ * The .x loader is not implemented yet.  D3DXLoadMeshHierarchyFromXInMemory
+ * builds a frame hierarchy through the game's own ID3DXAllocateHierarchy and
+ * attaches a container whose draw method lands here.  The geometry is a
+ * synthetic ship so the whole chain (frame hierarchy -> game CModel ->
+ * container draw -> XYZ rasteriser) can be exercised while the real .x mesh
+ * parser is still pending.  OTOMEDIUS_NO_SHIP=1 disables it. */
+typedef struct { float x, y, z; uint32_t color; } shipv_t;
+static const shipv_t g_ship[] = {
+    /* nose -> mid ring */
+    {0.0f,0.0f,2.2f,0xFFC8D8F0u}, {0.45f,0.35f,0.3f,0xFFC8D8F0u}, {0.45f,-0.35f,0.3f,0xFFC8D8F0u},
+    {0.0f,0.0f,2.2f,0xFFC8D8F0u}, {0.45f,-0.35f,0.3f,0xFFC8D8F0u}, {-0.45f,-0.35f,0.3f,0xFFC8D8F0u},
+    {0.0f,0.0f,2.2f,0xFFC8D8F0u}, {-0.45f,-0.35f,0.3f,0xFFC8D8F0u}, {-0.45f,0.35f,0.3f,0xFFC8D8F0u},
+    {0.0f,0.0f,2.2f,0xFFC8D8F0u}, {-0.45f,0.35f,0.3f,0xFFC8D8F0u}, {0.45f,0.35f,0.3f,0xFFC8D8F0u},
+    /* mid ring -> tail */
+    {0.45f,0.35f,0.3f,0xFFA0B0D0u}, {0.0f,0.0f,-2.0f,0xFFA0B0D0u}, {0.45f,-0.35f,0.3f,0xFFA0B0D0u},
+    {0.45f,-0.35f,0.3f,0xFFA0B0D0u}, {0.0f,0.0f,-2.0f,0xFFA0B0D0u}, {-0.45f,-0.35f,0.3f,0xFFA0B0D0u},
+    {-0.45f,-0.35f,0.3f,0xFFA0B0D0u}, {0.0f,0.0f,-2.0f,0xFFA0B0D0u}, {-0.45f,0.35f,0.3f,0xFFA0B0D0u},
+    {-0.45f,0.35f,0.3f,0xFFA0B0D0u}, {0.0f,0.0f,-2.0f,0xFFA0B0D0u}, {0.45f,0.35f,0.3f,0xFFA0B0D0u},
+    /* wings */
+    {0.4f,0.0f,0.7f,0xFF4060C0u}, {2.9f,0.0f,-0.7f,0xFF4060C0u}, {0.4f,0.0f,-1.4f,0xFF3050A0u},
+    {-0.4f,0.0f,0.7f,0xFF4060C0u}, {-0.4f,0.0f,-1.4f,0xFF3050A0u}, {-2.9f,0.0f,-0.7f,0xFF4060C0u},
+    /* tail fin */
+    {0.0f,0.0f,-1.4f,0xFFE8E8F0u}, {0.0f,1.1f,-2.3f,0xFFE8E8F0u}, {0.0f,0.0f,-2.3f,0xFFC0C0D0u},
+    /* horizontal stabilisers */
+    {0.0f,0.0f,-1.5f,0xFF8088A0u}, {1.3f,0.0f,-2.3f,0xFF8088A0u}, {0.0f,0.0f,-2.3f,0xFF606880u},
+    {0.0f,0.0f,-1.5f,0xFF8088A0u}, {0.0f,0.0f,-2.3f,0xFF606880u}, {-1.3f,0.0f,-2.3f,0xFF8088A0u},
+    /* cockpit */
+    {0.0f,0.32f,1.0f,0xFFFF3030u}, {0.28f,0.0f,0.45f,0xFFFF3030u}, {-0.28f,0.0f,0.45f,0xFFFF3030u},
+    {0.0f,0.32f,1.0f,0xFFFF3030u}, {-0.28f,0.0f,0.45f,0xFFFF3030u}, {0.0f,0.0f,0.2f,0xFFB02020u},
+    /* engine glow */
+    {0.0f,0.0f,-2.0f,0xFFFFFF40u}, {0.3f,0.0f,-2.35f,0xFFFFFF40u}, {-0.3f,0.0f,-2.35f,0xFFFFFF40u},
+};
+
+static void default_view(float *m)
+{
+    memset(m, 0, 64);
+    m[0] = m[5] = m[10] = m[15] = 1.0f;
+    m[14] = 8.0f;                       /* camera at z = -8, looking +z */
+}
+
+static void default_proj(float *m)
+{
+    float aspect = (float)g_fb_w / (float)(g_fb_h ? g_fb_h : 1);
+    float f = 1.0f / tanf(0.5f * 1.04719755f);
+    float zn = 0.1f, zf = 1000.0f;
+    memset(m, 0, 64);
+    m[0] = f / (aspect > 0.01f ? aspect : 1.0f);
+    m[5] = f;
+    m[10] = zf / (zf - zn);
+    m[11] = 1.0f;
+    m[14] = -zn * zf / (zf - zn);
+}
+
+void render_draw_ship(const float *world)
+{
+    static const float ident[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+    float view[16], proj[16], wv[16], wvp[16], wc[16];
+    const float *wp = world ? world : ident;
+    int have_view = 0, have_proj = 0;
+    uint32_t ntri = (uint32_t)(sizeof g_ship / sizeof g_ship[0]) / 3u;
+    static int dbg;
+
+    if (getenv("OTOMEDIUS_NO_SHIP") || !g_fb)
+        return;
+    for (int i = 0; i < 16; i++) {
+        if (g_xform[0][i] != 0.0f) have_view = 1;
+        if (g_xform[1][i] != 0.0f) have_proj = 1;
+    }
+    if (have_view) memcpy(view, g_xform[0], sizeof view); else default_view(view);
+    if (have_proj) memcpy(proj, g_xform[1], sizeof proj); else default_proj(proj);
+    /* The game's 3D scene uses a shader path whose VIEW transform we do not
+     * capture yet; the container draw only gives us the node's world matrix,
+     * whose translation is the ship's position in world space.  Until the
+     * camera constants are wired up, centre that world matrix so the model is
+     * visible instead of tens of units off-screen.  OTOMEDIUS_SHIP_CENTER=0
+     * disables the override. */
+    if (!have_view && !(getenv("OTOMEDIUS_SHIP_CENTER") &&
+                        *getenv("OTOMEDIUS_SHIP_CENTER") == '0')) {
+        memcpy(wc, wp, sizeof wc);
+        wc[12] = wc[13] = wc[14] = 0.0f;
+        wp = wc;
+    }
+    mat_mul_row(wv, wp, view);
+    mat_mul_row(wvp, wv, proj);
+    if (getenv("OTOMEDIUS_3DDBG") && dbg < 3) {
+        dbg++;
+        fprintf(stderr, "3ddbg: ship draw world=[%.3f %.3f %.3f %.3f | "
+                "%.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f] "
+                "view=%d proj=%d effect=[%.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | "
+                "%.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f]\n",
+                wp[0],wp[1],wp[2],wp[3],wp[4],wp[5],wp[6],
+                wp[7],wp[8],wp[9],wp[10],wp[11],wp[12],wp[13],wp[14],wp[15],
+                have_view, have_proj,
+                g_effect_xform[0],g_effect_xform[1],g_effect_xform[2],g_effect_xform[3],
+                g_effect_xform[4],g_effect_xform[5],g_effect_xform[6],g_effect_xform[7],
+                g_effect_xform[8],g_effect_xform[9],g_effect_xform[10],g_effect_xform[11],
+                g_effect_xform[12],g_effect_xform[13],g_effect_xform[14],g_effect_xform[15]);
+    }
+    for (uint32_t t = 0; t < ntri; t++) {
+        svtx_t vt[3];
+        int ok = 1;
+        for (int k = 0; k < 3; k++) {
+            const shipv_t *v = &g_ship[t * 3 + k];
+            float cx = v->x*wvp[0] + v->y*wvp[4] + v->z*wvp[8]  + wvp[12];
+            float cy = v->x*wvp[1] + v->y*wvp[5] + v->z*wvp[9]  + wvp[13];
+            float cz = v->x*wvp[2] + v->y*wvp[6] + v->z*wvp[10] + wvp[14];
+            float cw = v->x*wvp[3] + v->y*wvp[7] + v->z*wvp[11] + wvp[15];
+            if (cw <= 1e-6f) { ok = 0; break; }
+            vt[k].x = g_vp_x + (cx / cw + 1.0f) * 0.5f * g_vp_w;
+            vt[k].y = g_vp_y + (1.0f - cy / cw) * 0.5f * g_vp_h;
+            vt[k].z = cz / cw;
+            vt[k].iw = 1.0f / cw;
+            vt[k].u = vt[k].v = 0.0f;
+            vt[k].color = v->color;
+            vt[k].valid = 1;
+        }
+        if (ok)
+            raster_array(vt, 3, 4, NULL, 0, 0, 1);
+    }
 }
 
 /* Experimental: drive the KonamiLogo manager directly.
@@ -812,6 +1156,77 @@ static void movie_draw_tick(void)
     }
 }
 
+/* Renderer smoke test for the XYZ pipeline: OTOMEDIUS_TEST_3D=1 draws a
+ * rotating cube with FVF XYZ|DIFFUSE through the same transform/raster path
+ * the game's 3D draws use.  It proves W*V*P, /w, viewport and the z-buffer
+ * without waiting for the .x model loader. */
+static void test_3d_draw(void)
+{
+    extern uint32_t emu_alloc(uint32_t size);
+    static uint32_t buf;
+    static float ang;
+    static const float cube[8][3] = {
+        {-1,-1,-1},{1,-1,-1},{1,1,-1},{-1,1,-1},
+        {-1,-1, 1},{1,-1, 1},{1,1, 1},{-1,1, 1}
+    };
+    static const uint8_t faces[12][3] = {
+        {4,5,6},{4,6,7}, {1,0,3},{1,3,2}, {0,4,7},{0,7,3},
+        {5,1,2},{5,2,6}, {3,7,6},{3,6,2}, {0,1,5},{0,5,4}
+    };
+    static const uint32_t fcol[6] = {
+        0xFFFF4040u, 0xFF40FF40u, 0xFF4040FFu,
+        0xFFFFFF40u, 0xFFFF40FFu, 0xFF40FFFFu
+    };
+    float ry[16], rx[16], world[16], view[16], proj[16];
+    float sw[16], sv[16], sp[16];
+    float c, s, f, aspect = (float)g_fb_w / (float)(g_fb_h ? g_fb_h : 1);
+    const float zn = 0.1f, zf = 100.0f;
+    uint32_t saved_fvf = g_fvf;
+
+    ang += 0.02f;
+    c = cosf(ang); s = sinf(ang);
+    memset(ry, 0, sizeof ry); ry[0] = c; ry[2] = -s; ry[5] = 1.0f;
+    ry[8] = s; ry[10] = c; ry[15] = 1.0f;
+    memset(rx, 0, sizeof rx); rx[0] = 1.0f; rx[5] = c; rx[6] = -s;
+    rx[9] = s; rx[10] = c; rx[15] = 1.0f;
+    mat_mul_row(world, ry, rx);
+    memset(view, 0, sizeof view);
+    view[0] = view[5] = view[10] = view[15] = 1.0f;
+    view[14] = 6.0f;                    /* camera at z = -6, looking +z */
+    f = 1.0f / tanf(0.5f * 1.04719755f); /* 60 degrees */
+    memset(proj, 0, sizeof proj);
+    proj[0] = f / (aspect > 0.01f ? aspect : 1.0f);
+    proj[5] = f;
+    proj[10] = zf / (zf - zn);
+    proj[11] = 1.0f;
+    proj[14] = -zn * zf / (zf - zn);
+
+    if (!buf)
+        buf = emu_alloc(36u * 16u + 16u);
+    for (int t = 0; t < 12; t++) {
+        for (int k = 0; k < 3; k++) {
+            uint32_t v = buf + (uint32_t)(t * 3 + k) * 16u;
+            const float *p = cube[faces[t][k]];
+            MF32(v + 0) = p[0];
+            MF32(v + 4) = p[1];
+            MF32(v + 8) = p[2];
+            M32(v + 12) = fcol[t / 2];
+        }
+    }
+    memcpy(sw, g_xform[2], sizeof sw);
+    memcpy(sv, g_xform[0], sizeof sv);
+    memcpy(sp, g_xform[1], sizeof sp);
+    memcpy(g_xform[2], world, sizeof world);
+    memcpy(g_xform[0], view, sizeof view);
+    memcpy(g_xform[1], proj, sizeof proj);
+    g_fvf = 0x042u;                     /* XYZ | DIFFUSE, stride 16 */
+    draw_up_vertices(4, 12, buf, 16);
+    memcpy(g_xform[2], sw, sizeof sw);
+    memcpy(g_xform[0], sv, sizeof sv);
+    memcpy(g_xform[1], sp, sizeof sp);
+    g_fvf = saved_fvf;
+}
+
 void render_present(void)
 {
     /* Diagnostic: OTOMEDIUS_QUIT_AT=n requests a clean quit at present n, so
@@ -880,6 +1295,10 @@ void render_present(void)
         }
         draw_up_vertices(5, 2, buf, 28);
     }
+    if (getenv("OTOMEDIUS_TEST_3D") && g_fb && g_stat.presents < 600)
+        test_3d_draw();
+    if (getenv("OTOMEDIUS_SHIP_OVERLAY") && g_fb)
+        render_draw_ship(NULL);
 test_done:
     movie_draw_tick();
     g_stat.presents++;
@@ -928,11 +1347,21 @@ void render_clear(int count, uint32_t rects, uint32_t flags, uint32_t color)
         g_clear = color & 0x00FFFFFFu;
         fb_fill(g_clear);
     }
+    if ((flags & 2) && g_zbuf) {
+        for (size_t i = 0, n = (size_t)g_zb_w * g_zb_h; i < n; i++)
+            g_zbuf[i] = 1.0f;
+    }
     platform_clear(flags, color);
 }
 
 void render_set_viewport(int x, int y, int w, int h)
 {
+    if (w > 0 && h > 0) {
+        g_vp_x = (float)x;
+        g_vp_y = (float)y;
+        g_vp_w = (float)w;
+        g_vp_h = (float)h;
+    }
     if (g_verbose > 1)
         fprintf(stderr, "render: viewport %d,%d %dx%d\n", x, y, w, h);
     platform_viewport(x, y, w, h);
@@ -980,6 +1409,7 @@ void render_set_stream(uint32_t stream, uint32_t vb, uint32_t offset, uint32_t s
     if (stream == 0) {
         g_stream_vb = vb;
         g_stream_stride = stride;
+        g_stream_off = offset;
     }
     platform_stream(stream, vb, offset, stride);
 }
@@ -991,6 +1421,8 @@ void render_set_fvf(uint32_t fvf)
 
 void render_set_indices(uint32_t ib, uint32_t base)
 {
+    g_ib = ib;
+    g_ib_base = base;
     platform_indices(ib, base);
 }
 
@@ -1014,6 +1446,8 @@ void render_draw(uint32_t prim, uint32_t base_vertex, uint32_t min_index,
                 indexed, prim_count, g_fvf, g_stream_stride, g_stream_vb,
                 g_tex0);
     }
+    draw_vb(prim, base_vertex, min_index, num_vertices, start_index, indexed,
+            prim_count);
     platform_draw(prim, base_vertex, min_index, num_vertices, start_index,
                   indexed, prim_count);
 }

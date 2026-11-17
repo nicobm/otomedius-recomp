@@ -454,16 +454,18 @@ int font_abc_widths(uint32_t handle, uint32_t first, uint32_t last, uint32_t abc
     for (c = first; c <= last; c++) {
         FT_UInt gi = FT_Get_Char_Index(f, c);
         int a = 0, b = 0, cc = 0;
-        uint32_t p = abc + (c - first) * 6;
+        uint32_t p = abc + (c - first) * 12;
         if (FT_Load_Glyph(f, gi, FT_LOAD_NO_BITMAP | FT_LOAD_NO_HINTING) == 0) {
             int adv = (int)(f->glyph->advance.x >> 6);
             a = (int)(f->glyph->metrics.horiBearingX >> 6);
             b = (int)(f->glyph->metrics.width >> 6);
             cc = adv - a - b;
         }
-        M16(p + 0) = (uint16_t)a;
-        M16(p + 2) = (uint16_t)b;
-        M16(p + 4) = (uint16_t)cc;
+        /* Windows ABC is three 32-bit fields (12 bytes).  The game reads
+         * abcA/abcB/abcC as dwords right after the call. */
+        M32(p + 0) = (uint32_t)a;
+        M32(p + 4) = (uint32_t)b;
+        M32(p + 8) = (uint32_t)cc;
     }
     FONT_UNLOCK();
     return 1;

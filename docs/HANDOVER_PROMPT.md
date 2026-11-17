@@ -1,13 +1,15 @@
 # Otomedius (Arcade) — Handover para sesión nueva
 
 > Copiar y pegar este documento entero como prompt inicial. El documento
-> canónico y exhaustivo es `docs/HANDOVER.md`; **§11 manda sobre §1–§10**.
+> canónico y exhaustivo es `docs/BOOKLET.md`; **§12 manda sobre §1–§11**.
+> Las reglas de operación (`INICIAR` / `TERMINAR`) están en `AGENTS.md` y en
+> `docs/BOOKLET.md` §0.
 > Repo: `/var/home/vm/Proyectos/SALA DE TRABAJO/otomedius-recomp`.
-> Estado del árbol: HEAD `c43c61f` + los cambios de la sesión del §11 **sin
-> commitear** (comprobar con `git status` / `git log -1`). No hagas commits ni
-> push sin pedirlo. **Nunca** escribas tokens en ficheros: el push va con
-> `GIT_ASKPASS` + variable de entorno. Este repo **no contiene datos del
-> juego**; el dump se traduce en la máquina del usuario.
+> Estado del árbol: **limpio** en el commit de esta sesión (ver `git log -1`;
+> el hash se informa al cerrar la sesión). No hagas commits ni push sin
+> pedirlo. **Nunca** escribas tokens en ficheros: el push va con `GIT_ASKPASS`
+> + variable de entorno. Este repo **no contiene datos del juego**; el dump se
+> traduce en la máquina del usuario.
 
 ---
 
@@ -30,8 +32,7 @@ Directorios: `native/` (capa Linux), `tools/recomp/`, `recomp/` (seeds+sha),
 
 ```sh
 # compilar la capa nativa (solo los ficheros tocados) y enlazar
-sh ../.work/tools/build.sh patches.c d3dx9.c d3d9.c d3d9_objects.c \
-   win32_kernel32.c win32_misc.c font.c render.c x86rt.c
+sh ../.work/tools/build.sh render.c d3dx9.c patches.c font.c win32_misc.c
 
 # regenerar el juego (SOLO si cambia native/x86rt.h; tarda y recompila 85 rc_*.c)
 PYTHONPATH=../.work/pylib python3 tools/recomp/recomp.py \
@@ -43,10 +44,7 @@ OTOMEDIUS_SMOKE_LOG=/tmp/opencode/smoke.log sh tests/smoke.sh
 # corrida manual
 cd ../.work/oto
 SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy \
-  OTOMEDIUS_BOOTDBG=1 OTOMEDIUS_DUMP_FB=/tmp/opencode/h \
-  OTOMEDIUS_DUMP_AT=4400 OTOMEDIUS_DUMP_EVERY=600 \
-  OTOMEDIUS_QUIT_AT=9000 ../obj/otomedius-recomp . \
-  > /tmp/opencode/h.log 2>&1
+  OTOMEDIUS_BOOTDBG=1 OTOMEDIUS_QUIT_AT=4700 ../obj/otomedius-recomp .
 ```
 
 **Reglas de pruebas**
@@ -70,126 +68,103 @@ eye-catch → **attract con `CGameMan` y state 5** → HUD 2D visible.
 Cadena medida con `OTOMEDIUS_BOOTDBG=1`:
 
 ```
-present 4160  DEMO state=0
-present 4163  DEMO state=3 slot25c=10176d78
-present 4277  DEMO state=4
-present 4277  CGameMan ctor this=1018bca0
-present 4277  CGameMan ctor returned eax=1018bca0 mask220=00000000
-present 4278  DEMO state=5 slot260=1018bca0
-present 4398  DEMO state=5 (se mantiene)
+present 4251  CGameMan ctor returned, eax=… mask220=00000000
+present 4252  DEMO state=5 slot260=… mask220=00000000
+present 4286  DEMO state=5 (se mantiene)
 ```
 
-- Corrida headless con audio dummy hasta `OTOMEDIUS_QUIT_AT=9000`: **sin crash**,
+- Corrida headless con audio dummy hasta `OTOMEDIUS_QUIT_AT=9000`: sin crash,
   sin `no recompiled code`, sin agotar thunks.
-- Frame 6000: 129 quads / 258 vértices; HUD visible (retrato Player 1, barras,
-  botones). Fondo/escena **negro** (3D pendiente).
-- `tests/smoke.sh` pasa: state 5, `mask220=0`, exit 0.
+- En esta sesión se verificó `state=5`/`mask220=0` en corridas hasta 4400/4530;
+  el smoke formal de 4700 **no se rerunneó** (ver §12.5 del booklet).
+- **Pipeline XYZ nuevo** en `render.c`: `W*V*P`, `/w`, viewport, z-buffer,
+  UV perspective-correct y `DrawPrimitive`/`DrawIndexedPrimitive` con
+  vertex/index buffers. El test `OTOMEDIUS_TEST_3D=1` dibuja un cubo sólido.
+- **Nave HLE visible**: `D3DXLoadMeshHierarchyFromXInMemory` construye una
+  jerarquía de 5 frames con el `ID3DXAllocateHierarchy` del juego y cuelga un
+  contenedor con una nave sintética. `OTOMEDIUS_SHIP_OVERLAY=1` la muestra en
+  el centro; el HUD 2D se dibuja completo.
+- **Texto del HUD**: la mayor parte ya se lee. La línea larga del warning rojo
+  sigue solapándose.
+
+Lo que falta: el **3D real del juego** (`.x` + cámara) y el texto largo.
 
 ---
 
 ## 3. Qué se arregló en la sesión anterior (y no hay que volver a tocar)
 
-1. **`ID3DXEffect` stub real** (`native/d3dx9.c`) — la causa raíz del bloqueo.
-   `D3DXCreateEffect` devolvía `E_FAIL`, el build de `Stage01.pak` abortaba
-   (2302/2306) y el pak nunca quedaba ready; `CGameMan::CGameMan` (0x42E1F0)
-   logueaba 1036 "Not load pak STAGE" y `0x403DB0` ponía
-   `[0x5DE220] = 0xFFFFFFFF`. Ahora devuelve `S_OK` con un objeto de 79
-   métodos (`GetParameter*`/`GetTechnique*`/`GetPass*` no nulos, `Begin`
-   escribe `passes=1`, `SetTexture`→stage 0, `SetMatrix` guarda la matriz).
-2. **`AddFontMemResourceEx` real** (`win32_misc.c` + `font.c`): registra las
-   fuentes del juego (`DFGothic-SU`, `DFMincho-SU`, `DFMaruGothic-Bd`,
-   `DFPOP2-W9`, `DFPOPCorn-W12`, `DFGothicP-W5`) con `FT_New_Memory_Face`.
-   `OTOMEDIUS_SYSFONT=1` vuelve a la fuente del sistema.
-3. **Arenas de memoria** (`win32_kernel32.c`): `HEAP 0x10000000–0x20000000`,
-   `MAP 0x20000000–0x30000000`, `PAGE 0x30000000–0x60000000`. La ventana de
-   `MapViewOfFile` se solapaba con el heap y las paks del Title escribían encima
-   de listas de jobs (`fn = 0xc954c1a1`). `UnmapViewOfFile` ahora libera.
-4. **Vtables COM compartidas** (`d3d9.c`): una por clase, no una por objeto.
-   Antes ~3000 texturas agotaban la tabla fija de 0x10000 thunks.
-5. **`D3DXVec3TransformArray` / `NormalArray`**: firma real de **6** args
-   `(pOut, OutStride, pV, VStride, pM, n)`. La tabla decía 5: dejaba 4 bytes por
-   llamada en la pila y corrompía direcciones de retorno. `Vec3Transform` ahora
-   escribe `w`.
-6. **`GetBackBuffer` + `s_GetDesc`**: surface real 1280×1024 A8R8G8B8 y
-   `D3DSURFACE_DESC` relleno; `0x4505E0` los usa para crear su render target.
-7. **Workaround 3D** (`patches.c`, `0x4ECBF3`): si `CPlayer02::Init` encuentra
-   `scene+0x150` vacío (interfaz de animación `.x` que no cargamos), instala un
-   objeto COM vacío (`model_stub`). Evita el `call [0]`; **no dibuja la nave**.
-8. **`tests/smoke.sh`** nuevo y utilidades: `OTOMEDIUS_TRIPWIRE` (`x86rt.c`),
-   `OTOMEDIUS_TEXDUMP` (`render.c`), `OTOMEDIUS_EFFECTDBG`, `OTOMEDIUS_TEXDBG`,
-   `OTOMEDIUS_MALLOCDBG`, `OTOMEDIUS_WATCHDOG`.
+1. **Test de interior del triángulo invertido** (`native/render.c`). El
+   rasterizador saltaba el interior y dibujaba el complemento. Con eso las
+   caras 3D desaparecían y los quads 2D muestreaban las UV del otro triángulo.
+   Ahora se dibuja solo si `w0,w1,w2` tienen el mismo signo.
+2. **`GetCharABCWidthsA` con `ABC` de 12 bytes** (`native/font.c`,
+   `native/win32_misc.c`). La API usa `int abcA; UINT abcB; int abcC` (tres
+   dwords); el layout compacto de 6 bytes rompía los avances y solapaba texto.
+3. **`D3DXLoadMeshHierarchyFromXInMemory`: `ppFrame=arg6`, `ppAnim=arg7`**
+   (`native/d3dx9.c`). El stub los tenía invertidos; con la jerarquía real el
+   juego llamaba a la vtable del frame y moría en `10041408`.
+4. **Heap local**: crear 70–81 frames por cada `.x` (~80 cargas) agotaba el
+   heap y abortaba el pak (`2207/2206/2310/2306`). Ahora solo se sintetiza
+   jerarquía para el `.x` que contiene `p02_*` (modelo del jugador), con 5
+   frames, y `D3DXFrameDestroy` libera los frames con el `DestroyFrame` del
+   juego.
+5. **Protocolo de sesión**: `AGENTS.md` (nuevo) y `docs/BOOKLET.md` §0 con
+   `INICIAR` / `TERMINAR`. `docs/HANDOVER.md` se renombró a `docs/BOOKLET.md`.
 
 ---
 
-## 4. Bloqueo activo: la capa 3D
+## 4. Bloqueos activos
 
-El attract ya corre, pero la escena 3D no se dibuja (`draw=0` en todos los
-frames; el HUD sí sale porque es 2D).
+### 4.1 Modelo `.x` real
+- `Data/Player02.pak` es un **CAB (`MSCF`)** con `Player02.bin`; el `.bin` es
+  un contenedor de chunks: `TXGP` (texturas DDS), `POF0`, `MESH`, `CONF`.
+- El chunk `MESH`: `u32 count=1`, `u32 name_size=0x0c`,
+  `u32 data_size=0x3df2e0`, `"player02.x\0\0"`, y un `.x` **binario**
+  (`xof 0303bin 0032`) de 4.059.840 bytes. Templates: `Frame`,
+  `FrameTransformMatrix`, `Mesh`, `MeshMaterialList`, `MeshNormals`,
+  `MeshTextureCoords`, `SkinWeights`, `AnimationKey`. El primer frame de datos
+  (`p02_master`) está hacia `0x582d2`.
+- `CPlayer02`: vtable `0x56CAFC`, `Init` `0x4ECBE0`. `CModel` (0x48 bytes):
+  `+0` root frame, `+8` array de nodos (entradas de 0x70), `+0x14` anim.
+  `CPlayer02::Init` toca `node[3]`; otra clase toca `node[68]`.
+- Contenedor del juego: vtable `0x5590AC` (estático) / `0x559088` (skinned);
+  `CreateMeshContainer` devuelve `container+4`; el draw original `0x415DF0`
+  usa el renderer `[container+0x28]` y `mesh->DrawSubset`. El HLE sustituye
+  esa vtable por una nativa.
 
-### 4.1 Modelos `.x`
-- `CPlayer02`: vtable **`0x56CAFC`**, RTTI **`0x58AE20`**; el método índice 2 es
-  **`0x4ECBE0`**. Ese método hace:
-  ```
-  0x4ECBF3  mov eax,[esi+0x94]      ; scene
-  0x4ECBF9  mov eax,[eax+8]         ; model root (b)
-  0x4ECBFC  mov ecx,[eax+0x150]     ; animation interface  ← 0 en este port
-  0x4ECC02  mov ecx,[ecx+0x44]      ; null → xor ecx,ecx → call [0]
-  ```
-- La interfaz la produce el loader `.x`: **`0x414960`** llama a
-  `D3DXLoadMeshHierarchyFromXInMemory` en **`0x4149FE`**. Nuestro stub devuelve
-  `S_OK` con frame/animación NULL.
-- La constructora base de Player es **`0x4EA0E0`**; `CPlayer02` está en
-  **`0x4ECA11`–`0x4ECA50`** (pone `[esi]=0x56CAFC` y `or [b+0x154],1`).
-- Decidir entre: (a) parser `.x` mínimo (frames + mesh + materiales) usando la
-  `ID3DXAllocateHierarchy` que pasa el juego, o (b) HLE de los datos que el
-  juego espera, leyendo los chunks reales de `Player02.pak`/`Stage01.pak`.
-  Los `.x` están dentro de los paks; `Stage01.pak` son ~10,7 MB.
+### 4.2 Cámara / VIEW
+- El juego usa `ID3DXEffect::SetMatrix` para el camino de shaders, pero el stub
+  devuelve un handle constante (`0xe0000001`) y solo guarda la última matriz.
+  No se distingue World/View/Projection. `render_draw_ship` centra la nave
+  cuando no hay VIEW; es un workaround, no la cámara final.
+- Las matrices de proyección sí se ven (`[0.640 … | 0.800 … | 1.010 1 | -30.303]`),
+  y el mundo llega como primer argumento del draw del contenedor.
 
-### 4.2 Pipeline XYZ / draw
-- `render.c` ya guarda `WORLD/VIEW/PROJ` en `g_xform[3][16]` y la última matriz
-  del efecto en `g_effect_xform` (`render_set_effect_matrix`).
-- Faltan: transformar vértices XYZ (FVF `0x142`/`0x144`), dividir por `w`,
-  viewport, z-test, UV perspective-correct, y enlazar `DrawPrimitive` /
-  `DrawIndexedPrimitive` con los vertex/index buffers (ya hay `SetStreamSource`,
-  `SetIndices`, `Lock`).
-- `dev_DrawPrimitive` ya llama a `render_draw(..., indexed=0)`; el problema es
-  que el camino de vértices no interpreta posiciones 3D y descarta.
+### 4.3 Texto largo del warning
+- La línea larga del warning rojo sigue solapándose. El `ABC` de 12 bytes
+  mejoró el resto; falta revisar el wrapping/avance del renderer de texto para
+  cadenas largas y el blending.
 
-### 4.3 HUD / texto
-- La tira **512×64 DXT5** (`obj 60915380`) decodifica bien (es una fila de
-  botones hexagonales). En el frame 4400 se dibuja un quad ancho
-  `(368,40)–(636,40)` con `u 0.000–0.524`, y quads de 16 px con
-  `u 0.531–0.563`: revisar UV por celdas, blending y estados.
-- El texto amarillo ilegible del HUD probablemente comparte esa causa
-  (UV/escala/estado), no el decode DXT.
-- `FreeLocal error 1172/1173/1174` al teardown **solo con `BOOTDBG`**; en
-  corrida normal no aparecen. Sospecha: datos `.x` ausentes + objeto falso.
-
-### 4.4 Rendimiento / detalles
-- Rasterizador software ~26–36 fps. Quad nativo `0x43F540` con X duplicada.
-- El mezclador dsound→SDL y el vídeo están resueltos; el audio en Flatpak
-  necesita `--socket=pulseaudio`.
+### 4.4 Rendimiento
+- Rasterizador software ~26–36 fps. Perfilar `draw_tri`/`tex_sample` cuando el
+  3D real esté en marcha.
 
 ---
 
 ## 5. Plan inmediato (3 pasos)
 
-1. **Entender qué espera `CPlayer02` de `+0x150`**
-   - Desensamblar `0x414960`, `0x4EA0E0`, `0x4ECA11`, `0x4ECBE0` y los métodos
-     de la vtable `0x56CAFC`.
-   - Ver la `ID3DXAllocateHierarchy` del juego (probablemente en `0x414960`) y
-     qué hace con `ppFrame`/`ppAnim`.
-   - Decidir parser `.x` vs HLE. Si es HLE, extraer los chunks reales del pak y
-     rellenar las estructuras que el juego espera.
-2. **Pipeline XYZ en `render.c`**
-   - Implementar FVF `0x142`/`0x144`: `v' = v · W · V · P`, `/w`, viewport,
-     z-buffer, UV perspective-correct.
-   - Enlazar `DrawPrimitive`/`DrawIndexedPrimitive` con los buffers.
-   - Verificar con `OTOMEDIUS_DRAWDBG=<frame>` y dumps PPM/PNG.
-3. **HUD y rendimiento**
-   - Corregir el quad ancho de la tira de botones (UV por celdas/estado) y el
-     texto.
-   - Perfilar `draw_tri`/`tex_sample` (evitar pow/divisiones por píxel).
+1. **Parser `.x` mínimo / `ID3DXMesh` real**
+   - Leer el `.x` binario del chunk `MESH`: frames, vértices, caras,
+     materiales, UVs y normales.
+   - Sustituir la nave sintética por la malla real; mantener el HLE como
+     fallback (`OTOMEDIUS_NO_SHIP=1`).
+2. **Cámara real**
+   - Guardar matrices de efecto por handle (o identificarlas por forma) y
+     distinguir World/View/Projection.
+   - Quitar el centrado de `render_draw_ship` cuando haya VIEW.
+3. **HUD/texto y rendimiento**
+   - Corregir la línea larga del warning; revisar blending/estado.
+   - Perfilar `draw_tri`/`tex_sample`.
 
 ---
 
@@ -201,11 +176,12 @@ frames; el HUD sí sale porque es 2D).
 | `CGameMan::CGameMan` | `0x42E1F0`; slot `0x5DE260`; mask `0x5DE220` |
 | `CDemoPlayMan` slot | `0x5DE258`; eye-catch `0x5DE25C` |
 | `0x403DB0` | log + **pone `[0x5DE220] = 0xFFFFFFFF`** (suspende managers) |
-| 2302/2306 | `0x418C6A` / `0x41812B` (build de pak) |
-| 1036 STAGE | `0x42E1F0` (`0x55BD5C`) |
-| `AddFontMemResourceEx` | `0x4190FE` (2313 si falla) |
-| `CPlayer02` vtable | `0x56CAFC`, método 2 `0x4ECBE0` |
-| Loader `.x` | `0x414960`, llamada `0x4149FE` |
+| `CPlayer02` vtable / Init | `0x56CAFC` / `0x4ECBE0` |
+| `CModel` | 0x48 bytes; `+0` root frame, `+8` nodos (0x70), `+0x14` anim |
+| `D3DXFRAME` layout | Name +0, matrix +4, pMeshContainer +0x44, sibling +0x48, child +0x4c |
+| Loader `.x` | `0x414960`; allocator `0x559074`; `CreateFrame` `0x4167A0` |
+| Contenedor | vtable `0x5590AC` / `0x559088`; draw `0x415DF0` |
+| `ID3DXEffect::SetMatrix` | handle constante `0xe0000001`; hace falta mapear por handle |
 | Back buffer → texture | `0x4505E0` |
 | Device D3D9 | `[0x5E1F20]`; `g_xform` en `render.c` |
 | Job list runner | `0x4095A0` (registros `{prio, fn, arg}` de 12 B) |
@@ -216,12 +192,18 @@ frames; el HUD sí sale porque es 2D).
 
 - **Ghidra MCP** del handover: no está en el catálogo de esta sesión.
 - **REA** (MCP) está disponible pero su provider Ghidra **falla**:
-  `GhidraLaunchError` (`launch.properties` del Flatpak). Se usó
-  `capstone` local, `../.work/gen/rc_*.c` e instrumentación runtime.
+  `GhidraLaunchError` (`launch.properties` del Flatpak). Se usó `capstone`
+  local, `../.work/gen/rc_*.c` e instrumentación runtime.
 - `OTOMEDIUS_WATCHDOG=1`: estado de todos los hilos cada 2 s.
 - `OTOMEDIUS_TRIPWIRE=<addr[,addr…]>`: detecta escrituras salvajes.
 - `OTOMEDIUS_TEXDUMP=WxH`: PPM de una textura decodificada.
 - `OTOMEDIUS_DRAWDBG=<frame>`: draws, FVF, textura, estados, matrices.
+- `OTOMEDIUS_3DDBG=1`: matrices del efecto, draws de la nave y conteo de nodos.
+- `OTOMEDIUS_TEST_3D=1`: cubo XYZ de prueba (transform + z-buffer).
+- `OTOMEDIUS_SHIP_OVERLAY=1`: dibuja la nave HLE encima de todo (diagnóstico).
+- `OTOMEDIUS_SHIP_CENTER=0`: desactiva el centrado de la nave.
+- `OTOMEDIUS_USE_EFFECT_XFORM=1`: usa `g_effect_xform` como WVP.
+- `OTOMEDIUS_NO_SHIP=1`: desactiva la jerarquía HLE (vuelve al stub NULL).
 - `OTOMEDIUS_TEXFMT=1` / `OTOMEDIUS_TEXDBG=1`: formatos DDS / creaciones.
 - `OTOMEDIUS_EFFECTDBG=1`: blobs de `D3DXCreateEffect`.
 - `OTOMEDIUS_MALLOCDBG=1`: `MallocLocal` (junto a `OTOMEDIUS_BOOTDBG`).
@@ -231,25 +213,28 @@ frames; el HUD sí sale porque es 2D).
 ## 8. Ficheros clave (sesión anterior)
 
 ```
-M native/d3dx9.c           ID3DXEffect; Vec3TransformArray 6 args; w
-M native/d3d9.c            vtables compartidas; back buffer real
-M native/d3d9_objects.c    GetDesc de surface; TEXDBG
-M native/win32_kernel32.c  arenas heap/map; UnmapViewOfFile real
-M native/win32_misc.c      AddFontMemResourceEx real
-M native/font.c            fuentes en memoria; OTOMEDIUS_SYSFONT
-M native/patches.c         0x4ECBF3 workaround; BOOTDBG/MALLOCDBG acotado
-M native/render.c          render_set_effect_matrix; OTOMEDIUS_TEXDUMP
-M native/x86rt.c           OTOMEDIUS_TRIPWIRE
-A tests/smoke.sh           test de humo headless
-M docs/HANDOVER.md         §11
+M native/render.c          pipeline XYZ, z-buffer, viewport, UV perspective-
+                           correct, draw_vb, HLE ship, test 3D, fix inside test
+M native/d3dx9.c           jerarquía HLE, D3DXFrameDestroy, fix ppFrame/ppAnim,
+                           3DDBG de matrices de efecto
+M native/d3d9.h            render_draw_ship, buffer_data
+M native/d3d9_objects.c    buffer_data() para el rasterizador
+M native/font.c            ABC de 12 bytes
+M native/win32_misc.c      fallback de ABC de 12 bytes
+M native/patches.c         BOOTDBG de 0x415CE0 (conteo de nodos)
+M README.md                estado y protocolo de sesión
+M docs/BOOKLET.md          §12
 M docs/HANDOVER_PROMPT.md  este documento
+A AGENTS.md                protocolo INICIAR / TERMINAR
+R docs/HANDOVER.md         renombrado a docs/BOOKLET.md
 ```
 
 ---
 
 ## 9. Reglas de la sesión
 
-- No commits ni push sin pedirlo.
+- Protocolo completo: `AGENTS.md` y `docs/BOOKLET.md` §0.
+- No commits ni push sin pedirlo (`TERMINAR`).
 - Nunca tokens en ficheros; `GIT_ASKPASS` + entorno.
 - Tests con `SDL_AUDIODRIVER=dummy` (silencio).
 - Logs mínimos; no volcar logs enteros.

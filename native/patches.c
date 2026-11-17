@@ -104,6 +104,9 @@ int x86_patch_call(uint32_t addr)
                     render_presents(), (unsigned)addr, cpu->esi, cpu->ebx,
                     M32(cpu->esp + 4u), M32(0x5BC914u), M32(0x5BC918u),
                     M32(0x5BC91Cu), M32(0x5DCF90u), M32(0x5DCF94u));
+        } else if (addr == 0x415CE0u) {
+            fprintf(stderr, "bootdbg: [present %u] 415ce0 model build count(ebx)=%u "
+                    "model=%08x\n", render_presents(), cpu->ebx, cpu->esi);
         } else if (addr == 0x4142B0u) {
             uint32_t desc = M32(cpu->esp + 4u), size = M32(cpu->esp + 8u);
             static unsigned nmalloc;

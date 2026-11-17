@@ -322,6 +322,24 @@ static const method_t buffer_methods[] = {
     {b_GetDesc, 2},   /* GetDesc */
 };
 
+const void *buffer_data(uint32_t obj, uint32_t *size, int *is_index,
+                        uint32_t *format)
+{
+    buffer_t *b;
+    if (!obj)
+        return NULL;
+    b = buf(obj);
+    if (b->size > 0x40000000u)
+        return NULL;
+    if (size)
+        *size = b->size;
+    if (is_index)
+        *is_index = b->is_index;
+    if (format)
+        *format = b->format;
+    return MEM + b->data;
+}
+
 uint32_t buffer_create(uint32_t size, uint32_t usage, uint32_t fvf, int is_index)
 {
     uint32_t obj = com_create_named("IDirect3DVertexBuffer9", buffer_methods,

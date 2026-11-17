@@ -1,4 +1,4 @@
-# Otomedius (Arcade) — Technical Handover
+# Otomedius (Arcade) — Booklet de ingeniería
 
 > Static recompilation of the 2008 Konami arcade shooter **Otomedius** to native
 > Linux x86-64, packaged as a Flatpak. **This repository contains no game data**;
@@ -23,9 +23,9 @@
 > (WMV3 640x512, `Data/OTOMEDIUS_OP_f.wmv`) dentro de la **textura real del
 > `TextureRenderer` del juego**, con **audio** (WMAv2 -> SDL3), y se corrigió
 > el **cierre con Esc a mitad de vídeo** (cuelgue del hilo de audio + `call`
-> a NULL en `0x4050B0`). Detalle completo en **§7**. Este documento es el
-> prompt de transferencia para una sesión nueva; el repo es
-> `/var/home/vm/Proyectos/SALA DE TRABAJO/otomedius-recomp`.
+> a NULL en `0x4050B0`). Detalle completo en **§7**. El prompt de la sesión
+> nueva está en [`docs/HANDOVER_PROMPT.md`](HANDOVER_PROMPT.md); este booklet
+> es la referencia canónica y acumulativa del port.
 >
 > **Última sesión: ver §9** (loader sin carreras, logo de Konami visible,
 > tabla de thunks fija, rasterizador con estados D3D, fondo del Title roto).
@@ -34,6 +34,50 @@
 > **Sesión más reciente: ver §11** (el attract corre: `ID3DXEffect` real,
 > fuentes del juego, arenas heap/map separadas, back buffer y HUD 2D; falta
 > el 3D `.x`/XYZ). Donde §1–§10 contradigan a §11, manda §11.
+
+---
+
+## 0. Protocolo de sesión (`INICIAR` / `TERMINAR`)
+
+Este repositorio usa un protocolo explícito para que una sesión nueva de IA
+sepa qué hacer sin improvisar. Las reglas operativas completas están en
+[`AGENTS.md`](../AGENTS.md); este es el resumen.
+
+### 0.1 `INICIAR`
+
+El usuario envía `INICIAR` junto con la cuenta, el repositorio, el email y el
+token de GitHub. La IA debe:
+
+1. Leer `AGENTS.md`, este booklet (empezando por la sección más reciente, hoy
+   §11) y `docs/HANDOVER_PROMPT.md`.
+2. Comprobar `git log -1` y `git status` para no pisar trabajo sin commitear.
+3. Compilar solo lo tocado y correr `tests/smoke.sh` antes de cambiar código.
+4. Continuar el plan de `docs/HANDOVER_PROMPT.md` §5.
+
+El token **nunca** se escribe en un fichero ni se pasa en un argumento visible:
+se usa desde una variable de entorno con `GIT_ASKPASS` cuando toque hacer push.
+
+### 0.2 `TERMINAR`
+
+El usuario envía `TERMINAR`. Solo entonces la IA puede:
+
+1. Correr los tests (`tests/smoke.sh`, audio dummy).
+2. Actualizar `README.md`, este booklet (nueva sección de sesión al final, con
+   el estado verificado y los bloqueos) y `docs/HANDOVER_PROMPT.md`.
+3. Hacer `git add`, commit descriptivo y `git push origin master`.
+4. Informar el hash del commit y el resultado del push.
+
+Sin `TERMINAR` (o permiso explícito del usuario) **no se hace commit ni push**.
+Las secciones de sesión son acumulativas: la última manda sobre las anteriores.
+
+### 0.3 Reglas permanentes
+
+- Tests siempre con `SDL_AUDIODRIVER=dummy`.
+- Logs mínimos: `OTOMEDIUS_QUIT_AT` bajo y `grep`/`head`/`tail`; no volcar logs
+  enteros al contexto.
+- No datos del juego en el repo; el dump se traduce en la máquina del usuario.
+- Tocar `native/x86rt.h` obliga a regenerar y recompilar los 85 `rc_*.c`.
+- Antes de tocar algo dudoso, `git diff` para no pisar trabajo del usuario.
 
 ---
 
@@ -155,7 +199,7 @@ otomedius-recomp/
 ├── recomp/exe.sha256     c55796ad1f2d6ea9bd0fb0d33ed6b6eb6463d0e3ad8f2e1d7c4608ca9dfcf112
 ├── recomp/seeds.txt      NEW: 7 manual entry points the discovery misses
 ├── tests/platform_null.c headless backend
-└── docs/HANDOVER.md      this file
+└── docs/BOOKLET.md      this file
 ```
 
 ### 1.5 Diagnostic switches (all implemented, keep them)
@@ -967,14 +1011,14 @@ escribir esto; el commit se hará al cerrar la sesión):
 M native/avs.c        # coin counter returns 1; BMS clock arg/real time
 M native/patches.c    # shader error ignore, bookkeep skip, boot state force
 M native/render.c     # OTOMEDIUS_KONAMI experimental hook
-M docs/HANDOVER.md    # this document
+M docs/BOOKLET.md    # this document
 ```
 
 Los cambios de la sesión anterior (`font.c`, `font.h`, `d3d9*.c`,
 `win32_misc.c`, `x86rt.c`, `emit.py`, manifiesto) ya están en el commit
 `aff81d6`.
 
-`docs/HANDOVER.md` y `README.md` también se actualizan en el checkpoint.
+`docs/BOOKLET.md` y `README.md` también se actualizan en el checkpoint.
 
 Artefactos locales (fuera del repo): `.work/gen` regenerado (85 ficheros con
 `--chunk 60`), `.work/obj` reconstruido, `.work/freetype_include` y
@@ -1240,7 +1284,7 @@ M native/font.c           nombre de fuente CP932 -> UTF-8 en el log
 M native/patches.c        OTOMEDIUS_BOOTDBG + 0x4050B0 tolerante
 M tests/platform_null.c   stubs de audio
 M flatpak/..-launch       copia bezel.png; LD_LIBRARY_PATH codecs-extra
-M README.md, docs/HANDOVER.md
+M README.md, docs/BOOKLET.md
 ```
 
 ---
@@ -1433,7 +1477,7 @@ M native/patches.c       boot sin forzados; id<16; commit id9 diferido;
                          guard de records muertos; clamp ±inf en 0x41C620;
                          temporizador real del vídeo; logs BOOTDBG
 M native/main.c          TEB check en TLS; backtrace + RIP/RSP al fallar
-M README.md, docs/HANDOVER.md
+M README.md, docs/BOOKLET.md
 ```
 
 ---
@@ -1602,7 +1646,7 @@ nativo del vídeo (`0x43F540`) con X duplicada; rendimiento ~26–36 fps
 
 ```
 Repo: /var/home/vm/Proyectos/SALA DE TRABAJO/otomedius-recomp (recompilación
-estática de Otomedius, Flatpak + SDL3). Lee docs/HANDOVER.md entero; manda §9.
+estática de Otomedius, Flatpak + SDL3). Lee docs/BOOKLET.md entero; manda §9.
 No hagas commits ni push sin pedirlo; nunca escribas tokens en archivos.
 Herramientas persistentes: .work/tools/{build.sh,xd.py,ppm2png.py}
 (sh .work/tools/build.sh <archivo.c>; gen: PYTHONPATH=../.work/pylib python3
@@ -1777,7 +1821,7 @@ M native/main.c           dsound_shutdown() antes de platform_shutdown()
 M native/win32.h          prototypes dsound_shutdown / render_dump_fb
 M native/render.c         render_dump_fb(); diagnósticos DISCARD/SKIP y
                           matrices WORLD/VIEW/PROJ
-M docs/HANDOVER.md        esta sección
+M docs/BOOKLET.md        esta sección
 A docs/HANDOVER_PROMPT.md documento de transferencia de 6 secciones para la
                           sesión siguiente (copiar/pegar como prompt inicial)
 ```
@@ -1986,9 +2030,169 @@ M native/patches.c         0x4ECBF3 workaround; BOOTDBG/MALLOCDBG acotado
 M native/render.c          render_set_effect_matrix; OTOMEDIUS_TEXDUMP
 M native/x86rt.c           OTOMEDIUS_TRIPWIRE
 A tests/smoke.sh           test de humo headless
-M docs/HANDOVER.md         esta sección
+M docs/BOOKLET.md         esta sección
 M docs/HANDOVER_PROMPT.md  prompt de la sesión siguiente
 ```
+
+> **Sesión más reciente: ver §12** (pipeline XYZ, bug del rasterizador,
+> `ABC` de 12 bytes, jerarquía HLE del modelo y nave visible). Donde §1–§11
+> contradigan a §12, manda §12.
+
+---
+
+## 12. Sesión 2026-11-16 (sexta parte): pipeline XYZ, rasterizador corregido y HLE del modelo
+
+> **Esta sección manda sobre §1–§11.** El attract sigue llegando a `state=5`
+> con `mask220=0`. Se completó el camino de vértices XYZ, se corrigieron dos
+> bugs de base (el test de interior del triángulo y el tamaño del `ABC`) y se
+> añadió una jerarquía de frames HLE para que el modelo del jugador se dibuje
+> mientras se implementa el parser `.x` real.
+
+### 12.1 Causas raíz corregidas
+
+1. **Test de interior del triángulo invertido** (`native/render.c`).
+   El rasterizador saltaba los píxeles con `w0,w1,w2` del mismo signo (el
+   interior) y dibujaba el complemento. En un quad de dos triángulos cada
+   mitad acababa muestreando las UV del *otro* triángulo; en un triángulo
+   suelto desaparecía el interior y se veía el exterior. Esto explicaba las
+   caras negras del cubo de prueba y buena parte del texto/HUD raro. El test
+   correcto es: dibujar solo si los tres pesos tienen el mismo signo.
+2. **`GetCharABCWidthsA` escribía 6 bytes por carácter** (`native/font.c`,
+   `native/win32_misc.c`). La API de Windows usa `ABC` de **12 bytes**
+   (`int abcA; UINT abcB; int abcC`). El juego lee los tres campos como
+   dwords justo después de la llamada; con el layout compacto los avances
+   salían gigantes y el texto se solapaba. Ahora se escriben 12 bytes.
+3. **`D3DXLoadMeshHierarchyFromXInMemory`: `ppFrame`/`ppAnim` invertidos**
+   (`native/d3dx9.c`). La firma real es `ppFrameHierarchy = arg6` y
+   `ppAnimController = arg7`; el stub antiguo los tenía al revés. Con ambos a
+   NULL no se notaba, pero al devolver una jerarquía real el juego intentaba
+   llamar a la vtable del frame y moría en `no recompiled code at 10041408`.
+4. **Agotamiento del heap local al cargar `.x`** (`native/d3dx9.c`). El juego
+   llama al loader para ~80 `.x`; crear 70–81 frames por cada uno agotaba el
+   heap local y abortaba el build del pak con `2207:Failed Alloc FrameInfs`,
+   `2206:Failed SetupFrameInf`, `2310:Failed Create Mesh` y
+   `2306:Failed Build`. Ahora solo se sintetiza jerarquía para el modelo del
+   jugador (el `.x` que contiene los nombres `p02_*`), con 5 frames, y
+   `D3DXFrameDestroy` libera los frames con el `DestroyFrame` del juego.
+
+### 12.2 Pipeline XYZ (`native/render.c`)
+
+- Parser de FVF: `XYZ`/`XYZRHW`, `NORMAL`, `PSIZE`, `DIFFUSE`, `SPECULAR` y
+  hasta 15 coordenadas de textura; calcula offsets y stride mínimo.
+- `WVP = WORLD * VIEW * PROJ` con convención row-vector de D3D, división por
+  `w`, viewport (`D3DVIEWPORT9`) y `z` NDC. Los triángulos con `w <= 0` se
+  descartan (clipping grueso; falta clipping real del near plane).
+- **Z-buffer** (`g_zbuf`, `float` 0..1) con `D3DRS_ZENABLE`,
+  `D3DRS_ZWRITEENABLE` y `D3DRS_ZFUNC`; se limpia con `D3DCLEAR_ZBUFFER`.
+- **UV perspective-correct**: se interpolan `u/w`, `v/w` y `1/w` y se divide
+  al final. En 2D `iw = 1`, así que el camino anterior no cambia.
+- `DrawPrimitive`/`DrawIndexedPrimitive` leen el vertex buffer y el index
+  buffer reales (`buffer_data()` en `d3d9_objects.c`), soportan índices de 16
+  y 32 bits, `BaseVertexIndex` y offset de stream. `DrawPrimitiveUP` sigue
+  usando el camino inmediato.
+- Prueba visual: `OTOMEDIUS_TEST_3D=1` dibuja un cubo giratorio con
+  `FVF=0x042` (XYZ|DIFFUSE). Verificado: cubo sólido, caras y profundidad
+  correctas.
+
+### 12.3 HLE del modelo del jugador
+
+- `D3DXLoadMeshHierarchyFromXInMemory` construye los frames llamando al
+  **`ID3DXAllocateHierarchy` del propio juego** (`CreateFrame` en la vtable
+  `0x559074`), así el contador `allocator+4` que usa `0x414960` para dimensionar
+  el array de nodos queda correcto.
+- Layout de frame que espera el juego (0x68 bytes): `Name` en `+0`, matriz
+  `D3DXMATRIX` en `+4`, `pMeshContainer` en `+0x44`, `pFrameSibling` en
+  `+0x48`, `pFrameFirstChild` en `+0x4c`; extras `+0x50..+0x64`.
+- Jerarquía actual: root + 4 hijos (5 nodos). El contenedor se cuelga del
+  hijo 2, que es `node[3]` (el índice que usa `CPlayer02::Init`). El array de
+  nodos tiene entradas de `0x70` bytes y `entry+0 = frame`.
+- Contenedor nativo de 0x68 bytes con vtable **thiscall** propia:
+  método 0 = destroy, 1 = draw (3 args), 2 = init (7 args, no se usa),
+  3 = attach (1 arg). `container+0x20 = 0` hace que `0x416580` se salte la
+  validación de texturas; `frame+0x44 = container+4`.
+- El método draw lee la matriz de mundo del primer argumento (el juego pasa
+  `nodes+0x30`), y llama a `render_draw_ship()`. La nave es geometría sintética
+  (fuselaje, alas, cola, cabina y motor) con colores difusos; no usa texturas
+  todavía.
+- Como el juego no expone la VIEW por `SetTransform` en este camino, la nave se
+  centra en pantalla cuando no hay VIEW (`OTOMEDIUS_SHIP_CENTER=0` lo desactiva).
+  Es un workaround de diagnóstico, no la cámara final.
+- Verificado: `3ddbg: ship draw ...` aparece durante el attract y el dump con
+  `OTOMEDIUS_SHIP_OVERLAY=1` muestra la nave en el centro, con el HUD completo.
+
+### 12.4 Hallazgos del `.x` / los paks (para la próxima sesión)
+
+- `Data/Player02.pak` es un **CAB (`MSCF`)** que contiene `Player02.bin`. El
+  `.bin` es un contenedor de chunks: `TXGP` (texturas DDS), `POF0`, `MESH` y
+  `CONF`.
+- El chunk `MESH` tiene: `u32 count=1`, `u32 name_size=0x0c`,
+  `u32 data_size=0x3df2e0`, `"player02.x\0\0"`, y después un `.x` **binario**
+  (`xof 0303bin 0032`) de 4.059.840 bytes. Los templates incluyen `Frame`,
+  `FrameTransformMatrix`, `Mesh`, `MeshMaterialList`, `MeshNormals`,
+  `MeshTextureCoords`, `SkinWeights` y `AnimationKey`; el primer frame de datos
+  (`p02_master`) aparece hacia el offset `0x582d2`.
+- `CPlayer02`: vtable `0x56CAFC`, `Init` en `0x4ECBE0`. El `CModel` (0x48
+  bytes) guarda `+0 = root frame`, `+8 = array de nodos`, `+0x14 = anim
+  controller`. `CPlayer02::Init` toca `node[3]`; otra clase de player toca
+  `node[68]`.
+- Contenedor del juego: vtable `0x5590AC` (estático) o `0x559088` (skinned);
+  `CreateMeshContainer` devuelve `container+4`; el draw original `0x415DF0`
+  usa el renderer `[container+0x28]` y `mesh->DrawSubset`. El HLE sustituye
+  esa vtable por la nativa.
+- La cámara/VIEW del camino de shaders no se captura todavía: el juego usa
+  `ID3DXEffect::SetMatrix`, pero el stub devuelve un handle constante
+  (`0xe0000001`) y solo guarda la última matriz. Para la cámara real hay que
+  guardar matrices por handle (o identificarlas por forma) y distinguir
+  World/View/Projection.
+
+### 12.5 Estado verificado
+
+- `CGameMan` se construye con `mask220=00000000` y el attract llega a
+  `DEMO state=5`.
+- `OTOMEDIUS_TEST_3D=1`: cubo sólido con perspectiva y z-buffer.
+- `OTOMEDIUS_SHIP_OVERLAY=1`: nave HLE visible en el centro; el HUD 2D
+  (retrato, barras, botones) se dibuja completo.
+- Texto del HUD: la mayor parte ya se lee (el `ABC` de 12 bytes y el test de
+  interior corrigieron el layout); la línea larga del warning rojo sigue
+  solapándose y queda pendiente.
+- Corridas headless con audio dummy hasta 4400/4530 presentes: sin
+  `no recompiled code`, `DEMO state=5` y `CGameMan ctor returned …
+  mask220=00000000`. El smoke formal de 4700 presentes **no se rerunneó** en
+  esta sesión por tiempo/CPU; queda como verificación pendiente para la
+  próxima (el script tarda ~8–10 min con `BOOTDBG`).
+
+### 12.6 Ficheros de esta sesión
+
+```
+M native/render.c          pipeline XYZ, z-buffer, viewport, UV perspective-
+                           correct, draw_vb, HLE ship, test 3D, fix inside test
+M native/d3dx9.c           jerarquía HLE, D3DXFrameDestroy, fix ppFrame/ppAnim,
+                           3DDBG de matrices de efecto
+M native/d3d9.h            render_draw_ship, buffer_data
+M native/d3d9_objects.c    buffer_data() para el rasterizador
+M native/font.c            ABC de 12 bytes
+M native/win32_misc.c      fallback de ABC de 12 bytes
+M native/patches.c         BOOTDBG de 0x415CE0 (conteo de nodos)
+M README.md                estado y protocolo de sesión
+M docs/BOOKLET.md          esta sección
+M docs/HANDOVER_PROMPT.md  prompt de la sesión siguiente
+A AGENTS.md                protocolo INICIAR / TERMINAR
+R docs/HANDOVER.md         renombrado a docs/BOOKLET.md
+```
+
+### 12.7 Próximos pasos
+
+1. **Parser `.x` mínimo / `ID3DXMesh` real**: leer el `.x` binario del chunk
+   `MESH`, extraer frames, vértices, caras, materiales y UVs, y sustituir la
+   nave sintética por la malla real. Alternativa: mantener el HLE y mejorar la
+   nave/cámara.
+2. **Cámara real**: capturar VIEW/PROJ del camino de shaders (matrices por
+   handle de efecto) y quitar el centrado de `render_draw_ship`.
+3. **HUD/texto**: la línea larga del warning rojo sigue mal; revisar el
+   wrapping/avance del renderer de texto para cadenas largas y el estado de
+   blending.
+4. **Rendimiento**: perfilar `draw_tri`/`tex_sample`; el rasterizador software
+   sigue en ~26–36 fps.
 
 ---
 
