@@ -1,12 +1,13 @@
 # Otomedius (Arcade) — Handover para sesión nueva
 
 > Pegar este documento entero como prompt inicial. El documento canónico y
-> exhaustivo es `docs/BOOKLET.md`; **§14 manda sobre §1–§13**.
+> exhaustivo es `docs/BOOKLET.md`; **§15 manda sobre §1–§14** en lo relativo al
+> workflow de compilación, y §14 en el estado del port.
 > Las reglas de operación (`INICIAR` / `TERMINAR`) están en `AGENTS.md` y en
 > `docs/BOOKLET.md` §0.
 > Repo: `/var/home/vm/Proyectos/SALA DE TRABAJO/otomedius-recomp`.
 > `INICIAR` alcanza con el **token** de GitHub: la cuenta, el repo, el email y
-> la rama salen de `git remote`/`git config` (no hace falta escribirlos).
+> la rama salen de `git remote`/`git config`.
 > Estado del árbol: **limpio** en el commit de esta sesión. No hagas commits ni
 > push sin `TERMINAR`. **Nunca** escribas tokens en ficheros: el push va con
 > `GIT_ASKPASS` + variable de entorno de un único comando. Este repo **no
@@ -25,7 +26,7 @@
 | Compilador agente | `zig 0.17.1` como `cc` (`-O2 -std=gnu11 -w -Inative`) |
 | Compilador Flatpak | SDK `cc` (GCC) `-O2 -std=c11 -w -Inative` + `pkg-config sdl3 freetype2` |
 | Recompilador | Python 3 + **capstone 5.0.9** (`tools/recomp`) |
-| FreeType | 2.13.2 (headers/libs en `.work/freetype_include`, `.work/freetype_lib`) |
+| FreeType | 2.13.2 (`.work/freetype_include`, `.work/freetype_lib`) |
 
 Directorios: `native/` (capa Linux), `tools/recomp/`, `recomp/` (seeds+sha),
 `tests/`, `flatpak/`, `docs/`. `.work` está en el directorio **padre**:
@@ -63,7 +64,44 @@ SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy \
 
 ---
 
-## 2. Estado actual (verificado en esta sesión)
+## 2. Granja de compilación (recomp-farm) — leer antes de compilar
+
+El usuario mantiene una granja LAN fuera del repo:
+`~/Proyectos/SALA DE TRABAJO/recomp-farm` (script `recomp-farm.sh`, un master en
+esta VM y N workers). **El master no escucha**: sale él a los workers
+(`tcp/47824`); su CLI necesita `podman`, que el sandbox **no tiene**.
+
+El agente habla **TD1 directo contra los workers** con `tools/farm.py`, que lee
+el secreto y la lista de workers del volumen del master
+(`~/.local/share/containers/storage/volumes/recomp-farm-workspace/_data`).
+No hay IPs en el código.
+
+```sh
+python3 tools/farm.py status                    # workers vivos + slots
+python3 tools/farm.py scan                      # si la caché del master está vacía
+python3 tools/farm.py sync ../.work/farm-build  # sube el kit, imprime el sha256
+python3 tools/farm.py run --kit <sha> -- 'sh build-farm.sh shard-16.txt'
+python3 tools/farm.py run --sync DIR --collect ../.work/farm-out -- '<cmd>'
+```
+
+Reglas:
+- **Reproducibilidad obligatoria**: compilar en la granja con `-target
+  x86_64-linux-gnu.2.44`, `-ffile-prefix-map=$PWD=.`,
+  `-fdebug-compilation-dir=.` y `-ffile-prefix-map=$ZIGLIB=@zig` (receta en
+  `README.md` §Build farm; el `build-farm.sh` del kit ya la genera en un
+  `ccwrap`). Criterio: `sha256` de cada objeto **igual** al build local.
+- **Un solo escritor por árbol de objetos**: los `.o` de la granja se linkean
+  desde `.work/farm-out`, nunca se descomprimen sobre `.work/obj`.
+- El kit del build completo está en `../.work/farm-build` (50 MB: `native/` +
+  `gen/` + headers SDL3/FreeType + `build-farm.sh` + `shard-*.txt`).
+- Verificado el 2026-11-17: 105/105 objetos idénticos y **binario idéntico**
+  (`sha256 fb256033…`) con 2 workers; el smoke pasa.
+- El usuario es quien hace `up`/`down` de la granja; si no hay workers, pedíselo
+  en vez de intentar `podman`.
+
+---
+
+## 3. Estado actual (verificado)
 
 El juego arranca de punta a punta y **el smoke de 4700 pasa**:
 
@@ -74,41 +112,16 @@ jugador visible y texturado**.
 - `tests/smoke.sh`: **PASS** (`DEMO state=5`, `mask220=00000000`, sin
   `no recompiled code`, sin agotar thunks).
 - **El modelo se ve**: `render: frame 4320 … model=6/7998 clip=0 zout=0
-  px_model>0` (presentes ≈4230–4430; después la cámara entra dentro de
-  `zn=30` y el modelo se recorta, que es lo correcto).
+  px_model>0`.
 - **Cámara real**: `GetTransform(PROJECTION)` (0x414e96) y la matriz
-  cámara→mundo del nodo (`nodo+0x30`, invertida). El VIEW del dispositivo es
-  cero a propósito.
+  cámara→mundo del nodo (`nodo+0x30`, invertida).
 - **Luz real**: el efecto `LightDir`/`LightCol` (handles distintos).
 - **Texturado**: atlases `p02_body01`, `p02_bike01`, `p02_gun01`, `p02_hair`
-  decodificados desde la imagen del pak en memoria emulada y enlazados por
-  nombre de malla.
-- **DXT1/3/5 corregido**: la mezcla 1/3-2/3 se hace por canal (antes metía
-  motas de color en *todas* las texturas DXT).
+  decodificados del pak en memoria emulada y enlazados por nombre de malla.
+- **DXT1/3/5 corregido** (mezcla por canal).
 
 Lo que falta: el mapeo material→textura real del motor, el escenario/enemigos,
 el cartel de red, `REPLAY RAND ERROR`, el texto largo y los logos del boot.
-
----
-
-## 3. Qué se arregló en esta sesión (y no hay que volver a tocar)
-
-1. **Visibilidad (causa raíz)**: tabla `D3DCMP_*` corrida en `draw_tri`
-   (`native/render.c`). El default `LESSEQUAL` actuaba como `GREATEREQUAL` y
-   descartaba todas las caras 3D (y el quad de composición). Ver §14.1.
-2. **`GetTransform`** devuelve WORLD/VIEW/PROJ (identidad por defecto) —
-   `dev_GetTransform` + `render_get_transform`.
-3. **Composición del modelo**: `frameWorld × inverse_rígida(cámara)`
-   (`hle_mat_invert_rigid`); se eliminaron `default_view` y el centrado.
-4. **z-buffer por target**: `zbuf_bind()` con el stride del target actual.
-5. **Handles de efecto por parámetro** (`eff_param_handle`,
-   `eff_get_param_by_name`): `View`, `Proj`, `LightDir`, `LightCol`,
-   `SeaParam`, `FogParam`, `FogColor`.
-6. **Texturas**: nombres desde el pak en memoria (`<name>.dds` antes del
-   header) + barrido único de la memoria + decode bajo demanda. El `.x` no
-   trae `TextureFilename`; el mapeo es por nombre de malla.
-7. **DXT**: interpolación por canal en `dxt_color_block`
-   (`native/d3d9_objects.c`).
 
 ---
 
@@ -123,8 +136,8 @@ sustituye el contenedor, así que ese camino nunca corre. Dos vías:
 1. **Replicar el contenedor**: crear un contenedor con el layout del juego
    (`+0x20` manager, `+0x28` device, `+0x60` tabla de texturas, `+0x40` refcount)
    y llamar a `0x4163e0` con el `pAllocateHierarchyData` real, o
-  2. **Llamar al lookup** `0x416580` / `0x51ba2e` (`D3DXFrameFind`) desde la HLE
-     con el nombre del modelo y los materiales.
+2. **Llamar al lookup** `0x416580` / `0x51ba2e` (`D3DXFrameFind`) desde la HLE
+   con el nombre del modelo y los materiales.
 
 Mientras tanto el mapeo por nombre (`p02_*`) cubre las 6 mallas del jugador.
 
@@ -146,23 +159,14 @@ un store por modelo y una tabla de contenedores dinámica
    en `0x55beb0`) y si el CRT recompilado usa la secuencia de MSVC.
 3. **Material→textura** (ver §4) y blending/alpha del material
    (`p02_transparenceShape`).
-4. **Texto largo del warning** y logos del boot (§4.3, §13.8).
+4. **Texto largo del warning** y logos del boot (§4.3, §13.8 de `BOOKLET.md`).
+
+Si el trabajo es de compilación masiva (regenerar + 85 `rc_*.c` + 20 nativos),
+usar la granja (§2) y comparar `sha256` de los objetos con el build local.
 
 ---
 
-## 6. Reportes del usuario pendientes de diagnóstico
-
-1. **Logos de Konami/eAMUSE y warning "warpeados"** mientras animan. Descartado:
-   aspecto (escala uniforme en el compositor, 5:4 nativo). Falta comparar un
-   dump del boot (`OTOMEDIUS_DUMP_FB` + `DUMP_AT` 200/400/800) contra la
-   referencia.
-2. **Audio del vídeo "saltaba"**: `platform_audio_submit` descarta el chunk si
-   la cola supera ~200 ms; ahora loguea `audio: dropped N chunk(s), queue full`.
-3. **Cartel rojo de red** (nuevo): ver §5.1.
-
----
-
-## 7. Direcciones y globals útiles
+## 6. Direcciones y globals útiles
 
 | Cosa | Valor |
 |---|---|
@@ -173,42 +177,31 @@ un store por modelo y una tabla de contenedores dinámica
 | `CModel` | 0x48 bytes; `+0` root frame, `+8` nodos (0x70), `+0x14` anim |
 | `D3DXFRAME` layout | Name +0, matrix +4, pMeshContainer +0x44, sibling +0x48, child +0x4c |
 | Loader `.x` | `0x414960`; allocator `0x559074`; `CreateFrame` `0x4167A0`; `CreateMeshContainer` `0x416810` |
-| Contenedor draw / init / tex table | `0x416220` / `0x4163e0` / `0x416580` (+0x20 manager, +0x60 tabla, +0x40 refcount) |
+| Contenedor draw / init / tex table | `0x416220` / `0x4163e0` / `0x416580` |
 | Node walk | `0x415810` → `[container_vt+4](escena, nodo+0x30, nodo+0x20)` |
-| Proyección | `D3DXMatrixPerspectiveFovLH` → `0x5e26f0`; `SetTransform(PROJ, 0x5e31f0)`; fovy=1.7921, aspect=1.25, zn=30, zf=3000 |
-| Efecto `SetMatrix` (View/Proj/LightDir/LightCol) | `0x414ead` / `0x414edb` / `0x414ef2` / `0x414f09` |
-| Textura de escena (256×256) | `0x5E1EB8`; quad de composición `0x450316`/`0x5bebe0` |
+| Proyección | `D3DXMatrixPerspectiveFovLH` → `0x5e26f0`; fovy=1.7921, aspect=1.25, zn=30, zf=3000 |
+| Efecto `SetMatrix` | `0x414ead` / `0x414edb` / `0x414ef2` / `0x414f09` |
 | Device D3D9 | `[0x5E1F20]`; `g_xform` en `render.c` |
-| Job list runner | `0x4095A0` (registros `{prio, fn, arg}` de 12 B) |
+| Job list runner | `0x4095A0` (`{prio, fn, arg}` de 12 B) |
 | Mensaje de red | `REPLAY RAND ERROR %d/%d` en `0x55beb0` |
 
 ---
 
-## 8. Herramientas y diagnóstico
+## 7. Herramientas y diagnóstico
 
-- **REA** (MCP) está disponible. Para leer una función concreta alcanza con el
-  código recompilado: `../.work/gen/rc_*.c` (una función por `fn_XXXXXXXX`, con
-  los comentarios de cada instrucción).
-- `OTOMEDIUS_3DDBG=1`: draw del contenedor, matrices, `SetMatrix`,
-  `GetParameterByName`, `PerspectiveFovLH`.
-- `OTOMEDIUS_ORDERDBG=<present>`: orden desde ese present.
-- `OTOMEDIUS_RTDBG=1`: render targets (incluye back buffer) + present.
-- `OTOMEDIUS_VPDBG=1`: `SetViewport`/`SetTransform`/`PerspectiveFovLH`.
-- `OTOMEDIUS_TEXDBG=1`: `CreateTexture`, nombres de textura, `SetTexture`.
-- `OTOMEDIUS_HARVESTDUMP=1`: volcado de cada textura decodificada.
-- `OTOMEDIUS_MODELTEX=<file.dds>`: fuerza la textura del modelo.
-- `OTOMEDIUS_PAKDBG=<path>` / `OTOMEDIUS_PAKDUMP=<path>` /
-  `OTOMEDIUS_PAKSCAN=<present>`: chunks y nombres del pak en memoria.
-- `OTOMEDIUS_EFFECTDUMP=<dir>`: blobs de efecto.
-- `OTOMEDIUS_WATCHDOG=1`, `OTOMEDIUS_TRIPWIRE=<addr>`, `OTOMEDIUS_TEXDUMP=WxH`,
-  `OTOMEDIUS_TEXFMT=1`, `OTOMEDIUS_DRAWDBG=<present>`, `OTOMEDIUS_MALLOCDBG=1`.
-- Ficheros volcados útiles: `/tmp/opencode/tx4.ppm` (modelo texturado),
-  `/tmp/opencode/pak.x` (el `.x` extraído), `/tmp/opencode/pakimg.bin`
-  (imagen del pak, ~70 MB).
+- **REA** (MCP) disponible. Para leer una función concreta alcanza con el código
+  recompilado: `../.work/gen/rc_*.c` (una función por `fn_XXXXXXXX`).
+- `tools/farm.py`: granja (§2).
+- `OTOMEDIUS_3DDBG=1`, `ORDERDBG=<present>`, `RTDBG=1`, `VPDBG=1`, `TEXDBG=1`,
+  `HARVESTDUMP=1`, `MODELTEX=<file.dds>`, `PAKDBG=<path>`, `PAKDUMP=<path>`,
+  `PAKSCAN=<present>`, `EFFECTDUMP=<dir>`, `WATCHDOG=1`, `TRIPWIRE=<addr>`,
+  `TEXDUMP=WxH`, `TEXFMT=1`, `DRAWDBG=<present>`, `MALLOCDBG=1`.
+- Ficheros volcados útiles: `/tmp/opencode/tx4.ppm`, `/tmp/opencode/pak.x`,
+  `/tmp/opencode/pakimg.bin`.
 
 ---
 
-## 9. Reglas de la sesión
+## 8. Reglas de la sesión
 
 - Protocolo completo: `AGENTS.md` y `docs/BOOKLET.md` §0.
 - No commits ni push sin `TERMINAR`.
@@ -217,3 +210,5 @@ un store por modelo y una tabla de contenedores dinámica
 - Logs mínimos; no volcar logs enteros.
 - Un cambio en `native/x86rt.h` ⇒ regenerar y recompilar los 85 `rc_*.c`.
 - Antes de tocar algo dudoso, `git diff` para no pisar trabajo del usuario.
+- Granja: no correr `recomp-farm.sh` desde el sandbox; usar `tools/farm.py` y
+  respetar la receta de reproducibilidad y el "un solo escritor por árbol".

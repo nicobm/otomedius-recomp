@@ -7,7 +7,7 @@ de su propio dump.
 
 La referencia técnica canónica y acumulativa es **`docs/BOOKLET.md`**. El plan
 de la sesión en curso está en **`docs/HANDOVER_PROMPT.md`**. Si hay conflicto,
-manda la sección más reciente del booklet (hoy §12) y, después, el prompt.
+manda la sección más reciente del booklet (hoy §15) y, después, el prompt.
 
 ---
 
@@ -146,11 +146,52 @@ SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy \
 - Falta el escenario/enemigos (store por modelo), el mapeo material→textura del
   motor, el cartel de red y el texto largo.
 - Los bloqueos y el plan inmediato están en `docs/HANDOVER_PROMPT.md` §4–§5 y
-  en la última sección de `docs/BOOKLET.md` (§14).
+  en la última sección de `docs/BOOKLET.md` (§15).
 
 ---
 
-## 6. Atribución
+## 6. Granja de compilación (recomp-farm)
+
+El usuario mantiene fuera del repo la granja **recomp-farm** (hoy en
+`~/Proyectos/SALA DE TRABAJO/recomp-farm`): un **master** en esta VM (dentro del
+NAT de Boxes) y N **workers** de la LAN, todo podman rootless, con imagen
+**Arch** (`zig 0.17.1`, gcc, distcc) y sin acceso a este filesystem. El master
+**sale** a los workers (`tcp/47824`); no escucha en ningún puerto.
+
+| Quién | Qué hace |
+|---|---|
+| usuario | ciclo de vida: `./recomp-farm.sh up|down|scan|status|logs` |
+| IA | `python3 tools/farm.py status|sync|run` — manda compilaciones y tests, lee logs y objetos |
+
+Reglas:
+
+- **La IA no corre `recomp-farm.sh`** (es `podman exec`, y en el sandbox no hay
+  podman). El enlace es TD1 contra los workers, firmado con el HMAC del secreto
+  que vive en el volumen `recomp-farm-workspace/.config/secret`. `tools/farm.py`
+  implementa ese cliente; no hay IPs en el código (salen de `slaves{,.cache}` o
+  de un `scan`/`--subnet` explícito).
+- El secreto no se imprime ni se copia, y no se escribe nada en el volumen del
+  master.
+- **Kits**: `farm.py sync DIR` imprime el `sha256`; el tar es determinístico
+  (`tar --sort=name --owner=0 --group=0 --numeric-owner -cf - . | gzip -n`), así
+  el cache `TD1 HAVE` pega entre el CLI y el agente. `--kit <sha>` no transmite
+  nada; con un worker viejo (sin HAVE) hay que mandar el tar.
+- **Reproducibilidad**: compilar en la granja siempre con `-target
+  x86_64-linux-gnu.2.44`, `-ffile-prefix-map=$PWD=.`,
+  `-fdebug-compilation-dir=.` y `-ffile-prefix-map=$ZIGLIB=@zig`
+  (receta completa en `README.md` §Build farm). Criterio de aceptación:
+  `sha256` de cada objeto igual al del build local; si no coincide, no se usa.
+- El dump **no** va a la granja: `--sync` manda sólo lo que el job necesita.
+- **Un solo escritor por árbol de objetos**: los `.o` de la granja se linkean
+  desde un directorio aparte (`.work/farm-out`); nunca se descomprimen sobre
+  `.work/obj`.
+- Verificado 2026-11-17: 105/105 objetos idénticos y **binario idéntico**
+  (`sha256 fb256033…`) usando 2 workers (20 slots); el smoke pasa con ese
+  binario.
+
+---
+
+## 7. Atribución
 
 La recompilación estática, la ingeniería inversa y la capa nativa Linux se
 desarrollan con varios LLMs usados a través de **OpenCode** como agente de

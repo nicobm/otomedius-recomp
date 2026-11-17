@@ -2545,3 +2545,126 @@ M docs/HANDOVER_PROMPT.md prompt de la sesión siguiente
 
 La recompilación estática, la ingeniería inversa y la capa nativa Linux se
 desarrollan con varios LLMs usados a través de **OpenCode** como agente de código.
+
+---
+
+## 15. Sesión 2026-11-17 (novena parte): granja `recomp-farm` y recompilación distribuida verificada
+
+> **Esta sección manda sobre §1–§14 en todo lo relativo al *workflow de
+> compilación*.** El estado del port en sí sigue siendo el de §14 (el modelo 3D
+> se ve y está texturado; falta escenario/enemigos, material→textura, cartel de
+> red, `REPLAY RAND ERROR` y el texto largo). Lo que cambió es **cómo se
+> compila**: el juego completo se compila ahora repartido entre varias máquinas
+> del taller, con verificación byte a byte contra el build local.
+
+### 15.1 Qué se agregó
+
+| Dónde | Qué |
+|---|---|
+| `tools/farm.py` (nuevo) | cliente **TD1** de la granja: `status`, `scan`, `sync`, `run --kit/--sync/--collect/--stream`. Sin `podman`, sin IPs en el código |
+| `README.md` | sección **Build farm (`recomp-farm`)**: arquitectura, canal del agente, receta de reproducibilidad y resultados medidos |
+| `AGENTS.md` §6 | reglas duras de la granja (quién hace qué, kits, reproducibilidad, un solo escritor por árbol de objetos) |
+| fuera del repo | granja `recomp-farm` v3 en `~/Proyectos/SALA DE TRABAJO/recomp-farm`: script único, master que **sale** a los workers, imagen **Arch** con zig 0.17.1 + gcc + distcc, API HTTP opcional (`tools/farmd.py`) |
+| `../.work/farm-kit` | kit de prueba (3 `rc_*.c` + `x86rt.h` + `build.sh`) |
+| `../.work/farm-build` | kit del build completo (50 MB: `native/` + `gen/` + headers SDL3/FreeType + `build-farm.sh`) |
+
+### 15.2 Por qué hizo falta un cliente propio
+
+El agente corre dentro del Flatpak de OpenCode: **no hay `podman`** ni permiso
+para ejecutar procesos del host (`flatpak-spawn --host` bloqueado por el
+portal). En v3 **el master no escucha en ningún puerto**: es un cliente que sale
+a los workers (`socat TCP4-LISTEN:47824`), así que su CLI —que hace
+`podman exec`— queda fuera de alcance.
+
+Lo que sí es alcanzable: el **volumen del master** (secreto HMAC + lista de
+workers en `.config/slaves{,.cache}`) y el **protocolo TD1** de los workers.
+`tools/farm.py` hace exactamente lo que hace el master, sin podman.
+
+### 15.3 Protocolo TD1: lo que hubo que reconstruir
+
+```
+TD1 PING <nonce>   -> TD1 PONG <host> <slots> <port> <ver> <user> <role>
+TD1 HAVE <sha256>  -> TD1 HAVE <sha256> | TD1 NEED <sha256> | TD1 ERR bad request
+TD1 JOB <nonce> <ts> <auth> <id> <tmo> <b64cwd> <cmdlen> <syncsize> <synchash>
+    <cmd: cmdlen bytes><tar: syncsize bytes>
+                   -> TD1 NEEDSECRET / TD1 SECRET <s>
+                   -> TD1 OK <nonce> <ts> <auth>     (ACEPTADO: el job sigue)
+                      <stdout+stderr en vivo>
+                      TD1 DONE <nonce> <rc>
+auth = HMAC-SHA256(secreto, "v1\njob\n<nonce>\n<ts>\n<id>\n<tmo>\n<b64cwd>\n<cmdlen>\n<syncsize>\n<synchash>")
+```
+
+Tres trampas que costaron tiempo (ya documentadas en la granja y en
+`AGENTS.md`):
+
+1. **Ningún campo de la cabecera puede ir vacío**: se parsea con `read`, que
+   colapsa espacios; un `b64cwd` vacío corre todos los campos siguientes
+   (`cmdlen` cae en `syncsize`). Nos pasó con el primer cliente.
+2. **`synchash` se usa como nombre del directorio** (`jobs/<sha>`), aunque el
+   master lo llame por `--sync-name`. Con sync, el worker ignora `b64cwd`.
+3. **`TD1 OK` significa "aceptado"**, no "terminó": la salida se streamea hasta
+   `TD1 DONE <rc>`. Un cliente viejo igual funciona (lee OK y luego itera).
+
+### 15.4 Reproducibilidad: la receta
+
+Dos máquinas sólo producen objetos idénticos si coinciden **el compilador y las
+rutas que quedan grabadas**. Sin estas banderas los objetos difieren en 120
+bytes; comparando sección por sección, **todo el código era idéntico**
+(`.text`, `.rodata*`, `.symtab`, `.eh_frame`, `.llvm_addrsig`, `.debug_info`,
+`.debug_str`) y sólo cambiaban `.debug_line` y `.rela.debug_line`:
+
+```sh
+zig cc -target x86_64-linux-gnu.2.44 \
+       -ffile-prefix-map=$PWD=. -fdebug-compilation-dir=. \
+       -ffile-prefix-map="$(zig env | sed -n 's/.*lib_dir *= *"\([^"]*\)".*/\1/p')=@zig" \
+       -O2 -std=gnu11 -w -Inative -Iinc/sdl3 -Iinc/freetype
+```
+
+La tercera bandera es la que faltaba: la tabla de líneas graba la ruta de los
+headers de libc de zig, y `/usr/lib/zig` (imagen) no es `.work/zig/lib` (local).
+Ojo: `zig env` usa la sintaxis de registro de zig (`.lib_dir = "..."`), **no
+JSON**. Y en `build-farm.sh` las banderas se generan en un wrapper (`ccwrap`)
+con comillas, porque la ruta local tiene espacios.
+
+### 15.5 Resultado verificado
+
+Build completo (105 objetos = 85 `rc_*.c` + 20 `native/*.c`) repartido entre dos
+workers (16 + 4 slots), kit de 6,3 MB:
+
+| | local (12 jobs) | granja (20 slots) |
+|---|---|---|
+| compilar | 32 s | **21,4 s** (84 `rc_*.c`, 16 jobs) + **4,2 s** (21 nativos, 4 jobs) |
+| transferir | — | kit 6,3 MB una vez; después **0** (`HAVE` pega) |
+| resultado | 105 objetos | **los mismos 105, byte a byte** |
+
+- `sha256` de los 105 objetos: **idéntico** al build local.
+- Link local con los objetos de la granja → **binario idéntico**
+  (`sha256 fb256033…`, 53 785 008 B, `cmp` limpio) y **el smoke de 4700 pasa**.
+- Costo actual: los 81 MB de `.o` vuelven como `tar.gz`+base64 dentro del stdout
+  del job (el cliente los decodifica). Funciona, pero es el cuello de botella;
+  lo próximo es un endpoint de artefactos en la granja.
+
+### 15.6 Cambios por fichero
+
+| Fichero | Cambio |
+|---|---|
+| `tools/farm.py` | **nuevo**: cliente TD1 (status/scan/sync/run), tar determinístico, `HAVE`/`NEED`, reintento por `missing kit`, placeholders, `--collect`, `--stream` |
+| `README.md` | sección *Build farm* reescrita para v3 + fila de `tools/farm.py` en *Layout* |
+| `AGENTS.md` | §6 reescrito (granja v3, reglas y criterio de aceptación) |
+| `docs/BOOKLET.md` | esta §15 |
+| `docs/HANDOVER_PROMPT.md` | reescrito para la sesión siguiente (incluye el workflow de granja) |
+
+Sin cambios en `native/` ni en `tools/recomp/`: el port no se tocó en esta
+sesión.
+
+### 15.7 Bloqueos y próximos pasos
+
+1. **Port (sin cambios respecto de §14)**: mapeo material→textura del motor,
+   escenario y enemigos (`store` por modelo), cartel de red, `REPLAY RAND
+   ERROR`, texto largo.
+2. **Granja**: devolver artefactos fuera del stdout (endpoint o socket aparte),
+   sumar el tercer slave y —si se quiere independencia del secreto— usar el
+   `serve` HTTP (`tools/farmd.py`) en vez de TD1 directo.
+3. **Regla nueva**: los objetos de la granja se linkean desde
+   `.work/farm-out`, nunca se descomprimen sobre `.work/obj` (un solo escritor
+   por árbol).
