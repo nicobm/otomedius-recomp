@@ -156,7 +156,9 @@ El usuario mantiene fuera del repo la granja **recomp-farm** (hoy en
 `~/Proyectos/SALA DE TRABAJO/recomp-farm`): un **master** en esta VM (dentro del
 NAT de Boxes) y N **workers** de la LAN, todo podman rootless, con imagen
 **Arch** (`zig 0.17.1`, gcc, distcc) y sin acceso a este filesystem. El master
-**sale** a los workers (`tcp/47824`); no escucha en ningún puerto.
+**sale** a los workers (`tcp/47824`) y además **escucha él mismo**
+(`role=master+worker`): sus núcleos también toman shard, alcanzables por
+loopback desde el sandbox.
 
 | Quién | Qué hace |
 |---|---|
@@ -186,8 +188,11 @@ Reglas:
   desde un directorio aparte (`.work/farm-out`); nunca se descomprimen sobre
   `.work/obj`.
 - Verificado 2026-11-17: 105/105 objetos idénticos y **binario idéntico**
-  (`sha256 fb256033…`) usando 2 workers (20 slots); el smoke pasa con ese
-  binario.
+  (`sha256 fb256033…`) con 4 nodos (master 12 + 16 + 4 + 4 = **36 slots**); el
+  smoke pasa con ese binario.
+- `tools/farm.py` incluye al master como candidato en `127.0.0.1` (se puede
+  excluir con `--no-master`); el reparto se hace con `--hosts <addr>` y listas
+  por shard.
 
 ---
 

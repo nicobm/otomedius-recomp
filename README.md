@@ -218,9 +218,10 @@ this repository, today in `~/Proyectos/SALA DE TRABAJO/recomp-farm`).
                                                  ports on the master
 ```
 
-* The master **does not listen**: it scans the LAN, dials `tcp/47824` on every
-  worker and streams each job's output back. Workers listen (`socat`), never
-  see this machine's filesystem and have **no internet**.
+* The master scans the LAN and dials `tcp/47824` on every worker, streaming each
+  job's output back; it also **listens itself** (`role=master+worker`), so its
+  own cores can take a shard (`tools/farm.py` reaches it through loopback).
+  Workers never see this machine's filesystem and have **no internet**.
 * Every job is HMAC-SHA256-signed with the shared secret that lives in the
   master's volume (`/workspace/.config/secret`, trust-on-first-use enrollment).
 * Image: **Arch Linux** with `zig 0.17.1`, `gcc 16`, `distcc 3.4` and glibc (the
@@ -265,10 +266,10 @@ explicit `scan`/`--subnet`.
 A full rebuild — 105 objects (85 `rc_*.c` + 20 `native/*.c`) — through two
 workers (16 + 4 slots) with a 6.3 MB kit:
 
-| | local (12 jobs) | farm (20 slots) |
+| | local (12 jobs) | farm (36 slots: master + 3 workers) |
 |---|---|---|
-| compile | 32 s | 21.4 s (84 `rc_*.c`, 16 jobs) + 4.2 s (21 native, 4 jobs) |
-| transfer | — | kit 6.3 MB once, then **0** (`HAVE` hit) |
+| compile | 32 s | 14 s (master, 33 files) ‖ 10 s (42) ‖ 4 s (15) ‖ 2 s (15) |
+| transfer | — | kit 6.3 MB once per node, then **0** (`HAVE` hit) |
 | result | 105 objects | **the same 105 objects, byte for byte** |
 
 Linking the farm objects locally produced a **bit-identical binary**

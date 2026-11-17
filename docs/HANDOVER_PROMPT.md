@@ -95,7 +95,8 @@ Reglas:
 - El kit del build completo está en `../.work/farm-build` (50 MB: `native/` +
   `gen/` + headers SDL3/FreeType + `build-farm.sh` + `shard-*.txt`).
 - Verificado el 2026-11-17: 105/105 objetos idénticos y **binario idéntico**
-  (`sha256 fb256033…`) con 2 workers; el smoke pasa.
+  (`sha256 fb256033…`) con **4 nodos** (master 12 + 16 + 4 + 4 = 36 slots); el
+  smoke pasa. El master también es nodo TD1 (`--no-master` para excluirlo).
 - El usuario es quien hace `up`/`down` de la granja; si no hay workers, pedíselo
   en vez de intentar `podman`.
 

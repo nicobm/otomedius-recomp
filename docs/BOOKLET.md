@@ -2564,7 +2564,7 @@ desarrollan con varios LLMs usados a través de **OpenCode** como agente de cód
 | `tools/farm.py` (nuevo) | cliente **TD1** de la granja: `status`, `scan`, `sync`, `run --kit/--sync/--collect/--stream`. Sin `podman`, sin IPs en el código |
 | `README.md` | sección **Build farm (`recomp-farm`)**: arquitectura, canal del agente, receta de reproducibilidad y resultados medidos |
 | `AGENTS.md` §6 | reglas duras de la granja (quién hace qué, kits, reproducibilidad, un solo escritor por árbol de objetos) |
-| fuera del repo | granja `recomp-farm` v3 en `~/Proyectos/SALA DE TRABAJO/recomp-farm`: script único, master que **sale** a los workers, imagen **Arch** con zig 0.17.1 + gcc + distcc, API HTTP opcional (`tools/farmd.py`) |
+| fuera del repo | granja `recomp-farm` v3 en `~/Proyectos/SALA DE TRABAJO/recomp-farm`: script único, master que **sale** a los workers y que además **escucha TD1 él mismo** (`role=master+worker`, añadido en `d473346`), imagen **Arch** con zig 0.17.1 + gcc + distcc, API HTTP opcional (`tools/farmd.py`) |
 | `../.work/farm-kit` | kit de prueba (3 `rc_*.c` + `x86rt.h` + `build.sh`) |
 | `../.work/farm-build` | kit del build completo (50 MB: `native/` + `gen/` + headers SDL3/FreeType + `build-farm.sh`) |
 
@@ -2628,14 +2628,20 @@ con comillas, porque la ruta local tiene espacios.
 
 ### 15.5 Resultado verificado
 
-Build completo (105 objetos = 85 `rc_*.c` + 20 `native/*.c`) repartido entre dos
-workers (16 + 4 slots), kit de 6,3 MB:
+Build completo (105 objetos = 85 `rc_*.c` + 20 `native/*.c`) repartido entre
+**cuatro nodos** (master 12 + 16 + 4 + 4 = 36 slots), kit de 6,3 MB:
 
-| | local (12 jobs) | granja (20 slots) |
+| | local (12 jobs) | granja (36 slots) |
 |---|---|---|
-| compilar | 32 s | **21,4 s** (84 `rc_*.c`, 16 jobs) + **4,2 s** (21 nativos, 4 jobs) |
-| transferir | — | kit 6,3 MB una vez; después **0** (`HAVE` pega) |
+| compilar | 32 s | **14 s** (master, 33 ficheros) ‖ 10 s (42) ‖ 4 s (15) ‖ 2 s (15) |
+| transferir | — | kit 6,3 MB una vez por nodo; después **0** (`HAVE` pega) |
 | resultado | 105 objetos | **los mismos 105, byte a byte** |
+
+El reparto se hace explícito: una lista por nodo (`shard-master.txt`,
+`shard-115.txt`, …) y `tools/farm.py run --hosts <addr> -- 'sh build-farm.sh
+shard-X.txt'`. Los shards se dimensionan por costo estimado (los `rc_*.c` pesan
+~5× más que los `native/*.c`), no por cantidad de ficheros. Con 36 slots la
+pared baja de 32 s a ~14 s de compilación.
 
 - `sha256` de los 105 objetos: **idéntico** al build local.
 - Link local con los objetos de la granja → **binario idéntico**
@@ -2648,7 +2654,7 @@ workers (16 + 4 slots), kit de 6,3 MB:
 
 | Fichero | Cambio |
 |---|---|
-| `tools/farm.py` | **nuevo**: cliente TD1 (status/scan/sync/run), tar determinístico, `HAVE`/`NEED`, reintento por `missing kit`, placeholders, `--collect`, `--stream` |
+| `tools/farm.py` | **nuevo**: cliente TD1 (status/scan/sync/run), tar determinístico, `HAVE`/`NEED`, reintento por `missing kit`, placeholders, `--collect`, `--stream`; el master entra como nodo en `127.0.0.1` (excluible con `--no-master`) y la ausencia de caché no se cancela porque el master responda |
 | `README.md` | sección *Build farm* reescrita para v3 + fila de `tools/farm.py` en *Layout* |
 | `AGENTS.md` | §6 reescrito (granja v3, reglas y criterio de aceptación) |
 | `docs/BOOKLET.md` | esta §15 |

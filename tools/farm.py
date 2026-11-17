@@ -179,8 +179,13 @@ def scan_subnets(subnets, timeout=2.0, parallel=128):
     return found
 
 
+# El master también acepta jobs TD1 (role=master+worker) y, como el sandbox
+# comparte su namespace de red, se lo alcanza por loopback.
+MASTER_ADDR = "127.0.0.1"
+
+
 def pick_workers(args):
-    """Workers vivos: primero la caché del master, después (si hace falta) scan."""
+    """Nodos vivos: master en loopback + caché del master + (si hace falta) scan."""
     entries = cache_entries()
     workers = []
     seen = set()
@@ -192,11 +197,20 @@ def pick_workers(args):
             info["source"] = source
             workers.append(info)
 
+    if not getattr(args, "no_master", False):
+        info = ping("%s:%d" % (MASTER_ADDR, PORT), args.ping_timeout)
+        if info:
+            add(info, "master")
+
+    from_cache = 0
     for item, origin in entries:
         info = ping(item, args.ping_timeout)
         if info:
             add(info, origin)
-    if workers:
+            from_cache += 1
+    # la presencia del master no reemplaza al scan: si la caché no dio nada,
+    # seguimos y escaneamos la LAN
+    if from_cache:
         return workers
     if entries and not getattr(args, "scan", False):
         print(
@@ -204,7 +218,7 @@ def pick_workers(args):
             % len(entries),
             file=sys.stderr,
         )
-        return []
+        return workers  # al menos el master, si está
 
     subnets = list(getattr(args, "subnet", None) or []) or list(DEFAULT_SUBNETS)
     print(
@@ -460,11 +474,13 @@ def cmd_status(args):
         )
         return 1
     _label_workers(workers)
-    print("%-16s %-6s %-22s %-6s %-8s %s" % ("ADDR", "SLOTS", "HOST", "PORT", "VERSION", "USER"))
+    print("%-16s %-6s %-22s %-6s %-8s %-14s %s"
+          % ("ADDR", "SLOTS", "HOST", "PORT", "VERSION", "ROLE", "USER"))
     for w in sorted(workers, key=lambda x: x["label"]):
         print(
-            "%-16s %-6s %-22s %-6d %-8s %s"
-            % (w["addr"], w["slots"], w["label"], w["port"], w["version"], w["user"])
+            "%-16s %-6s %-22s %-6d %-8s %-14s %s"
+            % (w["addr"], w["slots"], w["label"], w["port"], w["version"],
+               w.get("role", "-"), w["user"])
         )
     print(
         "total %d slots en %d worker(s); secreto %s"
@@ -656,6 +672,8 @@ def main(argv=None):
                     help="timeout de TD1 PING (default 2s)")
     ap.add_argument("--subnet", action="append", default=[],
                     help="subred /24 a escanear, p. ej. 192.168.5 (repetible)")
+    ap.add_argument("--no-master", action="store_true",
+                    help="no incluir el master (127.0.0.1) como nodo")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     st = sub.add_parser("status", help="workers vivos")
