@@ -9,6 +9,7 @@
 #define _GNU_SOURCE
 #include "win32.h"
 #include "d3d9.h"
+#include "xmodel.h"
 
 #include <math.h>
 #include <string.h>
@@ -898,11 +899,89 @@ static uint32_t hle_mesh_object(void)
 }
 
 /* Container methods are C++ thiscall: `this` is in ecx, not on the stack. */
+/* Containers do not carry the mesh index themselves (the game's loader and
+ * skinning code own that layout), so keep a side table keyed by address. */
+#define HLE_MAX_CONTAINERS 16
+static uint32_t hle_cont_addr[HLE_MAX_CONTAINERS];
+static int      hle_cont_mesh[HLE_MAX_CONTAINERS];
+static float    hle_cont_world[HLE_MAX_CONTAINERS][16];
+static int      hle_cont_n;
+
+/* Row-vector D3D convention: out = a * b (v' = v * a * b). */
+static void hle_mat_mul(float *out, const float *a, const float *b)
+{
+    float r[16];
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++)
+            r[i * 4 + j] = a[i * 4 + 0] * b[0 * 4 + j] +
+                           a[i * 4 + 1] * b[1 * 4 + j] +
+                           a[i * 4 + 2] * b[2 * 4 + j] +
+                           a[i * 4 + 3] * b[3 * 4 + j];
+    memcpy(out, r, sizeof r);
+}
+
+static void hle_cont_map(uint32_t container, int mesh, const float *world)
+{
+    if (hle_cont_n < HLE_MAX_CONTAINERS) {
+        hle_cont_addr[hle_cont_n] = container;
+        hle_cont_mesh[hle_cont_n] = mesh;
+        if (world)
+            memcpy(hle_cont_world[hle_cont_n], world, 64);
+        else
+            memset(hle_cont_world[hle_cont_n], 0, 64);
+        hle_cont_n++;
+    }
+}
+
+static int hle_cont_lookup(uint32_t container)
+{
+    int i;
+    for (i = 0; i < hle_cont_n; i++)
+        if (hle_cont_addr[i] == container)
+            return hle_cont_mesh[i];
+    return -1;
+}
+
+static const float *hle_cont_world_of(uint32_t container)
+{
+    int i;
+    for (i = 0; i < hle_cont_n; i++)
+        if (hle_cont_addr[i] == container)
+            return hle_cont_world[i];
+    return NULL;
+}
+
 static void hle_mesh_draw(void)
 {
     uint32_t w = arg32(0);
+    uint32_t self = x86_cpu()->ecx;
+    int mesh = hle_cont_lookup(self);
+    /* Which engine function walks the nodes and calls us?  OTOMEDIUS_3DDBG. */
+    if (getenv("OTOMEDIUS_3DDBG")) {
+        static unsigned n;
+        if (n++ < 6)
+            fprintf(stderr, "3ddbg: container draw ret=%08x self=%08x world=%08x "
+                    "mesh=%d\n", M32(x86_cpu()->esp), self, w, mesh);
+    }
     extern void render_draw_ship(const float *world);
-    render_draw_ship(w ? (const float *)(MEM + w) : NULL);
+    extern void render_draw_model(const float *world, int mesh);
+    const float *game = w ? (const float *)(MEM + w) : NULL;
+    const float *fw = hle_cont_world_of(self);
+    float world[16];
+    extern int render_has_view(void);
+    /* The game hands every node the same scene matrix and the shader-path
+     * VIEW is not captured yet, so applying it would only rotate the model
+     * edge-on to the fallback camera.  Use it once a real VIEW exists. */
+    if (fw && game && render_has_view()) {
+        hle_mat_mul(world, fw, game);
+        game = world;
+    } else if (fw) {
+        game = fw;
+    }
+    if (mesh >= 0)
+        render_draw_model(game, mesh);
+    else
+        render_draw_ship(game);
     RET32(0);
 }
 static void hle_mesh_destroy(void) { RET32(0); }
@@ -965,6 +1044,84 @@ static uint32_t hle_create_frame(uint32_t allocator, const char *name)
     return f;
 }
 
+/* Build the real frame hierarchy from the .x image the game just handed us.
+ * Returns 1 on success; the caller falls back to the synthetic hierarchy. */
+#define HLE_MAX_FRAMES 128
+static uint32_t hle_frame_addr[HLE_MAX_FRAMES];
+
+/* Compose the frame's local matrix with its parents' (row-vector order). */
+static void hle_frame_world(int i, float *out)
+{
+    int p = xmodel_frame_parent(i);
+    const float *l = xmodel_frame_matrix(i);
+    if (!l) {
+        memset(out, 0, 64);
+        out[0] = out[5] = out[10] = out[15] = 1.0f;
+        return;
+    }
+    if (p < 0 || p == i) {
+        memcpy(out, l, 64);
+        return;
+    }
+    {
+        float pw[16];
+        hle_frame_world(p, pw);
+        hle_mat_mul(out, pw, l);
+    }
+}
+
+static int hle_build_from_x(uint32_t allocator, uint32_t src, uint32_t size,
+                            uint32_t ppFrame)
+{
+    int n, i;
+
+    if (!src || size < 16)
+        return 0;
+    if (xmodel_parse((const uint8_t *)(MEM + src), size) != 0)
+        return 0;
+    n = xmodel_frame_count();
+    if (n <= 0 || n > HLE_MAX_FRAMES)
+        return 0;
+    hle_cont_n = 0;
+    for (i = 0; i < n; i++) {
+        hle_frame_addr[i] = hle_create_frame(allocator, xmodel_frame_name(i));
+        if (!hle_frame_addr[i]) {
+            fprintf(stderr, "d3dx9: HLE frame %d/%d failed\n", i, n);
+            return 0;
+        }
+        memcpy(MEM + hle_frame_addr[i] + 4, xmodel_frame_matrix(i), 64);
+    }
+    for (i = 1; i < n; i++) {
+        int p = xmodel_frame_parent(i);
+        uint32_t f = hle_frame_addr[i], s;
+        if (p < 0 || p >= n)
+            continue;
+        if (!M32(hle_frame_addr[p] + 0x4c)) {
+            M32(hle_frame_addr[p] + 0x4c) = f;      /* pFrameFirstChild */
+        } else {
+            s = M32(hle_frame_addr[p] + 0x4c);
+            while (M32(s + 0x48))
+                s = M32(s + 0x48);
+            M32(s + 0x48) = f;                      /* pFrameSibling */
+        }
+    }
+    for (i = 0; i < n; i++) {
+        int mesh = xmodel_frame_mesh(i);
+        uint32_t c;
+        float w[16];
+        if (mesh < 0)
+            continue;
+        c = hle_container();
+        M32(hle_frame_addr[i] + 0x44) = c + 4u;     /* pMeshContainer */
+        hle_frame_world(i, w);
+        hle_cont_map(c, mesh, w);
+    }
+    M32(ppFrame) = hle_frame_addr[0];
+    if (getenv("OTOMEDIUS_XMODEL_DBG"))
+        xmodel_dump();
+    return 1;
+}
+
 static void d3dx_LoadMeshHierarchyFromXInMemory(void)
 {
     uint32_t allocator = arg32(4), src = arg32(0), size = arg32(1);
@@ -978,8 +1135,10 @@ static void d3dx_LoadMeshHierarchyFromXInMemory(void)
         M32(ppAnim) = 0;
     if (ppFrame)
         M32(ppFrame) = 0;
-    if (getenv("OTOMEDIUS_NO_SHIP"))
+    if (getenv("OTOMEDIUS_NO_SHIP")) {
         RET32(0);
+        return;
+    }
     /* Only synthesise the player hierarchy.  The game loads ~80 .x files;
      * creating 70 frames for each one exhausts the local heap and aborts the
      * pak build (2207:Failed Alloc FrameInfs).  The player .x contains the
@@ -993,10 +1152,19 @@ static void d3dx_LoadMeshHierarchyFromXInMemory(void)
                 break;
             }
     }
-    if (!is_player)
+    if (!is_player) {
         RET32(0);
+        return;
+    }
     if (!allocator || !ppFrame) {
         RET32(0x80004005u);
+        return;
+    }
+    /* Prefer the real frame tree parsed from the .x image.  The synthetic
+     * hierarchy below stays as a fallback so the attract never loses its
+     * model if a file uses a variant this parser does not understand. */
+    if (hle_build_from_x(allocator, src, size, ppFrame)) {
+        RET32(0);
         return;
     }
     root = hle_create_frame(allocator, "p02_root");

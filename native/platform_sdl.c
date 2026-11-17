@@ -559,6 +559,7 @@ void platform_wait(void)
  * their own threads, so every access to g_astream is serialised. */
 static pthread_mutex_t g_audio_lock = PTHREAD_MUTEX_INITIALIZER;
 static FILE *g_adump;
+static unsigned g_adrop;
 
 static void audio_stream_dump_locked(const void *data, int len)
 {
@@ -642,8 +643,13 @@ void platform_audio_write(const void *data, int len)
             return;
         }
         pthread_mutex_unlock(&g_audio_lock);
-        if (++spins > 100)
-            return;             /* device stalled: drop this chunk */
+        if (++spins > 100) {
+            /* Device stalled: dropping the chunk is audible, so count it. */
+            if (++g_adrop == 1 || (g_adrop % 50) == 0)
+                fprintf(stderr, "audio: dropped %u chunk(s), queue full\n",
+                        g_adrop);
+            return;
+        }
         SDL_Delay(5);
     }
 }

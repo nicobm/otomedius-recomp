@@ -36,8 +36,9 @@ Version: see [`VERSION`](VERSION).
 This repository uses an explicit session protocol so a new AI session knows
 what to do without guessing (full rules in [`AGENTS.md`](AGENTS.md)):
 
-- **`INICIAR`** + GitHub account/repo/email/token: read `AGENTS.md`, the latest
-  section of [`docs/BOOKLET.md`](docs/BOOKLET.md) and
+- **`INICIAR`** + GitHub token (the account, repo and email are taken from
+  `git remote`/`git config`): read `AGENTS.md`, the latest section of
+  [`docs/BOOKLET.md`](docs/BOOKLET.md) and
   [`docs/HANDOVER_PROMPT.md`](docs/HANDOVER_PROMPT.md), check `git status` and
   run the smoke test before changing code.
 - **`TERMINAR`**: run the tests, update `README.md`, the booklet and the next
@@ -61,7 +62,7 @@ what to do without guessing (full rules in [`AGENTS.md`](AGENTS.md)):
 | `dsound` (device, buffers, lock/play) | working; voices are mixed to SDL3 (volume/pan/rate/loop) |
 | `dshow` (opening movie: graph, filter, pin) | interfaces working; the WMV3 intro is decoded with the runtime's ffmpeg and uploaded into the game's own video texture |
 | Fonts / text | working: `GGO_GRAY8_BITMAP`/`GGO_BITMAP` implemented; `AddFontMemResourceEx` registers the game's own fonts (DFGothic/DFMincho/DFPOP…) and `SysFont.dds`/`gradius_font.dds` load through a real `D3DXCreateTextureFromFileExA` |
-| Renderer (2D, sprites, playfield) | 2D path working (signed-area fix in `draw_tri`); the game runs its main loop, creates a 1280×1024 device and draws every frame (`BeginScene`/`EndScene`/`Present`); the attract HUD is visible; the 3D XYZ pipeline (`W*V*P`, `/w`, viewport, z-buffer, perspective-correct UVs, `DrawPrimitive`/`DrawIndexedPrimitive`) works and a HLE frame hierarchy draws a synthetic player ship; the real `.x` mesh parser and the shader camera are still pending |
+| Renderer (2D, sprites, playfield) | 2D path working (signed-area fix in `draw_tri`); the game runs its main loop, creates a 1280×1024 device and draws every frame (`BeginScene`/`EndScene`/`Present`); the attract HUD is visible; the 3D XYZ pipeline (`W*V*P`, `/w`, viewport, z-buffer, perspective-correct UVs, `DrawPrimitive`/`DrawIndexedPrimitive`) works; the **real `.x` parser** (`native/xmodel.c`) builds the player's 58-frame hierarchy and the renderer draws its 6 meshes (7 998 faces) with directional shading. The model is still erased by the game's own post-scene `Clear`, so it is not visible yet (see booklet §13.8) |
 | Audio | `dsound` voices are mixed to SDL3 (volume/pan/rate/loop); the intro movie track (WMAv2) plays cleanly through the same stream |
 
 Today the recompiled game boots completely: the MSVC CRT runs, the window is
@@ -118,13 +119,19 @@ lists), shares one COM vtable per class (a per-object vtable exhausted the
 fixed native-thunk table after a few thousand frames), and implements
 `GetBackBuffer`/`GetDesc`.
 
-What is still missing: the **real 3D layer**. The XYZ vertex path (FVF
-`0x142`/`0x144`, `W*V*P`, z-buffer, viewport and perspective-correct UVs) now
-works and is verified with a rotating cube, and a HLE frame hierarchy draws a
-synthetic player ship while the `.x` parser is pending. The real `.x` mesh,
-the shader camera/VIEW and the long warning text are still to do. The software
-rasteriser runs at ~26–36 fps. The detailed state and the next three steps are
-in [`docs/BOOKLET.md`](docs/BOOKLET.md) (section 12); the ready-to-paste
+What is still missing: **showing** the 3D layer. The binary `.x` inside
+`Player02.pak` is now parsed (`native/xmodel.c`: templates, shared scalar
+lists, flattened inline templates, frames, meshes, materials, normals and
+UVs), `D3DXLoadMeshHierarchyFromXInMemory` builds the game's real 58-frame
+hierarchy through its own allocator, and the renderer draws all six meshes
+(7 375 vertices, 7 998 faces) with the XYZ pipeline and directional shading.
+Back-buffer read-back and render targets are implemented too. The remaining
+blocker is ordering: every attract frame runs `Clear → MODEL → Clear(TARGET) →
+HUD`, so the model is drawn and immediately erased; the engine's
+"scene-to-texture" path has to be located. The shader camera/VIEW, the model
+textures and the long warning text are still to do. The software rasteriser
+runs at ~26–36 fps. The detailed state and the next steps are in
+[`docs/BOOKLET.md`](docs/BOOKLET.md) (section 13); the ready-to-paste
 next-session prompt is [`docs/HANDOVER_PROMPT.md`](docs/HANDOVER_PROMPT.md).
 
 ## Requirements

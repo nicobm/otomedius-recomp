@@ -348,6 +348,9 @@ static void dev_GetBackBuffer(void)
     if (!surface)
         surface = surface_create((uint32_t)render_width(), (uint32_t)render_height(),
                                  0x15u /* D3DFMT_A8R8G8B8 */, 1);
+    /* Alias the renderer's framebuffer: the game reads the 3D scene back
+     * through this surface (GetRenderTargetData into its scene texture). */
+    surface_alias_backbuffer(surface);
     if (pp)
         M32(pp) = surface;
     RET32(0);
@@ -418,14 +421,37 @@ static void dev_UpdateSurface(void)
     RET32(0);
 }
 static void dev_UpdateTexture(void) { RET32(0); }
-static void dev_GetRenderTargetData(void) { RET32(0); }
+/* GetRenderTargetData(pRenderTarget, pDestSurface): the scene texture really
+ * receives the framebuffer contents here; the game later composites it as the
+ * background of the 2D HUD. */
+static void dev_GetRenderTargetData(void)
+{
+    uint32_t dst = arg32(2), src = arg32(1);
+    static unsigned n, ok;
+    if (src && dst) {
+        if (surface_copy(dst, src))
+            ok++;
+        else if (n++ < 3)
+            fprintf(stderr, "d3d9: GetRenderTargetData copy failed src=%08x dst=%08x\n",
+                    src, dst);
+    }
+    if (getenv("OTOMEDIUS_RTDBG"))
+        fprintf(stderr, "d3d9: GetRenderTargetData #%u src=%08x dst=%08x ok=%u\n",
+                n + ok, src, dst, ok);
+    RET32(0);
+}
 static void dev_GetFrontBufferData(void) { RET32(0); }
 static void dev_StretchRect(void)
 {
+    /* StretchRect(src, pSrcRect, dst, pDstRect, Filter): only the
+     * same-size copy is needed (back buffer -> scene texture). */
+    uint32_t src = arg32(1), dst = arg32(3);
     static unsigned n;
-    if (n++ < 3)
-        fprintf(stderr, "d3d9: UNIMPLEMENTED dev_StretchRect called (#%u) args %08x %08x %08x %08x\n", n,
-                arg32(1), arg32(2), arg32(3), arg32(4));
+    if (src && dst) {
+        if (!surface_copy(dst, src) && n++ < 3)
+            fprintf(stderr, "d3d9: StretchRect copy failed src=%08x dst=%08x\n",
+                    src, dst);
+    }
     RET32(0);
 }
 static void dev_ColorFill(void)
@@ -446,11 +472,25 @@ static void dev_CreateOffscreenPlainSurface(void)
     RET32(0);
 }
 
+/* The game renders the 3D scene into a scene texture and then composites it
+ * under the 2D HUD, so the target has to be real: Clear and Draw* are
+ * redirected to the surface's pixel buffer. */
 static void dev_SetRenderTarget(void)
 {
     uint32_t idx = arg32(1), s = arg32(2);
-    if (idx == 0)
+    if (idx == 0) {
         dev(arg32(0))->rt = s;
+        if (s) {
+            uint32_t px = surface_pixels(s);
+            int w = surface_width(s), h = surface_height(s);
+            if (getenv("OTOMEDIUS_RTDBG"))
+                fprintf(stderr, "d3d9: SetRenderTarget surface=%08x %dx%d "
+                        "pixels=%08x\n", s, w, h, px);
+            render_set_target(px, w, h);
+        } else {
+            render_set_target(0, 0, 0);
+        }
+    }
     RET32(0);
 }
 

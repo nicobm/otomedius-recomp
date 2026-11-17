@@ -28,6 +28,7 @@ typedef struct {
     uint32_t vt, refcount;
     uint32_t w, h, format, renderable;
     uint32_t data;
+    int      is_backbuffer;     /* data aliases the renderer's framebuffer */
 } surface_t_;
 
 typedef struct {
@@ -427,6 +428,45 @@ static const method_t surface_methods[] = {
     {s_GetDC, 2},   /* GetDC */
     {s_ReleaseDC, 2},   /* ReleaseDC */
 };
+
+/* The D3D back buffer is not a separate allocation in this port: point the
+ * surface at the renderer's framebuffer so LockRect / GetRenderTargetData see
+ * what the rasteriser drew. */
+void surface_alias_backbuffer(uint32_t s)
+{
+    int w = 0, h = 0;
+    uint32_t fb = render_framebuffer_guest();
+    if (!s || !surf(s) || !fb)
+        return;
+    (void)render_framebuffer(&w, &h);
+    surf(s)->data = fb;
+    surf(s)->w = (uint32_t)(w > 0 ? w : surf(s)->w);
+    surf(s)->h = (uint32_t)(h > 0 ? h : surf(s)->h);
+    surf(s)->is_backbuffer = 1;
+}
+
+uint32_t surface_pixels(uint32_t s) { return surf(s) ? surf(s)->data : 0; }
+int surface_width(uint32_t s) { return surf(s) ? (int)surf(s)->w : 0; }
+int surface_height(uint32_t s) { return surf(s) ? (int)surf(s)->h : 0; }
+
+/* GetRenderTargetData / StretchRect: copy the source surface into the
+ * destination pixel buffer (both are ARGB, top-down, pitch = width * 4). */
+int surface_copy(uint32_t dst, uint32_t src)
+{
+    surface_t_ *d = surf(dst), *s = surf(src);
+    int w, h, y;
+    if (!d || !s || !d->data || !s->data)
+        return 0;
+    w = (int)(d->w < s->w ? d->w : s->w);
+    h = (int)(d->h < s->h ? d->h : s->h);
+    if (w <= 0 || h <= 0)
+        return 0;
+    for (y = 0; y < h; y++)
+        memcpy(MEM + d->data + (size_t)y * d->w * 4u,
+               (const void *)(MEM + s->data + (size_t)y * s->w * 4u),
+               (size_t)w * 4u);
+    return 1;
+}
 
 uint32_t surface_create(uint32_t w, uint32_t h, uint32_t format, int renderable)
 {

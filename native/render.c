@@ -11,6 +11,7 @@
 #include "d3d9.h"
 #include "platform.h"
 #include "movie.h"
+#include "xmodel.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -25,6 +26,11 @@ static int g_fb_w, g_fb_h;
 static float g_vp_x, g_vp_y, g_vp_w = 1280.0f, g_vp_h = 1024.0f;
 static float *g_zbuf;
 static int g_zb_w, g_zb_h;
+/* Framebuffer lives in emulated memory (see render_init).  g_fb is the
+ * current render target: the back buffer, or a bound scene texture. */
+static uint32_t g_fb_guest;
+static size_t g_fb_bytes;
+static uint8_t *g_fb_primary;
 static void fb_fill(uint32_t color);
 
 /* ------------------------------------------------- renderer bring-up stats
@@ -35,10 +41,16 @@ static struct {
     unsigned presents, clears, draws, draw_ups, verts;
     int minx, miny, maxx, maxy;   /* bounding box of the submitted quads */
     unsigned onscreen;
+    unsigned model_draws, model_faces;
+    int model_minx, model_miny, model_maxx, model_maxy;
 } g_stat;
 static int g_cur_ntex;
 static uint32_t g_fvf, g_stream_stride, g_stream_vb, g_tex0;
 static uint32_t g_first_draw_logged;
+/* OTOMEDIUS_ORDERDBG=1: submission order (clears, 2D quads, model draws). */
+static int g_orderdbg;
+static unsigned g_order_seq;
+static unsigned g_last_model_draws;
 
 int render_width(void) { return g_width; }
 int render_height(void) { return g_height; }
@@ -47,15 +59,30 @@ static void render_state_defaults(void);
 
 void render_init(int w, int h)
 {
+    g_orderdbg = getenv("OTOMEDIUS_ORDERDBG") != NULL;
     render_state_defaults();
     if (w > 0 && h > 0) {
         g_width = (int)w;
         g_height = (int)h;
     }
-    free(g_fb);
+    /* The back buffer lives in emulated memory so the game can read it back
+     * (GetRenderTargetData / LockRect on the back buffer surface).  It is
+     * reused across resets instead of leaking a new 5 MiB bump allocation. */
+    {
+        extern uint32_t emu_alloc(uint32_t size);
+        size_t bytes = (size_t)g_width * (size_t)g_height * 4u;
+        if (g_fb_primary && g_fb_guest && g_fb_bytes == bytes) {
+            memset(g_fb_primary, 0, bytes);
+        } else {
+            g_fb_guest = emu_alloc((uint32_t)bytes);
+            g_fb_bytes = bytes;
+            g_fb_primary = MEM + g_fb_guest;
+            memset(g_fb_primary, 0, bytes);
+        }
+    }
+    g_fb = g_fb_primary;
     g_fb_w = g_width;
     g_fb_h = g_height;
-    g_fb = (uint8_t *)calloc((size_t)g_fb_w * g_fb_h, 4);
     free(g_zbuf);
     g_zbuf = (float *)malloc((size_t)g_fb_w * g_fb_h * sizeof(float));
     g_zb_w = g_fb_w;
@@ -84,16 +111,37 @@ void render_init(int w, int h)
 const uint8_t *render_framebuffer(int *w, int *h)
 {
     if (w)
-        *w = g_fb_w;
+        *w = g_width;
     if (h)
-        *h = g_fb_h;
-    return g_fb;
+        *h = g_height;
+    return g_fb_primary;
+}
+
+/* Guest (emulated) address of the framebuffer, for the back buffer surface. */
+uint32_t render_framebuffer_guest(void) { return g_fb_guest; }
+
+/* Bind the destination of Clear/Draw* to a texture surface (drop the null
+ * pointer to go back to the back buffer).  The game renders its 3D scene into
+ * a scene texture this way and then composites it under the 2D HUD. */
+void render_set_target(uint32_t guest, int w, int h)
+{
+    if (!guest || w <= 0 || h <= 0) {
+        g_fb = g_fb_primary;
+        g_fb_w = g_width;
+        g_fb_h = g_height;
+        return;
+    }
+    g_fb = MEM + guest;
+    g_fb_w = w;
+    g_fb_h = h;
 }
 
 void render_dump_fb(const char *path)
 {
     FILE *f;
-    if (!path || !*path || !g_fb || g_fb_w <= 0 || g_fb_h <= 0)
+    /* Always dump the composed back buffer, never a bound render target. */
+    const uint8_t *src = g_fb_primary ? g_fb_primary : g_fb;
+    if (!path || !*path || !src || g_width <= 0 || g_height <= 0)
         return;
     f = fopen(path, "wb");
     if (!f) {
@@ -101,10 +149,10 @@ void render_dump_fb(const char *path)
         return;
     }
     log_printf("render: dumped frame %u (%dx%d) to %s", g_stat.presents,
-               g_fb_w, g_fb_h, path);
-    fprintf(f, "P6\n%d %d\n255\n", g_fb_w, g_fb_h);
-    for (size_t i = 0, n = (size_t)g_fb_w * g_fb_h; i < n; i++) {
-        uint32_t c = ((uint32_t *)g_fb)[i];
+               g_width, g_height, path);
+    fprintf(f, "P6\n%d %d\n255\n", g_width, g_height);
+    for (size_t i = 0, n = (size_t)g_width * (size_t)g_height; i < n; i++) {
+        uint32_t c = ((const uint32_t *)src)[i];
         fputc((c >> 16) & 0xFF, f);
         fputc((c >> 8) & 0xFF, f);
         fputc(c & 0xFF, f);
@@ -935,6 +983,15 @@ static void default_proj(float *m)
     m[14] = -zn * zf / (zf - zn);
 }
 
+/* True when the game has bound a VIEW transform (SetTransform path). */
+int render_has_view(void)
+{
+    for (int i = 0; i < 16; i++)
+        if (g_xform[0][i] != 0.0f)
+            return 1;
+    return 0;
+}
+
 void render_draw_ship(const float *world)
 {
     static const float ident[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
@@ -1000,6 +1057,145 @@ void render_draw_ship(const float *world)
         }
         if (ok)
             raster_array(vt, 3, 4, NULL, 0, 0, 1);
+    }
+}
+
+/* Draw a mesh parsed from the game's own .x file (see native/xmodel.c).
+ *
+ * The HLE container replaces the game's mesh container, so the texture stages
+ * it would bind never reach this path: the model is shaded with a fixed
+ * directional light and the material's diffuse colour instead.  `world` is the
+ * node matrix the game passes to the container draw. */
+void render_draw_model(const float *world, int mesh)
+{
+    static const float ident[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+    static const float light[3] = {-0.42f, 0.66f, -0.62f};
+    float view[16], proj[16], wv[16], wvp[16], wc[16];
+    const float *wp = world ? world : ident;
+    const float *pos, *nrm, *uv;
+    const uint32_t *idx, *fmat;
+    int nv, nf, have_view = 0, have_proj = 0;
+    static int dbg;
+
+    if (!g_fb || mesh < 0)
+        return;
+    g_stat.model_draws++;
+    if (g_orderdbg)
+        fprintf(stderr, "order %u MODEL %s\n", ++g_order_seq,
+                xmodel_mesh_name(mesh));
+    nv = xmodel_mesh_nverts(mesh);
+    nf = xmodel_mesh_nfaces(mesh);
+    pos = xmodel_mesh_pos(mesh);
+    nrm = xmodel_mesh_norm(mesh);
+    uv = xmodel_mesh_uv(mesh);
+    idx = xmodel_mesh_idx(mesh);
+    fmat = xmodel_mesh_facemat(mesh);
+    if (nv <= 0 || nf <= 0 || !pos || !idx)
+        return;
+    for (int i = 0; i < 16; i++) {
+        if (g_xform[0][i] != 0.0f) have_view = 1;
+        if (g_xform[1][i] != 0.0f) have_proj = 1;
+    }
+    if (have_view) memcpy(view, g_xform[0], sizeof view); else default_view(view);
+    if (have_proj) memcpy(proj, g_xform[1], sizeof proj); else default_proj(proj);
+    /* Same workaround as the synthetic ship: the shader-path VIEW is not
+     * captured yet, so centre the node matrix on screen when it is missing. */
+    if (!have_view && !(getenv("OTOMEDIUS_SHIP_CENTER") &&
+                        *getenv("OTOMEDIUS_SHIP_CENTER") == '0')) {
+        memcpy(wc, wp, sizeof wc);
+        wc[12] = wc[13] = wc[14] = 0.0f;
+        wp = wc;
+    }
+    mat_mul_row(wv, wp, view);
+    mat_mul_row(wvp, wv, proj);
+    if (getenv("OTOMEDIUS_3DDBG") && dbg < 4) {
+        dbg++;
+        fprintf(stderr, "3ddbg: model %s verts=%d faces=%d view=%d proj=%d "
+                "world=[%.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f | "
+                "%.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f]\n",
+                xmodel_mesh_name(mesh), nv, nf, have_view, have_proj,
+                wp[0],wp[1],wp[2],wp[3], wp[4],wp[5],wp[6],wp[7],
+                wp[8],wp[9],wp[10],wp[11], wp[12],wp[13],wp[14],wp[15]);
+    }
+    for (int f = 0; f < nf; f++) {
+        svtx_t vt[3];
+        float fn[3] = {0.0f, 0.0f, 0.0f};
+        const float *mc;
+        uint32_t mi = fmat ? fmat[f] : 0u;
+        int ok = 1, i;
+
+        mc = xmodel_mesh_matcolor(mesh, (int)mi);
+        if (!mc)
+            mc = xmodel_mesh_matcolor(mesh, 0);
+        if (!nrm) {
+            /* Face normal in world space, for models without MeshNormals. */
+            const float *a = pos + idx[f * 3 + 0] * 3;
+            const float *b = pos + idx[f * 3 + 1] * 3;
+            const float *c = pos + idx[f * 3 + 2] * 3;
+            float u[3] = {b[0]-a[0], b[1]-a[1], b[2]-a[2]};
+            float v[3] = {c[0]-a[0], c[1]-a[1], c[2]-a[2]};
+            fn[0] = u[1]*v[2] - u[2]*v[1];
+            fn[1] = u[2]*v[0] - u[0]*v[2];
+            fn[2] = u[0]*v[1] - u[1]*v[0];
+        }
+        for (i = 0; i < 3; i++) {
+            uint32_t vi = idx[f * 3 + i];
+            const float *p;
+            float cx, cy, cz, cw, nx, ny, nz, nl, inten, r, g, b;
+            if (vi >= (uint32_t)nv) {
+                ok = 0;
+                break;
+            }
+            p = pos + vi * 3;
+            cx = p[0]*wvp[0] + p[1]*wvp[4] + p[2]*wvp[8]  + wvp[12];
+            cy = p[0]*wvp[1] + p[1]*wvp[5] + p[2]*wvp[9]  + wvp[13];
+            cz = p[0]*wvp[2] + p[1]*wvp[6] + p[2]*wvp[10] + wvp[14];
+            cw = p[0]*wvp[3] + p[1]*wvp[7] + p[2]*wvp[11] + wvp[15];
+            if (cw <= 1e-6f) {
+                ok = 0;
+                break;
+            }
+            if (nrm) {
+                const float *n = nrm + vi * 3;
+                nx = n[0]*wp[0] + n[1]*wp[4] + n[2]*wp[8];
+                ny = n[0]*wp[1] + n[1]*wp[5] + n[2]*wp[9];
+                nz = n[0]*wp[2] + n[1]*wp[6] + n[2]*wp[10];
+            } else {
+                nx = fn[0]; ny = fn[1]; nz = fn[2];
+            }
+            nl = nx*nx + ny*ny + nz*nz;
+            if (nl > 1e-12f) {
+                nl = 1.0f / sqrtf(nl);
+                inten = nx*light[0] + ny*light[1] + nz*light[2];
+                if (inten < 0.0f) inten = -inten;      /* two-sided */
+                inten = 0.30f + 0.70f * (inten * nl);
+            } else {
+                inten = 0.6f;
+            }
+            r = mc[0] * inten; g = mc[1] * inten; b = mc[2] * inten;
+            vt[i].x = g_vp_x + (cx / cw + 1.0f) * 0.5f * g_vp_w;
+            vt[i].y = g_vp_y + (1.0f - cy / cw) * 0.5f * g_vp_h;
+            vt[i].z = cz / cw;
+            vt[i].iw = 1.0f / cw;
+            vt[i].u = uv ? uv[vi * 2 + 0] : 0.0f;
+            vt[i].v = uv ? uv[vi * 2 + 1] : 0.0f;
+            vt[i].color = 0xFF000000u |
+                ((uint32_t)(r >= 1.0f ? 255.0f : r * 255.0f) << 16) |
+                ((uint32_t)(g >= 1.0f ? 255.0f : g * 255.0f) << 8) |
+                (uint32_t)(b >= 1.0f ? 255.0f : b * 255.0f);
+            vt[i].valid = 1;
+        }
+        if (ok) {
+            g_stat.model_faces++;
+            for (i = 0; i < 3; i++) {
+                int sx = (int)vt[i].x, sy = (int)vt[i].y;
+                if (sx < g_stat.model_minx) g_stat.model_minx = sx;
+                if (sx > g_stat.model_maxx) g_stat.model_maxx = sx;
+                if (sy < g_stat.model_miny) g_stat.model_miny = sy;
+                if (sy > g_stat.model_maxy) g_stat.model_maxy = sy;
+            }
+            raster_array(vt, 3, 4, NULL, 0, 0, 1);
+        }
     }
 }
 
@@ -1306,12 +1502,18 @@ test_done:
         fprintf(stderr,
                 "render: frame %u: clear=%u draw=%u up=%u verts=%u "
                 "fvf=%06x stride=%u vb=%08x tex0=%08x bbox=(%d,%d)-(%d,%d) "
-                "onscreen=%u\n",
+                "onscreen=%u model=%u/%u mbox=(%d,%d)-(%d,%d)\n",
                 g_stat.presents, g_stat.clears, g_stat.draws, g_stat.draw_ups,
                 g_stat.verts, g_fvf, g_stream_stride, g_stream_vb, g_tex0,
                 g_stat.minx, g_stat.miny, g_stat.maxx, g_stat.maxy,
-                g_stat.onscreen);
+                g_stat.onscreen, g_stat.model_draws, g_stat.model_faces,
+                g_stat.model_minx, g_stat.model_miny,
+                g_stat.model_maxx, g_stat.model_maxy);
+    g_last_model_draws = g_stat.model_draws;
     g_stat.clears = g_stat.draws = g_stat.draw_ups = g_stat.verts = 0;
+    g_stat.model_draws = g_stat.model_faces = 0;
+    g_stat.model_minx = g_stat.model_miny = 0x7FFFFFFF;
+    g_stat.model_maxx = g_stat.model_maxy = -0x7FFFFFFF;
     g_stat.minx = g_stat.miny = 0x7FFFFFFF;
     g_stat.maxx = g_stat.maxy = -0x7FFFFFFF;
     g_stat.onscreen = 0;
@@ -1327,10 +1529,23 @@ test_done:
         unsigned ev = ev_s ? (unsigned)atoi(ev_s) : 0u;
         char dname[512];
         int hit = g_stat.presents == at;
+        static int model_dumped;
         if (ev && g_stat.presents >= at && ((g_stat.presents - at) % ev) == 0) {
             snprintf(dname, sizeof dname, "%s.%05u", dump ? dump : "", g_stat.presents);
             dump = dname;
             hit = 1;
+        }
+        /* OTOMEDIUS_DUMP_MODEL=<path>: capture the first frame that drew the
+         * 3D model, whatever present number that happens to be. */
+        {
+            const char *mp = getenv("OTOMEDIUS_DUMP_MODEL");
+            if (mp && *mp && !model_dumped && g_last_model_draws) {
+                dump = mp;
+                hit = 1;
+                model_dumped = 1;
+                fprintf(stderr, "render: dumped model frame %u to %s\n",
+                        g_stat.presents, mp);
+            }
         }
         if (dump && *dump && hit)
             render_dump_fb(dump);
@@ -1343,6 +1558,9 @@ void render_clear(int count, uint32_t rects, uint32_t flags, uint32_t color)
     (void)count;
     (void)rects;
     g_stat.clears++;
+    if (g_orderdbg)
+        fprintf(stderr, "order %u CLEAR flags=%x color=%08x count=%d\n",
+                ++g_order_seq, flags, color, count);
     if (flags & 1) {
         g_clear = color & 0x00FFFFFFu;
         fb_fill(g_clear);
@@ -1458,6 +1676,9 @@ void render_draw_up(uint32_t prim, uint32_t count, uint32_t data, uint32_t strid
     (void)fvf;
     g_stat.draw_ups++;
     g_stat.verts += count;
+    if (g_orderdbg)
+        fprintf(stderr, "order %u UP prim=%u count=%u tex=%08x fvf=%06x\n",
+                ++g_order_seq, prim, count, g_tex0, fvf);
     if (g_verbose > 1 && g_first_draw_logged < 8) {
         g_first_draw_logged++;
         fprintf(stderr,

@@ -45,11 +45,13 @@ sepa qué hacer sin improvisar. Las reglas operativas completas están en
 
 ### 0.1 `INICIAR`
 
-El usuario envía `INICIAR` junto con la cuenta, el repositorio, el email y el
-token de GitHub. La IA debe:
+El usuario envía `INICIAR` junto con el **token de GitHub**, y nada más: la
+cuenta, el repositorio, el email y la rama se deducen del árbol de trabajo
+(`git remote get-url origin`, `git config user.email`,
+`git branch --show-current`). La IA debe:
 
 1. Leer `AGENTS.md`, este booklet (empezando por la sección más reciente, hoy
-   §11) y `docs/HANDOVER_PROMPT.md`.
+   §12) y `docs/HANDOVER_PROMPT.md`.
 2. Comprobar `git log -1` y `git status` para no pisar trabajo sin commitear.
 3. Compilar solo lo tocado y correr `tests/smoke.sh` antes de cambiar código.
 4. Continuar el plan de `docs/HANDOVER_PROMPT.md` §5.
@@ -2193,6 +2195,195 @@ R docs/HANDOVER.md         renombrado a docs/BOOKLET.md
    blending.
 4. **Rendimiento**: perfilar `draw_tri`/`tex_sample`; el rasterizador software
    sigue en ~26–36 fps.
+
+---
+
+## 13. Sesión 2026-11-16/17 (séptima parte): parser `.x` real, jerarquía de frames y render targets
+
+> **Esta sección manda sobre §1–§12.** El modelo del jugador ya no es una nave
+> sintética: se parsea el `.x` binario del pak, se construye la jerarquía real
+> de 58 frames con el allocator del juego y se dibujan las 6 mallas (7.998
+> caras). El smoke de 4700 **pasa** (antes colgaba en el present 4532). Lo que
+> queda es la *visibilidad* del modelo: el juego lo dibuja y acto seguido hace
+> `Clear(TARGET)` antes del HUD, así que hace falta localizar la pasada de
+> escena (ver §13.8).
+
+### 13.1 Formato del `.x` binario (lo que hay que saber)
+
+`D3DXLoadMeshHierarchyFromXInMemory` recibe el `.x` ya extraído del `MESH` de
+`Player02.pak` (`xof 0303bin 0032`, 4.059.860 bytes). El parser
+(`native/xmodel.c`) descubre estas reglas del formato:
+
+- **Plantillas**: `TOKEN_TEMPLATE NAME OBRACE GUID <miembros> CBRACE`. Un
+  miembro es `TIPO NAME <nombre> [OBRACKET dims CBRACKET] SEMI`, donde `TIPO`
+  es un token escalar, `TOKEN_ARRAY` + escalar, o `TOKEN_NAME <plantilla>`.
+  La lista de miembros puede terminar en `[...]` (después vienen objetos
+  anidados) o en `[<plantilla> <guid>]` (lista inline de objetos).
+  En este fichero `Frame` y `Mesh` y `Material` y `AnimationSet` llevan
+  `[...]`/inline.
+- **Objetos de datos**: `NAME <plantilla> [NAME <instancia>] OBRACE valores
+  CBRACE`. El nombre de instancia es el que da los nombres de frame
+  (`Frame p02_master { … }`).
+- **Listas compartidas**: los escalares de miembros consecutivos van
+  empaquetados en `TOKEN_INTEGER_LIST`/`TOKEN_FLOAT_LIST` que **atraviesan
+  varios miembros** (p. ej. `MeshMaterialList` mete `nMaterials`,
+  `nFaceIndexes` y los 486 índices en una sola lista de 488 enteros). Por eso
+  se consumen con un cursor (`vs_int`/`vs_float`) y no miembro a miembro.
+- **Plantillas inline (aplanadas)**: `Vector`, `Matrix4x4`, `Coords2d`,
+  `ColorRGBA`, `ColorRGB`, `MeshFace`, `FloatKeys` y `TimedFloatKeys` no
+  aparecen como objetos anidados: sus miembros se escriben en el flujo del
+  padre. Así, `vertices` de una malla son `3*nVertices` floats sueltos y
+  `FrameTransformMatrix` es una lista de 16 floats.
+- **Cadenas**: `TOKEN_STRING|LPSTR` + longitud de 32 bits + bytes, sin
+  terminador. En los datos, la cadena va seguida de `SEMI`.
+- **Solo se parsea el árbol de frames**: los `AnimationSet` que vienen después
+  usan una forma de datos (`{ nombre }` suelto) que no hace falta mientras el
+  controller de animación siga siendo NULL.
+
+### 13.2 Jerarquía real (`native/d3dx9.c`)
+
+- `hle_build_from_x()` parsea el `.x` y crea **un frame del juego por frame
+  del fichero** con `hle_create_frame()` (la vtable `0x559074` del propio
+  juego), copia la matriz local en `frame+4` y enlaza `pFrameFirstChild`
+  (`+0x4c`) / `pFrameSibling` (`+0x48`).
+- Cada frame con malla recibe un contenedor nativo (`hle_container()`) en
+  `frame+0x44 = container+4`, y una tabla lateral
+  `hle_cont_addr/hle_cont_mesh/hle_cont_world` asocia contenedor → índice de
+  malla → matriz de mundo compuesta.
+- `hle_frame_world()` compone las matrices locales desde la raíz (orden
+  row-vector) y así cada malla cae en su sitio: `body` (≈11,6 u de alto),
+  `bike` debajo/detrás, `gunR`/`gunR1` espejadas a los costados, manos delante.
+- El draw del contenedor llega por `thiscall` (`ecx` = `this`), resuelve la
+  malla con `hle_cont_lookup()` y llama a `render_draw_model()`.
+- El juego pasa **la misma matriz de escena a todos los nodos** (la pose está
+  stubeada), así que `hle_mesh_draw()` usa solo la matriz de frame mientras no
+  haya VIEW capturada (`render_has_view()`), y multiplica por la del juego
+  cuando la haya.
+
+### 13.3 Dibujo de la malla real (`native/render.c`)
+
+`render_draw_model(world, mesh)` transforma posiciones y normales, hace
+`WVP = world*VIEW*PROJ`, divide por `w`, descarta `w <= 0` y rasteriza con
+`raster_array(..., prim=4, tex=NULL, depth=1)`. Sin texturas todavía (el HLE
+sustituye el contenedor del juego, así que sus stages nunca llegan), el
+sombreado es una luz direccional fija de dos caras sobre el color difuso del
+material (todos blancos en este `.x`).
+
+### 13.4 Causa raíz del cuelgue en el present 4532
+
+`d3dx_LoadMeshHierarchyFromXInMemory` comprobaba `is_player` y hacía
+`if (!is_player) RET32(0);` **sin `return`**: `RET32` solo escribe `eax`, así
+que los ~80 `.x` no-player seguían construyendo 5 frames + contenedor cada
+uno. El attract cambiaba de stage en el 4532 (`CPlayer02::Init`, `0x4ECBF3`),
+volvía a cargar modelos y la máquina se quedaba girando sin avanzar (13 min
+de CPU, sin escribir en el log). Con el `return` explícito (y el parser real
+solo para el `.x` del jugador) el smoke de 4700 termina limpio.
+
+### 13.5 Back buffer y render targets
+
+- El **framebuffer vive ahora en memoria emulada** (`emu_alloc` en
+  `render_init`, `render_framebuffer_guest()`), para que el juego pueda leerlo:
+  `dev_GetBackBuffer()` aliasea la superficie al framebuffer
+  (`surface_alias_backbuffer`).
+- `dev_GetRenderTargetData()` y `dev_StretchRect()` copian de verdad
+  (`surface_copy`, pitch = ancho*4).
+- `dev_SetRenderTarget()` engancha la superficie a `render_set_target()`, que
+  redirige `Clear`/draws al buffer de la textura (las superficies de nivel 0 ya
+  comparten `data` con la textura, ver `t_GetSurfaceLevel`).
+- **El motor sí lo usa.** La función de escena `0x450190` hace
+  `GetRenderTarget(0)` → `GetSurfaceLevel(0)` de la textura `[0x5E1EB8]` →
+  `SetRenderTarget(0, surface)` → `call 0x415810` (recorrido de nodos), y la
+  secuencia por frame que ve el rasterizador es
+  `Clear(7) → MODEL×6 → Clear(TARGET) → HUD 2D`.
+- **Trampa de esta sesión**: el primer test de render targets se hizo con un
+  `d3d9.o` viejo (no estaba en la lista de `build.sh`), así que parecía que el
+  juego no llamaba a `SetRenderTarget`. Con el objeto reconstruido, se ven los
+  bindings (superficies de 256×256 que comparten `pixels`, es decir la misma
+  textura de escena). **Regla**: al probar una API nueva, comprobar que su
+  `.o` es más nuevo que el `.c`.
+- El draw del contenedor llega desde `0x415846` (dentro de `0x415810`, que
+  recorre los nodos de 0x70 bytes y llama a `[container_vt+4]` con
+  `(escena, nodo+0x30, nodo+0x20)`) y desde `0x4ECC31` (`CPlayer02`).
+
+### 13.6 Estado verificado
+
+- `tests/smoke.sh` (4700 presentes, audio dummy): **PASS**, `DEMO state=5`,
+  `CGameMan ctor … mask220=00000000`, sin `no recompiled code`.
+- En proceso: `xmodel: 23 templates`, `58 frames, 6 meshes, 7375 verts,
+  7998 faces`; el draw del contenedor se llama 6 veces por frame
+  (`model=6/7998`).
+- El parser en C coincide con un prototipo Python independiente en frames,
+  padres, mallas, materiales (`1,1,1,1` ×4), `facemat` y en el primer vértice
+  (`2.309 0.170 3.132`) y primera cara (`3 2 6`).
+- Sigue sin verse el modelo: ver §13.8.
+
+### 13.7 Ficheros de esta sesión
+
+```
+A native/xmodel.c          parser del .x binario (plantillas, frames, mallas,
+                           materiales, normales, UVs)
+A native/xmodel.h          API de consulta + xmodel_dump()
+M native/d3dx9.c           jerarquía real desde el .x, tabla contenedor→malla,
+                           hle_frame_world, render_has_view, ret del draw
+M native/render.c          render_draw_model (WVP + luz), framebuffer en MEM,
+                           render_set_target, contadores model=N/M, mbox,
+                           OTOMEDIUS_ORDERDBG, OTOMEDIUS_DUMP_MODEL
+M native/d3d9.c            GetBackBuffer aliaseado, GetRenderTargetData,
+                           StretchRect, SetRenderTarget reales
+M native/d3d9_objects.c    surface_alias_backbuffer/copy/pixels/width/height
+M native/d3d9.h            declaraciones nuevas
+M native/platform_sdl.c    contador de chunks de audio descartados
+M AGENTS.md                INICIAR solo con token; §12 como sección vigente
+M README.md                protocolo y estado del 3D
+M docs/BOOKLET.md          esta sección
+M docs/HANDOVER_PROMPT.md  prompt de la sesión siguiente
+```
+
+### 13.8 Bloqueos y próximos pasos
+
+1. **Visibilidad del modelo (bloqueo activo)**. El modelo se dibuja en la
+   textura de escena (`SetRenderTarget` ya funciona) pero en los dumps
+   capturados no se ve: la ventana en la que el attract dibuja el modelo es
+   estrecha (≈present 4300–4440) y coincide con un *fade* (blanco → negro) que
+   tapa la composición. Siguiente paso: dumpear en medio de la ventana
+   (`OTOMEDIUS_DUMP_MODEL` sólo da el primero; usar `OTOMEDIUS_DUMP_FB` +
+   `OTOMEDIUS_DUMP_EVERY=20` desde 4300) y, si el modelo tampoco aparece,
+   revisar dos cosas:
+   - la textura de escena que reporta el binding es de **256×256**, mientras
+     que el viewport del juego es 1280×1024: con `render_set_target` el
+     rasterizador recorta a 256×256 y la proyección sigue siendo la del
+     viewport grande, así que el modelo puede caer fuera;
+   - el quad que compone la escena bajo el HUD (texturas tipo `0x6289ED20`,
+     FVF `0x328432`) para ver de qué textura tira y con qué UVs.
+2. **Cámara real**: capturar VIEW/PROJ del camino de shaders (matrices por
+   handle de `ID3DXEffect`) y quitar el centrado de `render_draw_ship`/
+   `render_draw_model`.
+3. **Texturas del modelo**: los materiales son blancos y las texturas viven en
+   los `TXGP` de `Player02.pak`; el HLE tendría que enlazarlas al contenedor.
+4. **Texto largo del warning**: sigue solapándose (§4.3). El `ABC` de 12 bytes
+   y el test de interior corrigieron el resto.
+5. **Reportes del usuario de esta sesión** (sin diagnosticar todavía):
+   - los logos de Konami/eAMUSE y el warning "se ven warpeados" mientras
+     animan. Descartados aspecto (el compositor usa escala uniforme y el juego
+     es 5:4 nativo, `CreateDevice(1280x1024)`) y pitch (`LockRect` devuelve
+     `w*4`). Falta un dump del boot (`OTOMEDIUS_DUMP_FB` + `DUMP_AT` bajo).
+   - el audio del vídeo "saltaba" un poco: `platform_audio_submit` descarta el
+     chunk si la cola supera ~200 ms y el dispositivo no consume en 500 ms.
+     Ahora hay contador (`audio: dropped N chunk(s), queue full`); si aparece
+     durante el vídeo, el problema es de *pacing* (frames largos), no del
+     decodificador.
+6. **Rendimiento**: ~26–36 fps; con las 7.998 caras nuevas conviene medir
+   (`render: frame … model=`) antes de perfilar `draw_tri`/`tex_sample`.
+
+### 13.9 Diagnóstico nuevo
+
+- `OTOMEDIUS_XMODEL_DBG=1`: plantillas, frames y mallas del `.x` parseado.
+- `OTOMEDIUS_ORDERDBG=1`: orden de envío (`CLEAR`, `UP`, `MODEL`).
+- `OTOMEDIUS_DUMP_MODEL=<path.ppm>`: dumpea el primer frame que dibuja el
+  modelo, sin depender del número de present.
+- `OTOMEDIUS_RTDBG=1`: `SetRenderTarget` / `GetRenderTargetData`.
+- `render: frame … model=N/M mbox=(…)`: draws y caras del modelo por frame.
+- `audio: dropped N chunk(s), queue full`: descartes del mezclador.
 
 ---
 

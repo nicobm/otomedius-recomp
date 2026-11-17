@@ -7,7 +7,7 @@ de su propio dump.
 
 La referencia técnica canónica y acumulativa es **`docs/BOOKLET.md`**. El plan
 de la sesión en curso está en **`docs/HANDOVER_PROMPT.md`**. Si hay conflicto,
-manda la sección más reciente del booklet (hoy §11) y, después, el prompt.
+manda la sección más reciente del booklet (hoy §12) y, después, el prompt.
 
 ---
 
@@ -15,12 +15,18 @@ manda la sección más reciente del booklet (hoy §11) y, después, el prompt.
 
 ### `INICIAR`
 
-El usuario envía la palabra **`INICIAR`** acompañada de:
+El usuario envía la palabra **`INICIAR`** acompañada solo del **token de
+GitHub**. La cuenta, el repositorio, el email y la rama se deducen del propio
+árbol de trabajo; no hace falta repetirlos:
 
-- cuenta de GitHub,
-- nombre del repositorio,
-- email,
-- token de GitHub.
+| Dato | De dónde se deduce |
+|---|---|
+| cuenta / repositorio | `git remote get-url origin` |
+| email | `git config user.email` (o el `Author` de `git log -1`) |
+| rama de push | `git branch --show-current` (`master` por defecto) |
+
+Si el usuario los menciona igualmente, se usan como comprobación cruzada: si no
+coinciden con el remoto configurado, se avisa antes de tocar nada.
 
 Con esa señal, la IA debe:
 
@@ -48,9 +54,11 @@ No se reescribe historia ni se hace `force-push`.
 
 ### Token de GitHub
 
-El token **nunca** se escribe en un fichero del repo, ni en `AGENTS.md`, ni en
-un comando que quede visible en logs. Para el push se usa una variable de
-entorno y un `GIT_ASKPASS` temporal fuera del repositorio:
+El token llega **solo en el mensaje `INICIAR`** (o cuando se pida `TERMINAR`).
+Se mantiene únicamente en la memoria de la sesión: **nunca** se escribe en un
+fichero del repo, ni en `AGENTS.md`, ni en un comando que quede visible en logs.
+Para el push se usa una variable de entorno y un `GIT_ASKPASS` temporal fuera
+del repositorio:
 
 ```sh
 # /tmp/opencode/askpass.sh solo imprime la variable; no contiene el token
