@@ -103,7 +103,7 @@ There is **no CMake and no MSVC**: the build is a single manifest script
 
 ### 1.2 Local (agent) build, no Flatpak
 
-* Compiler: `zig cc` (`<SALA DE TRABAJO>/.work/zig/zig`).
+* Compiler: `zig cc` (`<Proyectos>/.work/zig/zig`).
 * Headless backend: `tests/platform_null.c` implements every `platform_*`
   symbol (no SDL, no GPU).
 * Layout: `.work/gen` (generated C), `.work/obj` (native `.o`),
@@ -1647,7 +1647,7 @@ nativo del vídeo (`0x43F540`) con X duplicada; rendimiento ~26–36 fps
 ### 9.7 Prompt para la sesión nueva
 
 ```
-Repo: /var/home/vm/Proyectos/SALA DE TRABAJO/otomedius-recomp (recompilación
+Repo: ~/Proyectos/Proyectos/otomedius-recomp (recompilación
 estática de Otomedius, Flatpak + SDL3). Lee docs/BOOKLET.md entero; manda §9.
 No hagas commits ni push sin pedirlo; nunca escribas tokens en archivos.
 Herramientas persistentes: .work/tools/{build.sh,xd.py,ppm2png.py}
@@ -2548,7 +2548,7 @@ desarrollan con varios LLMs usados a través de **OpenCode** como agente de cód
 
 ---
 
-## 15. Sesión 2026-11-17 (novena parte): granja `recomp-farm` y recompilación distribuida verificada
+## 15. Sesión 2026-11-17 (novena parte): granja `build-grid` y recompilación distribuida verificada
 
 > **Esta sección manda sobre §1–§14 en todo lo relativo al *workflow de
 > compilación*.** El estado del port en sí sigue siendo el de §14 (el modelo 3D
@@ -2562,9 +2562,9 @@ desarrollan con varios LLMs usados a través de **OpenCode** como agente de cód
 | Dónde | Qué |
 |---|---|
 | `tools/farm.py` (nuevo) | cliente **TD1** de la granja: `status`, `scan`, `sync`, `run --kit/--sync/--collect/--stream`. Sin `podman`, sin IPs en el código |
-| `README.md` | sección **Build farm (`recomp-farm`)**: arquitectura, canal del agente, receta de reproducibilidad y resultados medidos |
+| `README.md` | sección **Build farm (`build-grid`)**: arquitectura, canal del agente, receta de reproducibilidad y resultados medidos |
 | `AGENTS.md` §6 | reglas duras de la granja (quién hace qué, kits, reproducibilidad, un solo escritor por árbol de objetos) |
-| fuera del repo | granja `recomp-farm` v3 en `~/Proyectos/SALA DE TRABAJO/recomp-farm`: script único, master que **sale** a los workers y que además **escucha TD1 él mismo** (`role=master+worker`, añadido en `d473346`), imagen **Arch** con zig 0.17.1 + gcc + distcc, API HTTP opcional (`tools/farmd.py`) |
+| fuera del repo | granja `build-grid` v3 en `~/Proyectos/Proyectos/build-grid`: script único, master que **sale** a los workers y que además **escucha TD1 él mismo** (`role=master+worker`, añadido en `d473346`), imagen **Arch** con zig 0.17.1 + gcc + distcc, API HTTP opcional (`tools/farmd.py`) |
 | `../.work/farm-kit` | kit de prueba (3 `rc_*.c` + `x86rt.h` + `build.sh`) |
 | `../.work/farm-build` | kit del build completo (50 MB: `native/` + `gen/` + headers SDL3/FreeType + `build-farm.sh`) |
 
