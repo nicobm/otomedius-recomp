@@ -210,15 +210,15 @@ OTOMEDIUS_BIN=out/otomedius-recomp OTOMEDIUS_DIR=/path/to/dump sh tests/smoke.sh
 The script always sets `SDL_AUDIODRIVER=dummy`, so tests are quiet (including
 the intro movie's audio). For manual runs use the same variable.
 
-## Build farm (`recomp-farm`)
+## Build farm (`build-grid`)
 
 Development compiles on a LAN-only build farm: one **master** plus N **workers**,
-all rootless podman, driven by `recomp-farm.sh` (the farm project lives outside
-this repository, today in `~/Proyectos/SALA DE TRABAJO/recomp-farm`).
+all rootless podman, driven by `build-grid.sh` (the farm project lives outside
+this repository, today in `~/Proyectos/build-grid`).
 
 ```
    master (this dev VM, inside the GNOME Boxes NAT)
-     recomp-farm.sh  ── TCP 47824 ──▶  workers   the master dials OUT: no
+     build-grid.sh  ── TCP 47824 ──▶  workers   the master dials OUT: no
      (scans the LAN)  ◀── output ───             port-forwarding, no inbound
                                                  ports on the master
 ```
@@ -255,7 +255,7 @@ python3 tools/farm.py run --sync DIR --collect ../.work/farm-out -- '<cmd>'
 ```
 
 It reads `.config/secret` and `.config/slaves{,.cache}` from the master volume
-(`~/.local/share/containers/storage/volumes/recomp-farm-workspace/_data`,
+(`~/.local/share/containers/storage/volumes/build-grid-workspace/_data`,
 override with `OTOMEDIUS_FARM_VOL`), asks `TD1 HAVE <sha>` before sending a kit,
 falls back to sending the tar on old workers, retries on `missing kit`, replaces
 `{host}/{slots}/{total_slots}/{user}` (leaving `{dir}` to the worker) and
