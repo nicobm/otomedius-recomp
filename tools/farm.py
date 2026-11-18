@@ -630,12 +630,16 @@ def dispatch(args, kit):
     for worker, rc, out, secs in sorted(results, key=lambda r: r[0]["label"]):
         if rc != 0:
             failed += 1
-        if getattr(args, "quiet", False) and rc == 0:
-            continue
         collect = getattr(args, "collect", None)
         saved = None
+        # --collect corre también con --quiet: callar la salida no debe tirar
+        # los objetos (antes el `continue` se los comía).
         if collect and BUNDLE_TAG in out:
             saved = save_bundle(collect, worker["label"], out)
+        if getattr(args, "quiet", False) and rc == 0:
+            if saved:
+                print("[farm] objetos de %s en %s" % (worker["label"], saved))
+            continue
         print("\n===== %s exit=%d (%.1fs) =====" % (worker["label"], rc, secs))
         if collect:
             out = "".join(

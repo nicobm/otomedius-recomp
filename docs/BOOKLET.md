@@ -2666,11 +2666,90 @@ sesión.
 ### 15.7 Bloqueos y próximos pasos
 
 1. **Port (sin cambios respecto de §14)**: mapeo material→textura del motor,
-   escenario y enemigos (`store` por modelo), cartel de red, `REPLAY RAND
-   ERROR`, texto largo.
+   escenario y enemigos (`store` por modelo), cartel de red (resuelto en §16),
+   `REPLAY RAND ERROR`, texto largo.
 2. **Granja**: devolver artefactos fuera del stdout (endpoint o socket aparte),
    sumar el tercer slave y —si se quiere independencia del secreto— usar el
    `serve` HTTP (`tools/farmd.py`) en vez de TD1 directo.
 3. **Regla nueva**: los objetos de la granja se linkean desde
    `.work/farm-out`, nunca se descomprimen sobre `.work/obj` (un solo escritor
    por árbol).
+
+---
+
+## 16. Sesión 2026-11-17 (décima parte): cartel de red resuelto y método de trabajo
+
+> **Esta sección manda sobre §15 en el estado del port.** El workflow de
+> compilación sigue siendo el de §15 (granja + reproducibilidad), con una regla
+> nueva: comprobar `farm.py status` antes de compilar.
+
+### 16.1 El cartel de red: causa real
+
+El banner rojo `ネットワーク接続状況確認中` lo dibuja la capa 2D (`0x455bc0`)
+mientras `[0x5de160] < 5`. La máquina de estados de red (`0x4296d0`) llama a
+`bms_ea3_get_status_wait(int *status, int *sub)` del `libbms.dll` original y
+ramifica con una tabla de saltos en `0x429848`.
+
+El stub viejo (`bms_ok`) devolvía 0 **sin escribir `*status`**, así que el estado
+quedaba en 0 y el banner no se iba nunca. Además el argumento no es un puntero a
+puntero: la máquina hace `lea esi,[ebx+0x10]` y luego `mov esi,[esi]`, o sea que
+el argumento **es** la dirección del `int` de estado. El stub escribía el valor
+en el sitio correcto, pero con el valor equivocado.
+
+### 16.2 La tabla de saltos: qué estado va a dónde
+
+La tabla real en `0x429848` es `{0x429757, 0x429757, 0x42977d, 0x4297ca}`, con
+`cmp esi,3; ja default` (índice = valor de estado):
+
+| estado | salto | efecto |
+|---|---|---|
+| 0 | `0x429757` | `[0x5de160]=3`, `[0x5de164]=1`, reintenta |
+| 1 | `0x429757` | igual que 0 (la tabla repite el destino) |
+| 2 | `0x42977d` | mensaje del servidor pendiente → `[0x5de160]=2` o `4` |
+| 3 | `0x4297ca` | `[0x5de160]=5` (**check terminado**) |
+
+Ojo con la etiqueta: el recompilador rotula `0x4297ca` como `case2` porque es el
+**tercer destino distinto** de la tabla, no porque el estado sea 2. El estado que
+llega ahí es **3**. El stub escribía 2 → el juego se quedaba en 4; ahora escribe
+**3** en `*status` y **0** en `*sub` (sin licencia ni mensaje de servidor).
+
+### 16.3 Instrumentación agregada
+
+| Variable | Qué imprime |
+|---|---|
+| `OTOMEDIUS_NETDBG=1` | cada llamada a `bms_ea3_get_status_wait` con `st/sub/old`, registros y los globals `[0x5de160]`/`[0x5de164]` |
+| `OTOMEDIUS_DRAWDBG=<frame>` | ahora incluye `caller=%08x` (`[esp]` en el `draw_up_vertices`) para saber qué función pide cada primitiva |
+
+### 16.4 Arreglo en el cliente de la granja
+
+`tools/farm.py run --quiet --collect` perdía los objetos: el `continue` de
+`--quiet` saltaba antes de `save_bundle`. Ahora `--collect` corre siempre y
+`--quiet` sólo calla la salida. Verificado con el build completo de 105 objetos
+en los 4 nodos.
+
+### 16.5 Cambios por fichero
+
+| Fichero | Cambio |
+|---|---|
+| `native/avs.c` | `bms_ea3_get_status_wait` real (escribe `*status=3`, `*sub=0`, `OTOMEDIUS_NETDBG`); registrado en `avs_imports` en lugar de `bms_ok` |
+| `native/render.c` | `drawdbg` añade `caller=%08x` |
+| `tools/farm.py` | `--quiet` ya no se come `--collect` |
+| `AGENTS.md` | §0 nueva: rol, método y reglas críticas (nada de fuerza bruta, parches atómicos, binario como fuente de verdad); §6 regla de comprobar la granja antes de compilar |
+| `README.md`, `docs/HANDOVER_PROMPT.md` | estado: cartel de red resuelto; §3.1 con la tabla |
+
+### 16.6 Estado verificado
+
+- El banner desaparece y el attract sigue: dump de frame en el mismo punto
+  (`OTOMEDIUS_DUMP_FB`) sin el rojo, y `[0x5de160]` llega a 5 y se queda.
+- `tests/smoke.sh` (4700 presentes, audio dummy): **PASS**, exit 0, `DEMO
+  state=5`, `CGameMan ctor ... mask220=00000000`.
+- Binario enlazado con los cambios en `native/avs.c` y `native/render.c`.
+
+### 16.7 Bloqueos y próximos pasos
+
+1. **Port**: mapeo material→textura del motor, escenario y enemigos (`store` por
+   modelo), `REPLAY RAND ERROR`, texto largo y logos del boot.
+2. **Granja**: devolver artefactos fuera del stdout; comprobar `status` antes de
+   cualquier build. Sin workers vivos, compilar en local y decirlo.
+3. **Método**: cualquier discrepancia nueva se investiga primero en el binario
+   (`rc_*.c` o REA/Ghidra), nunca adivinando por logs.

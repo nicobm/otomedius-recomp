@@ -241,6 +241,43 @@ static void bms_init(void) { AVS_TRACE("bms_init", 0); RET32(0); }
 static void bms_init_wait(void) { AVS_TRACE("bms_init_wait", 0); RET32(0); }
 static void bms_eventlog_init(void) { AVS_TRACE("bms_eventlog_request_init", 0); RET32(0); }
 static void bms_ok(void) { RET32(0); }
+/* bms_ea3_get_status_wait(int *status, int *sub) - the e-AMUSE client monitor.
+ * The network-check state machine at 0x4296d0 calls it every few frames and
+ * branches on the *result*: 0 = success (it then reads status), 1 = error,
+ * >=2 = still working (it sleeps and retries).  The real DLL returns 1 until
+ * ea3_boot() ran and then reports its connection state in *status.
+ * The game's jump table at 0x429848 is {0,0,1,2} -> {0x429757,0x429757,
+ * 0x42977d,0x4297ca}, so the status value indexes straight into it:
+ *   0/1 -> 0x429757 -> [0x5de160] = 3   (not available / no connection)
+ *   2   -> 0x42977d -> [0x5de160] = 2|4 (server message pending)
+ *   3   -> 0x4297ca -> [0x5de160] = 5   (check finished, offline cabinet)
+ * (the generated NETDBG label "case2" for 0x4297ca refers to the table slot,
+ * not the status value).  [0x5de160] = 5 is the "network check done" state;
+ * while [0x5de160] < 5 the 2D layer (0x455bc0) draws the red
+ * "ネットワーク接続状況確認中" banner from MenuCmn's texture atlas.  Returning 0
+ * from this stub without writing *status left the machine in status 0 forever,
+ * so the banner never went away.  Report the offline-cabinet final state
+ * (status 3): the check finished, there is no server message, no license
+ * prompt.
+ * The argument really is the address of the status int (the machine does
+ * `lea esi,[ebx+0x10]` and later `mov esi,[esi]`), so write the value there,
+ * not a pointer. */
+static void bms_ea3_status_wait(void)
+{
+    uint32_t st = arg32(0), sub = arg32(1);
+    AVS_TRACE("bms_ea3_get_status_wait", 0);
+    if (getenv("OTOMEDIUS_NETDBG"))
+        fprintf(stderr, "netdbg: get_status_wait st=%08x sub=%08x old=%u/%u ret=%08x "
+                "ebx=%08x esi=%08x ecx=%08x g160=%u g164=%u\n",
+                st, sub, st ? M32(st) : 0, sub ? M32(sub) : 0,
+                M32(x86_cpu()->esp), x86_cpu()->ebx, x86_cpu()->esi,
+                x86_cpu()->ecx, M16(0x5de160u), M16(0x5de164u));
+    if (st)
+        M32(st) = 3;   /* check finished: the game's table maps 3 -> [0x5de160]=5 */
+    if (sub)
+        M32(sub) = 0;  /* no sub-status (license / server message) */
+    RET32(0);
+}
 /* The boot/attract manager (0x44D400) reads this 64-bit clock and divides a
  * delta by a frequency.  Returning a constant 0 made the divisor zero and the
  * game raised a divide-by-zero exception, which the CRT turned into an
@@ -377,7 +414,7 @@ const import_def_t avs_imports[] = {
     {"libbms.dll", "bms_ea3_license_agree", bms_ok, 0},
     {"libbms.dll", "bms_ea3_license_agree_wait", bms_ok, 0},
     {"libbms.dll", "bms_ea3_get_status", bms_ok, 0},
-    {"libbms.dll", "bms_ea3_get_status_wait", bms_ok, 0},
+    {"libbms.dll", "bms_ea3_get_status_wait", bms_ea3_status_wait, 0},
     {"libbms.dll", "bms_ea3_get_url_eapass", bms_ok, 0},
     {"libbms.dll", "bms_ea3_get_url_konaminetdx", bms_ok, 0},
     {"libbms.dll", "bms_ea3_get_eapass_valid", bms_ok, 0},

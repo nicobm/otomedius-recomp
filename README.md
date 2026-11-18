@@ -139,14 +139,19 @@ same time: the 1/3 and 2/3 blend colours were computed on the packed 24-bit
 value, so the channels carried into each other and every DXT texture had
 coloured speckles.
 
-Still open: the network-status banner (`ネットワーク接続状況確認中`), the
-`REPLAY RAND ERROR` overlay the game prints in the attract, the long warning
-text, the environment/enemy `.x` models (the parser holds a single model, so
-loading all of them needs a per-model mesh store) and drawing the model with
-the game's own material/texture mapping instead of the by-name heuristic. The
-software rasteriser runs at ~26–36 fps. The detailed state and the next steps
-are in [`docs/BOOKLET.md`](docs/BOOKLET.md) (section 15); the ready-to-paste
-next-session prompt is [`docs/HANDOVER_PROMPT.md`](docs/HANDOVER_PROMPT.md).
+The network-status banner is gone: the `libbms` HLE now answers
+`bms_ea3_get_status_wait` with the "check finished" state, so the game's network
+state machine reaches `[0x5de160]=5` and stops drawing the red
+`ネットワーク接続状況確認中` overlay.
+
+Still open: the `REPLAY RAND ERROR` overlay the game prints in the attract, the
+long warning text, the environment/enemy `.x` models (the parser holds a single
+model, so loading all of them needs a per-model mesh store) and drawing the
+model with the game's own material/texture mapping instead of the by-name
+heuristic. The software rasteriser runs at ~26–36 fps. The detailed state and
+the next steps are in [`docs/BOOKLET.md`](docs/BOOKLET.md) (section 16); the
+ready-to-paste next-session prompt is
+[`docs/HANDOVER_PROMPT.md`](docs/HANDOVER_PROMPT.md).
 
 ## Requirements
 

@@ -1,8 +1,8 @@
 # Otomedius (Arcade) — Handover para sesión nueva
 
 > Pegar este documento entero como prompt inicial. El documento canónico y
-> exhaustivo es `docs/BOOKLET.md`; **§15 manda sobre §1–§14** en lo relativo al
-> workflow de compilación, y §14 en el estado del port.
+> exhaustivo es `docs/BOOKLET.md`; **§16 manda sobre §1–§15** en lo relativo al
+> estado del port y al workflow de compilación.
 > Las reglas de operación (`INICIAR` / `TERMINAR`) están en `AGENTS.md` y en
 > `docs/BOOKLET.md` §0.
 > Repo: `/var/home/vm/Proyectos/SALA DE TRABAJO/otomedius-recomp`.
@@ -98,7 +98,8 @@ Reglas:
   (`sha256 fb256033…`) con **4 nodos** (master 12 + 16 + 4 + 4 = 36 slots); el
   smoke pasa. El master también es nodo TD1 (`--no-master` para excluirlo).
 - El usuario es quien hace `up`/`down` de la granja; si no hay workers, pedíselo
-  en vez de intentar `podman`.
+  en vez de intentar `podman`. **Antes de compilar, correr `farm.py status`**; si
+  no responde, decirlo y seguir en local (no fingir que se usó la granja).
 
 ---
 
@@ -122,7 +123,29 @@ jugador visible y texturado**.
 - **DXT1/3/5 corregido** (mezcla por canal).
 
 Lo que falta: el mapeo material→textura real del motor, el escenario/enemigos,
-el cartel de red, `REPLAY RAND ERROR`, el texto largo y los logos del boot.
+`REPLAY RAND ERROR`, el texto largo y los logos del boot. El cartel de red ya no
+aparece: `bms_ea3_get_status_wait` responde el estado "check finished" y el
+juego llega a `[0x5de160]=5` (ver §3.1).
+
+### 3.1 Cartel de red (resuelto en esta sesión)
+
+El banner rojo `ネットワーク接続状況確認中` lo dibuja la capa 2D (`0x455bc0`)
+mientras `[0x5de160] < 5`. La máquina de estados de red (`0x4296d0`) llama a
+`bms_ea3_get_status_wait(int *status, int *sub)` y usa una tabla de saltos en
+`0x429848` indexada por el estado:
+
+| estado | salto | efecto |
+|---|---|---|
+| 0 | `0x429757` | `[0x5de160]=3`, `[0x5de164]=1`, reintenta |
+| 1 | `0x429757` | igual que 0 (la tabla repite el destino) |
+| 2 | `0x42977d` | mensaje del servidor pendiente → `[0x5de160]=2` o `4` |
+| 3 | `0x4297ca` | `[0x5de160]=5` (**check terminado**) |
+
+La tabla real en `0x429848` es `{0x429757, 0x429757, 0x42977d, 0x4297ca}`
+(índice = valor de estado, `cmp esi,3; ja default`). El stub escribía 2 y el
+juego se quedaba en 4; ahora escribe **3** en `*status` y 0 en `*sub`. `OTOMEDIUS_NETDBG=1` imprime cada llamada con el estado y los
+globals. Verificado con dump de frame: el banner desaparece y el attract sigue.
+
 
 ---
 
@@ -153,9 +176,8 @@ un store por modelo y una tabla de contenedores dinámica
 
 ## 5. Plan inmediato (4 pasos)
 
-1. **Cartel de red**: identificar qué función de estado consulta el juego para
-   dibujar «ネットワーク接続状況確認中» y hacer que el HLE de `libbms`
-   (`native/avs.c`) responda "conectado", o silenciar el cartel.
+1. ~~**Cartel de red**~~ **HECHO** (§3.1): `bms_ea3_get_status_wait` escribe
+   `*status=3` y el juego llega a `[0x5de160]=5`; el banner ya no se dibuja.
 2. **`REPLAY RAND ERROR`**: averiguar qué RNG compara el replay (el mensaje está
    en `0x55beb0`) y si el CRT recompilado usa la secuencia de MSVC.
 3. **Material→textura** (ver §4) y blending/alpha del material

@@ -7,7 +7,50 @@ de su propio dump.
 
 La referencia técnica canónica y acumulativa es **`docs/BOOKLET.md`**. El plan
 de la sesión en curso está en **`docs/HANDOVER_PROMPT.md`**. Si hay conflicto,
-manda la sección más reciente del booklet (hoy §15) y, después, el prompt.
+manda la sección más reciente del booklet (hoy §16) y, después, el prompt.
+
+---
+
+## 0. Rol y método
+
+Actuás como **ingeniero senior de ingeniería inversa y de sistemas en C**,
+especializado en recompilación estática de binario a C. El objetivo es mantener
+**paridad lógica exacta** con el binario original de forma quirúrgica, eficiente
+y limpia.
+
+### 0.1 Reglas críticas
+
+1. **Nada de fuerza bruta.** No se corre el juego a ciegas ni se repiten
+   ejecuciones para "adivinar" fallos leyendo logs. Cada corrida debe tener una
+   hipótesis concreta y una variable de diagnóstico acotada (`OTOMEDIUS_QUIT_AT`
+   bajo, `OTOMEDIUS_TRIPWIRE`, `OTOMEDIUS_WATCH`, `OTOMEDIUS_DUMP_FB`). Los
+   `grep`/`head`/`tail` sobre logs sirven para **verificar** una hipótesis
+   concreta, no para explorar a ciegas.
+2. **Cero parches masivos.** Nada de reescribir archivos o bloques enteros.
+   Cambios atómicos, quirúrgicos y bien delimitados; el diff debe explicar por sí
+   solo qué se corrigió y por qué.
+3. **Una sola fuente de verdad.** Antes de tocar código, mirar el binario
+   original: REA/Ghidra (MCP) si está disponible y, si no, el código recompilado
+   `../.work/gen/rc_*.c` (una función por `fn_XXXXXXXX`). No se deduce la
+   semántica del original a partir de logs de la recompilación.
+4. **Documentar el workaround** en `native/patches.c` y en `docs/BOOKLET.md`.
+
+### 0.2 Flujo obligatorio ante una discrepancia
+
+1. **Análisis estático primero.** Consultar la firma, los tipos, los offsets y
+   el grafo de control en el binario original (REA/Ghidra o `rc_*.c`).
+   Confirmar qué hace realmente la función, no qué parece hacer.
+2. **Parche quirúrgico.** Editar solo las líneas necesarias para alinear la
+   lógica o los tipos; mantener el estilo del fichero.
+3. **Verificación aislada.** Antes de levantar el juego entero, compilar el
+   fichero (`sh ../.work/tools/build.sh <fichero>.c`) y, si aplica, un test
+   mínimo o `-fsyntax-only`.
+4. **Validación.** Recién entonces correr el smoke o una corrida acotada con
+   audio dummy. Si el cambio toca `native/x86rt.h`, regenerar y recompilar todo.
+5. **Compilación distribuida.** Usar la granja (§6) para builds completos o de
+   varios ficheros; para un solo fichero, el build local es más rápido. Si la
+   granja no responde, decirlo y seguir en local; **nunca** afirmar que se usó
+   la granja si no se usó.
 
 ---
 
@@ -108,8 +151,9 @@ SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy \
 
 - **Siempre** `SDL_AUDIODRIVER=dummy` en tests: si hay dispositivo, el mixer
   dsound→SDL suena de verdad.
-- Logs grandes = tokens. Usar `OTOMEDIUS_QUIT_AT` bajo y `grep`/`head`/`tail`;
-  no volcar logs enteros al contexto.
+- Logs grandes = tokens. Usar `OTOMEDIUS_QUIT_AT` bajo y `grep`/`head`/`tail`
+  **sobre una hipótesis concreta**; no volcar logs enteros al contexto ni correr
+  el juego a ciegas (ver §0.1).
 - Dumps visuales: `OTOMEDIUS_DUMP_FB=/tmp/opencode/frame.ppm` +
   `OTOMEDIUS_DUMP_AT=n`; convertir con `../.work/tools/ppm2png.py`.
 - Variables útiles: `OTOMEDIUS_BOOTDBG`, `OTOMEDIUS_DRAWDBG`, `OTOMEDIUS_3DDBG`,
@@ -144,9 +188,10 @@ SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy \
   `.x` real parseado (`native/xmodel.c`), cámara y luz de la escena, atlases
   `p02_*.dds` decodificados desde la imagen del pak en memoria.
 - Falta el escenario/enemigos (store por modelo), el mapeo material→textura del
-  motor, el cartel de red y el texto largo.
+  motor y el texto largo. El cartel de red ya no aparece: `bms_ea3_get_status_wait`
+  responde el estado "check finished" y el juego llega a `[0x5de160]=5`.
 - Los bloqueos y el plan inmediato están en `docs/HANDOVER_PROMPT.md` §4–§5 y
-  en la última sección de `docs/BOOKLET.md` (§15).
+  en la última sección de `docs/BOOKLET.md` (§16).
 
 ---
 
@@ -193,6 +238,10 @@ Reglas:
 - `tools/farm.py` incluye al master como candidato en `127.0.0.1` (se puede
   excluir con `--no-master`); el reparto se hace con `--hosts <addr>` y listas
   por shard.
+- **Antes de compilar, comprobar la granja**: `python3 tools/farm.py status`.
+  Si no hay workers vivos, avisar al usuario y compilar en local; no quedarse
+  esperando ni decir que se usó la granja. El usuario es quien hace `up`/`down`
+  (`recomp-farm.sh`); la IA no puede (no hay `podman` en el sandbox).
 
 ---
 

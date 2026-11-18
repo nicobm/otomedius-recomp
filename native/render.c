@@ -866,11 +866,13 @@ static void draw_up_vertices(uint32_t prim, uint32_t prim_count, uint32_t data,
         }
         if (dbg_at >= 0 && g_stat.presents == (unsigned)dbg_at) {
             fprintf(stderr, "drawdbg[%u]: prim=%u n=%u fvf=%x stride=%u tex=%08x %ux%u "
+                    "caller=%08x "
                     "rs(ab=%u src=%u dst=%u at=%u z=%u/%u/%u) "
                     "tss(cop=%u c1=%u c2=%u aop=%u) "
                     "ss(u=%u v=%u mag=%u) v0=(%.0f,%.0f z%.3f uv %.3f,%.3f c=%08x) "
                     "v2=(%.0f,%.0f uv %.3f,%.3f)\n",
                     g_stat.presents, prim, nverts, g_fvf, stride, g_tex0, tw, th,
+                    M32(x86_cpu()->esp),
                     g_rs[RS_ALPHABLENDENABLE], g_rs[RS_SRCBLEND], g_rs[RS_DESTBLEND],
                     g_rs[RS_ALPHATESTENABLE], g_rs[RS_ZENABLE],
                     g_rs[RS_ZWRITEENABLE], g_rs[RS_ZFUNC],
