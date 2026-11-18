@@ -5,7 +5,7 @@
 > estado del port y al workflow de compilación.
 > Las reglas de operación (`INICIAR` / `TERMINAR`) están en `AGENTS.md` y en
 > `docs/BOOKLET.md` §0.
-> Repo: `/var/home/vm/Proyectos/SALA DE TRABAJO/otomedius-recomp`.
+> Repo: `~/Proyectos/otomedius-recomp`.
 > `INICIAR` alcanza con el **token** de GitHub: la cuenta, el repo, el email y
 > la rama salen de `git remote`/`git config`.
 > Estado del árbol: **limpio** en el commit de esta sesión. No hagas commits ni
@@ -30,7 +30,7 @@
 
 Directorios: `native/` (capa Linux), `tools/recomp/`, `recomp/` (seeds+sha),
 `tests/`, `flatpak/`, `docs/`. `.work` está en el directorio **padre**:
-`/var/home/vm/Proyectos/SALA DE TRABAJO/.work`.
+`~/Proyectos/.work`.
 
 ```sh
 # compilar la capa nativa (solo los ficheros tocados) y enlazar
@@ -64,16 +64,16 @@ SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy \
 
 ---
 
-## 2. Granja de compilación (recomp-farm) — leer antes de compilar
+## 2. Granja de compilación (build-grid) — leer antes de compilar
 
 El usuario mantiene una granja LAN fuera del repo:
-`~/Proyectos/SALA DE TRABAJO/recomp-farm` (script `recomp-farm.sh`, un master en
+`~/Proyectos/build-grid` (script `build-grid.sh`, un master en
 esta VM y N workers). **El master no escucha**: sale él a los workers
 (`tcp/47824`); su CLI necesita `podman`, que el sandbox **no tiene**.
 
 El agente habla **TD1 directo contra los workers** con `tools/farm.py`, que lee
 el secreto y la lista de workers del volumen del master
-(`~/.local/share/containers/storage/volumes/recomp-farm-workspace/_data`).
+(`~/.local/share/containers/storage/volumes/build-grid-workspace/_data`).
 No hay IPs en el código.
 
 ```sh
@@ -233,5 +233,5 @@ usar la granja (§2) y comparar `sha256` de los objetos con el build local.
 - Logs mínimos; no volcar logs enteros.
 - Un cambio en `native/x86rt.h` ⇒ regenerar y recompilar los 85 `rc_*.c`.
 - Antes de tocar algo dudoso, `git diff` para no pisar trabajo del usuario.
-- Granja: no correr `recomp-farm.sh` desde el sandbox; usar `tools/farm.py` y
+- Granja: no correr `build-grid.sh` desde el sandbox; usar `tools/farm.py` y
   respetar la receta de reproducibilidad y el "un solo escritor por árbol".
