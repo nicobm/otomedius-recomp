@@ -195,10 +195,10 @@ SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy \
 
 ---
 
-## 6. Granja de compilación (recomp-farm)
+## 6. Granja de compilación (build-grid)
 
-El usuario mantiene fuera del repo la granja **recomp-farm** (hoy en
-`~/Proyectos/SALA DE TRABAJO/recomp-farm`): un **master** en esta VM (dentro del
+El usuario mantiene fuera del repo la granja **build-grid** (hoy en
+`~/Proyectos/SALA DE TRABAJO/build-grid`): un **master** en esta VM (dentro del
 NAT de Boxes) y N **workers** de la LAN, todo podman rootless, con imagen
 **Arch** (`zig 0.17.1`, gcc, distcc) y sin acceso a este filesystem. El master
 **sale** a los workers (`tcp/47824`) y además **escucha él mismo**
@@ -207,14 +207,14 @@ loopback desde el sandbox.
 
 | Quién | Qué hace |
 |---|---|
-| usuario | ciclo de vida: `./recomp-farm.sh up|down|scan|status|logs` |
+| usuario | ciclo de vida: `./build-grid.sh up|down|scan|status|logs` |
 | IA | `python3 tools/farm.py status|sync|run` — manda compilaciones y tests, lee logs y objetos |
 
 Reglas:
 
-- **La IA no corre `recomp-farm.sh`** (es `podman exec`, y en el sandbox no hay
+- **La IA no corre `build-grid.sh`** (es `podman exec`, y en el sandbox no hay
   podman). El enlace es TD1 contra los workers, firmado con el HMAC del secreto
-  que vive en el volumen `recomp-farm-workspace/.config/secret`. `tools/farm.py`
+  que vive en el volumen `build-grid-workspace/.config/secret`. `tools/farm.py`
   implementa ese cliente; no hay IPs en el código (salen de `slaves{,.cache}` o
   de un `scan`/`--subnet` explícito).
 - El secreto no se imprime ni se copia, y no se escribe nada en el volumen del
@@ -241,7 +241,7 @@ Reglas:
 - **Antes de compilar, comprobar la granja**: `python3 tools/farm.py status`.
   Si no hay workers vivos, avisar al usuario y compilar en local; no quedarse
   esperando ni decir que se usó la granja. El usuario es quien hace `up`/`down`
-  (`recomp-farm.sh`); la IA no puede (no hay `podman` en el sandbox).
+  (`build-grid.sh`); la IA no puede (no hay `podman` en el sandbox).
 
 ---
 
