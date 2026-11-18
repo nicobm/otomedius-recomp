@@ -34,6 +34,9 @@ y limpia.
    `../.work/gen/rc_*.c` (una función por `fn_XXXXXXXX`). No se deduce la
    semántica del original a partir de logs de la recompilación.
 4. **Documentar el workaround** en `native/patches.c` y en `docs/BOOKLET.md`.
+5. **Language Policy:**
+   - **Technical Artifacts & Code:** Always use **English** for all technical documentation, code comments, commit messages, logs, pull request descriptions, and any generated scripts or files.
+   - **User Communication:** Use **Spanish** exclusively for direct communication and responses to the user, addressing them directly.
 
 ### 0.2 Flujo obligatorio ante una discrepancia
 
