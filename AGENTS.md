@@ -198,57 +198,7 @@ SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy \
 
 ---
 
-## 6. Granja de compilación (build-grid)
-
-El usuario mantiene fuera del repo la granja **build-grid** (hoy en
-`~/Proyectos/SALA DE TRABAJO/build-grid`): un **master** en esta VM (dentro del
-NAT de Boxes) y N **workers** de la LAN, todo podman rootless, con imagen
-**Arch** (`zig 0.17.1`, gcc, distcc) y sin acceso a este filesystem. El master
-**sale** a los workers (`tcp/47824`) y además **escucha él mismo**
-(`role=master+worker`): sus núcleos también toman shard, alcanzables por
-loopback desde el sandbox.
-
-| Quién | Qué hace |
-|---|---|
-| usuario | ciclo de vida: `./build-grid.sh up|down|scan|status|logs` |
-| IA | `python3 tools/farm.py status|sync|run` — manda compilaciones y tests, lee logs y objetos |
-
-Reglas:
-
-- **La IA no corre `build-grid.sh`** (es `podman exec`, y en el sandbox no hay
-  podman). El enlace es TD1 contra los workers, firmado con el HMAC del secreto
-  que vive en el volumen `build-grid-workspace/.config/secret`. `tools/farm.py`
-  implementa ese cliente; no hay IPs en el código (salen de `slaves{,.cache}` o
-  de un `scan`/`--subnet` explícito).
-- El secreto no se imprime ni se copia, y no se escribe nada en el volumen del
-  master.
-- **Kits**: `farm.py sync DIR` imprime el `sha256`; el tar es determinístico
-  (`tar --sort=name --owner=0 --group=0 --numeric-owner -cf - . | gzip -n`), así
-  el cache `TD1 HAVE` pega entre el CLI y el agente. `--kit <sha>` no transmite
-  nada; con un worker viejo (sin HAVE) hay que mandar el tar.
-- **Reproducibilidad**: compilar en la granja siempre con `-target
-  x86_64-linux-gnu.2.44`, `-ffile-prefix-map=$PWD=.`,
-  `-fdebug-compilation-dir=.` y `-ffile-prefix-map=$ZIGLIB=@zig`
-  (receta completa en `README.md` §Build farm). Criterio de aceptación:
-  `sha256` de cada objeto igual al del build local; si no coincide, no se usa.
-- El dump **no** va a la granja: `--sync` manda sólo lo que el job necesita.
-- **Un solo escritor por árbol de objetos**: los `.o` de la granja se linkean
-  desde un directorio aparte (`.work/farm-out`); nunca se descomprimen sobre
-  `.work/obj`.
-- Verificado 2026-11-17: 105/105 objetos idénticos y **binario idéntico**
-  (`sha256 fb256033…`) con 4 nodos (master 12 + 16 + 4 + 4 = **36 slots**); el
-  smoke pasa con ese binario.
-- `tools/farm.py` incluye al master como candidato en `127.0.0.1` (se puede
-  excluir con `--no-master`); el reparto se hace con `--hosts <addr>` y listas
-  por shard.
-- **Antes de compilar, comprobar la granja**: `python3 tools/farm.py status`.
-  Si no hay workers vivos, avisar al usuario y compilar en local; no quedarse
-  esperando ni decir que se usó la granja. El usuario es quien hace `up`/`down`
-  (`build-grid.sh`); la IA no puede (no hay `podman` en el sandbox).
-
----
-
-## 7. Atribución
+## 6. Atribución
 
 La recompilación estática, la ingeniería inversa y la capa nativa Linux se
 desarrollan con varios LLMs usados a través de **OpenCode** como agente de
