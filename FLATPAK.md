@@ -33,6 +33,66 @@ The script installs the **Freedesktop Platform and SDK 26.08** automatically.
 A cold build takes a few minutes on a modern machine (the recompiler produces
 roughly 45 MB of C, which the SDK compiles with `-O2`).
 
+The result is exported to the persistent `repo/` directory (ignored by git) and
+installed for the current user through a single local remote called
+`otomedius-local`. The remote is left **disabled**: the app is built locally,
+so `flatpak update` has nothing to fetch and stays quiet, even if you later
+move or delete the checkout. **To update the app, run
+`./build-game-flatpak.sh` again**; it rebuilds and reinstalls from the local
+repository.
+
+`flatpak-builder` splits the debug symbols of the binary into a separate
+`io.github.nicobm.OtomediusRecomp.Debug` runtime. It is **not** needed to play:
+the script does not install it and removes one left by an older build, so it
+does not appear as a pinned runtime in `flatpak uninstall --unused`. If you
+want the symbols for `gdb`, run `./build-game-flatpak.sh --debug`.
+
+If you prefer to run `flatpak-builder` by hand, make sure `flatpak/wheels/`
+contains the capstone wheel first (run `./build-game-flatpak.sh` once, or
+download it from the URL in the script), then:
+
+```sh
+cp "/path/to/your/otomedius.zip" game.zip
+flatpak-builder --user --force-clean --disable-rofiles-fuse --repo=repo \
+    build-dir io.github.nicobm.OtomediusRecomp.json
+flatpak remote-add --user --if-not-exists --no-gpg-verify --no-use-for-deps \
+    otomedius-local "file://$PWD/repo"
+flatpak install --user --reinstall otomedius-local \
+    io.github.nicobm.OtomediusRecomp//master
+flatpak remote-modify --user --disable otomedius-local
+```
+
+## Troubleshooting
+
+* `flatpak update` reports `No se encontró la ref.
+  «app/io.github.nicobm.OtomediusRecomp/x86_64/master» en el remoto
+  otomediusrecomp-origin` (or `debug-origin`), or `Unable to update ...:
+  Remote "..." not found`: this comes from an install made by an older
+  `build-game-flatpak.sh`, which used `flatpak-builder --install`. That command
+  creates throw-away `*-origin` remotes pointing at the repository of one
+  particular build, so they break as soon as the checkout moves or the
+  repository is rebuilt elsewhere. Run `./build-game-flatpak.sh` again: it
+  reinstalls the app from `otomedius-local` and only then deletes the old
+  `*-origin` remotes (in that order, so nothing is left pointing at a deleted
+  remote). Deleting the old remotes by hand without reinstalling first makes
+  `flatpak update` fail with `Remote ... not found` for the installed refs.
+
+  If you only want to clean up without rebuilding, reinstall from the existing
+  `repo/` first, then remove the remotes:
+
+  ```sh
+  flatpak remote-add --user --if-not-exists --no-gpg-verify \
+      --no-use-for-deps otomedius-local "file://$PWD/repo"
+  flatpak install --user --reinstall otomedius-local \
+      io.github.nicobm.OtomediusRecomp//master
+  flatpak remote-modify --user --disable otomedius-local
+  flatpak remote-delete --user --force otomediusrecomp-origin
+  flatpak remote-delete --user --force debug-origin
+  ```
+
+  `flatpak remotes` hides disabled remotes, so `otomedius-local` only shows up
+  there with `flatpak remotes --show-disabled`.
+
 ## What the sandbox can and cannot do
 
 The manifest uses only these permissions:
@@ -77,5 +137,11 @@ downloaded items are:
 
 ```sh
 flatpak uninstall io.github.nicobm.OtomediusRecomp
+flatpak remote-delete --user --force otomedius-local
 rm -rf ~/.var/app/io.github.nicobm.OtomediusRecomp
+rm -rf repo/
 ```
+
+The `otomedius-local` remote and the `repo/` directory are only used by
+`./build-game-flatpak.sh`; the remote is disabled, so `flatpak update` does not
+need them.

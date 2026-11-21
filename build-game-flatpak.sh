@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Build and install Otomedius (recompiled) as a Flatpak.
 #
-#   ./build-game-flatpak.sh [path/to/game.zip]
+#   ./build-game-flatpak.sh [--debug] [path/to/game.zip]
+#
+# --debug also installs the <app-id>.Debug runtime (the debug symbols that
+# flatpak-builder splits out of the build); it is only useful with gdb and is
+# not needed to play, so it is not installed by default.
 #
 # The script is distribution agnostic: on a machine without flatpak or
 # flatpak-builder it prints the package names for the distribution it detects.
@@ -9,15 +13,32 @@
 # handled here.  The Flatpak build itself runs without network access and the
 # installed application can only see Wayland/X11, audio, the GPU and input
 # devices: no home directory, no host filesystem, no network.
+#
+# The result is exported to the persistent repo/ directory and installed
+# through one local remote, "otomedius-local", which is left disabled: the app
+# is built locally, so `flatpak update` has nothing to fetch.  To update it,
+# run this script again.
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
 APP_ID="io.github.nicobm.OtomediusRecomp"
+DEBUG_ID="${APP_ID}.Debug"
+LOCAL_REMOTE="otomedius-local"
 MANIFEST="${APP_ID}.json"
 RUNTIME_REF="org.freedesktop.Platform//26.08"
 SDK_REF="org.freedesktop.Sdk//26.08"
 GAME_ZIP_SHA256="4c6562eab3fff1bd1a6e84732bcb565a871440fcb894985fe990fe566a8bd897"
+
+# --debug: also install the debug runtime (see the comment at the top).
+WITH_DEBUG=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --debug) WITH_DEBUG=1; shift ;;
+        --) shift; break ;;
+        *) break ;;
+    esac
+done
 
 say()  { printf '\033[1m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
@@ -137,7 +158,17 @@ PY
 # 3. Runtime and SDK (26.08 is the current Freedesktop release).
 # ---------------------------------------------------------------------------
 flatpak_ref_installed() { flatpak info "$1" >/dev/null 2>&1; }
-flatpak_has_remote() { flatpak remotes "$1" --columns=name 2>/dev/null | grep -qx "$2"; }
+flatpak_has_remote() {
+    # `flatpak remotes` hides disabled remotes unless --show-disabled is given,
+    # and otomedius-local is disabled between builds; without it, a second run
+    # would not find the remote and `remote-add` would fail with
+    # "Remote otomedius-local already exists".  Older flatpak has no
+    # --show-disabled, so fall back to the plain listing.
+    local remotes
+    remotes=$(flatpak remotes "$1" --show-disabled --columns=name 2>/dev/null) ||
+        remotes=$(flatpak remotes "$1" --columns=name 2>/dev/null) || return 1
+    printf '%s\n' "$remotes" | grep -qx "$2"
+}
 
 install_ref() {
     local ref="$1"
@@ -197,11 +228,151 @@ if ! check_sha "flatpak/wheels/$CAPSTONE" "$CAPSTONE_SHA256"; then
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Build and install for the current user.
+# 5. Build, export and install for the current user.
 # ---------------------------------------------------------------------------
-flatpak remote-delete --user recomp-origin >/dev/null 2>&1 || true
-flatpak remote-delete --user debug-origin >/dev/null 2>&1 || true
+#
+#    `flatpak-builder --install` installs the app through throw-away
+#    "<last-id-component>-origin" remotes (otomediusrecomp-origin, debug-origin,
+#    and otomediusrecomp1-origin/... when those names are taken).  Those
+#    remotes point at the repository of one particular build, so as soon as the
+#    checkout moves, or the repository is rebuilt elsewhere, every
+#    `flatpak update` prints
+#
+#      No se encontró la ref. «app/io.github.nicobm.OtomediusRecomp/x86_64/master»
+#      en el remoto otomediusrecomp-origin
+#
+#    and keeps doing it until the remote is deleted.  Deleting the remote
+#    alone is not enough either: flatpak then cannot resolve the origin of the
+#    installed refs and reports "Remote ... not found".
+#
+#    Instead, export into the persistent repo/ directory and install from one
+#    stable local remote, "otomedius-local".  The remote is left disabled: the
+#    app is built locally, so `flatpak update` has nothing to fetch, and a
+#    disabled remote cannot fail later (for example if repo/ is deleted).  To
+#    update the app, run this script again.
+
+# Origin remotes used by an app or debug runtime installed by an older version
+# of this script.  They are deleted after the refs have been reinstalled from
+# otomedius-local below, never before: deleting them first would leave
+# `flatpak update` with refs whose origin does not exist.
+STALE_ORIGINS=""
+# `flatpak list --columns=ref` prints refs without the kind prefix
+# (io.github.nicobm.OtomediusRecomp/x86_64/master), unlike `flatpak remote-ls`;
+# accept both spellings.
+while IFS="$(printf '\t') " read -r ref origin; do
+    case "$ref" in
+        app/"$APP_ID"/*|"$APP_ID"/*|runtime/"$DEBUG_ID"/*|"$DEBUG_ID"/*) ;;
+        *) continue ;;
+    esac
+    case "$origin" in
+        ""|-|"$LOCAL_REMOTE") continue ;;
+        *-origin) ;;
+        *) continue ;;
+    esac
+    case " $STALE_ORIGINS " in
+        *" $origin "*) ;;
+        *) STALE_ORIGINS="$STALE_ORIGINS $origin" ;;
+    esac
+done <<EOF
+$(flatpak list --user --all --columns=ref,origin 2>/dev/null || true)
+EOF
 
 say "building $APP_ID (this takes a few minutes)"
-exec flatpak-builder --user --install --force-clean --disable-rofiles-fuse \
-    --repo=repo build-dir "$MANIFEST"
+flatpak-builder --user --force-clean --disable-rofiles-fuse \
+    --repo="$PWD/repo" build-dir "$MANIFEST"
+
+# The remote URL is a file:// URI; the checkout path may contain spaces, so
+# let Python escape it.
+repo_uri=$(python3 -c 'import pathlib, sys
+print(pathlib.Path(sys.argv[1]).as_uri())' "$PWD/repo")
+
+# Do not add --no-enumerate: flatpak hides the refs of a no-enumerate remote
+# from `flatpak remote-ls` unless it has an xa.main-ref set (see
+# flatpak_dir_list_remote_refs), and `flatpak remote-add` does not set one, so
+# the remote would be listed but appear empty.  The remote is disabled after
+# the install instead, which also keeps it out of app stores and updates.
+if flatpak_has_remote --user "$LOCAL_REMOTE"; then
+    flatpak remote-modify --user --no-gpg-verify --no-use-for-deps --enumerate \
+        --enable --url="$repo_uri" "$LOCAL_REMOTE"
+else
+    flatpak remote-add --user --no-gpg-verify --no-use-for-deps \
+        "$LOCAL_REMOTE" "$repo_uri"
+fi
+
+# Install the app, plus the debug runtime only with --debug: installing the
+# app does not pull its debug extension.
+# `flatpak remote-ls` prints full refs, `flatpak list` prints them without the
+# kind prefix; both spellings are accepted here.
+refs=$(flatpak remote-ls --user --all --columns=ref "$LOCAL_REMOTE" 2>/dev/null || true)
+
+set --
+if [ -n "$refs" ]; then
+    while IFS= read -r ref; do
+        case "$ref" in
+            app/"$APP_ID"/*) set -- "$@" "$ref" ;;
+            "$APP_ID"/*) set -- "$@" "app/$ref" ;;
+            runtime/"$DEBUG_ID"/*)
+                if [ "$WITH_DEBUG" = 1 ]; then set -- "$@" "$ref"; fi
+                ;;
+            "$DEBUG_ID"/*)
+                if [ "$WITH_DEBUG" = 1 ]; then set -- "$@" "runtime/$ref"; fi
+                ;;
+        esac
+    done <<EOF
+$refs
+EOF
+else
+    # The remote could not be listed: use the refs the export just wrote
+    # (repo/refs/heads/<kind>/<id>/<arch>/<branch>).
+    for ref in "$PWD"/repo/refs/heads/app/"$APP_ID"/*/*; do
+        [ -f "$ref" ] || continue
+        set -- "$@" "${ref#"$PWD"/repo/refs/heads/}"
+    done
+    if [ "$WITH_DEBUG" = 1 ]; then
+        for ref in "$PWD"/repo/refs/heads/runtime/"$DEBUG_ID"/*/*; do
+            [ -f "$ref" ] || continue
+            set -- "$@" "${ref#"$PWD"/repo/refs/heads/}"
+        done
+    fi
+fi
+[ "$#" -gt 0 ] || die \
+"$LOCAL_REMOTE ($repo_uri) does not provide $APP_ID
+  check it with: flatpak remote-ls --user $LOCAL_REMOTE"
+
+flatpak install --user --reinstall --noninteractive "$LOCAL_REMOTE" "$@"
+
+# The debug runtime is opt-in: remove one left installed by an older build (or
+# installed by hand) so it stops showing up as a pinned runtime in
+# `flatpak uninstall --unused`.  Run the script with --debug to keep it.
+if [ "$WITH_DEBUG" = 0 ]; then
+    while IFS= read -r ref; do
+        case "$ref" in
+            runtime/"$DEBUG_ID"/*|"$DEBUG_ID"/*) ;;
+            *) continue ;;
+        esac
+        say "removing the debug runtime $ref (use --debug to keep it)"
+        flatpak uninstall --user -y --noninteractive "$ref" >/dev/null 2>&1 || true
+    done <<EOF
+$(flatpak list --user --all --columns=ref 2>/dev/null || true)
+EOF
+fi
+
+# Local builds are updated by running this script, not by `flatpak update`.
+flatpak remote-modify --user --disable "$LOCAL_REMOTE" ||
+    warn "could not disable the $LOCAL_REMOTE remote"
+
+# Now the old origin remotes have no installed refs left.  --force is what
+# makes the deletion work: without it flatpak refuses (and prompts to remove
+# the refs) when a remote still has installed refs.
+for remote in $STALE_ORIGINS; do
+    flatpak_has_remote --user "$remote" || continue
+    if flatpak list --user --all --columns=origin 2>/dev/null | grep -qxF "$remote"; then
+        warn "$remote is still the origin of an installed ref; keeping it"
+        continue
+    fi
+    say "removing the old Flatpak remote $remote"
+    flatpak remote-delete --user --force --noninteractive "$remote" >/dev/null 2>&1 ||
+        warn "could not remove the Flatpak remote $remote"
+done
+
+say "installed $APP_ID (run it with: flatpak run $APP_ID)"

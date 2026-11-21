@@ -180,7 +180,8 @@ The script:
 4. downloads the pinned `capstone` wheel (the Flatpak build itself has **no
    network access**);
 5. recompiles the game, builds the native layer, and installs the Flatpak for
-   the current user.
+   the current user through a single local remote (`otomedius-local`, left
+   disabled: run the script again to update the app).
 
 Then launch **Otomedius (recompiled)** from your application menu or with:
 
