@@ -40,7 +40,8 @@ what to do without guessing (full rules in [`AGENTS.md`](AGENTS.md)):
   `git remote`/`git config`): read `AGENTS.md`, the latest section of
   [`docs/BOOKLET.md`](docs/BOOKLET.md) and
   [`docs/HANDOVER_PROMPT.md`](docs/HANDOVER_PROMPT.md), check `git status` and
-  run the smoke test before changing code.
+  `git diff`, and work surgically: compile only the files you touch and never
+  run the full build or the smoke test without a declared hypothesis.
 - **`TERMINAR`**: run the tests, update `README.md`, the booklet and the next
   session prompt, then commit and push. **No commit/push without this signal.**
 - The GitHub token is never written to a file; the push uses `GIT_ASKPASS` +
@@ -211,106 +212,9 @@ OTOMEDIUS_BIN=out/otomedius-recomp OTOMEDIUS_DIR=/path/to/dump sh tests/smoke.sh
 The script always sets `SDL_AUDIODRIVER=dummy`, so tests are quiet (including
 the intro movie's audio). For manual runs use the same variable.
 
-## Build farm (`build-grid`)
-
-Development compiles on a LAN-only build farm: one **master** plus N **workers**,
-all rootless podman, driven by `build-grid.sh` (the farm project lives outside
-this repository, today in `~/Proyectos/build-grid`).
-
-```
-   master (this dev VM, inside the GNOME Boxes NAT)
-     build-grid.sh  ── TCP 47824 ──▶  workers   the master dials OUT: no
-     (scans the LAN)  ◀── output ───             port-forwarding, no inbound
-                                                 ports on the master
-```
-
-* The master scans the LAN and dials `tcp/47824` on every worker, streaming each
-  job's output back; it also **listens itself** (`role=master+worker`), so its
-  own cores can take a shard (`tools/farm.py` reaches it through loopback).
-  Workers never see this machine's filesystem and have **no internet**.
-* Every job is HMAC-SHA256-signed with the shared secret that lives in the
-  master's volume (`/workspace/.config/secret`, trust-on-first-use enrollment).
-* Image: **Arch Linux** with `zig 0.17.1`, `gcc 16`, `distcc 3.4` and glibc (the
-  same family as the Flatpak runtime), so objects built on the farm are linkable
-  here and `distcc` works for gcc builds.
-* Jobs are `bash -lc` strings with `{slots}`, `{total_slots}`, `{dir}`,
-  `{host}`, `{user}`. A **kit** (`--sync DIR`) is a deterministic
-  `tar --sort=name --owner=0 --group=0 --numeric-owner -cf - . | gzip -n`,
-  cached by sha256 on master and workers; `--kit <sha>` runs against the cached
-  copy and transfers nothing.
-
-### The agent's channel: `tools/farm.py`
-
-The coding agent runs inside the OpenCode Flatpak sandbox: no `podman`, no host
-processes. The master has no control port, so its CLI is out of reach — but the
-workers speak TD1 over the LAN and the master's volume holds the secret and the
-worker list. [`tools/farm.py`](tools/farm.py) does what the master does, without
-podman:
-
-```sh
-python3 tools/farm.py status                   # live workers (master cache + TD1 PING)
-python3 tools/farm.py scan                     # explicit LAN scan (--subnet for other ranges)
-python3 tools/farm.py sync ../.work/farm-build # ship a kit, print its sha256
-python3 tools/farm.py run --kit <sha> -- 'sh build-farm.sh shard-16.txt'
-python3 tools/farm.py run --sync DIR --collect ../.work/farm-out -- '<cmd>'
-```
-
-It reads `.config/secret` and `.config/slaves{,.cache}` from the master volume
-(`~/.local/share/containers/storage/volumes/build-grid-workspace/_data`,
-override with `OTOMEDIUS_FARM_VOL`), asks `TD1 HAVE <sha>` before sending a kit,
-falls back to sending the tar on old workers, retries on `missing kit`, replaces
-`{host}/{slots}/{total_slots}/{user}` (leaving `{dir}` to the worker) and
-extracts the artefacts a job marks with `TDFARM-BUNDLE:` into `DIR/<host>/`.
-
-The human still owns the farm's lifecycle (`up`, `down`, `scan`); the agent
-dispatches compile/test jobs and reads their logs and objects. There are **no
-IPs anywhere in the tool**: addresses come from the master's cache or from an
-explicit `scan`/`--subnet`.
-
-### Measured: the whole game, distributed
-
-A full rebuild — 105 objects (85 `rc_*.c` + 20 `native/*.c`) — through two
-workers (16 + 4 slots) with a 6.3 MB kit:
-
-| | local (12 jobs) | farm (36 slots: master + 3 workers) |
-|---|---|---|
-| compile | 32 s | 14 s (master, 33 files) ‖ 10 s (42) ‖ 4 s (15) ‖ 2 s (15) |
-| transfer | — | kit 6.3 MB once per node, then **0** (`HAVE` hit) |
-| result | 105 objects | **the same 105 objects, byte for byte** |
-
-Linking the farm objects locally produced a **bit-identical binary**
-(`sha256 fb256033…`, 53 785 008 bytes, `cmp` clean) that passes
-`tests/smoke.sh`. A distributed build is therefore verified exactly like a local
-one: compare hashes instead of trusting the farm.
-
-Today's cost is bringing the objects back: 81 MB of `.o` travel as
-`tar.gz`+base64 inside the job's stdout, which the agent decodes. It works, but
-it is the bottleneck; a dedicated artefact endpoint (or a second socket) is the
-obvious next step on the farm side.
-
-### Reproducibility is not optional
-
-Two machines only produce identical objects if the *compiler* and the *recorded
-paths* match. This is the recipe that got us there:
-
-```sh
-zig cc -target x86_64-linux-gnu.2.44 \
-       -ffile-prefix-map=$PWD=. -fdebug-compilation-dir=. \
-       -ffile-prefix-map="$(zig env | sed -n 's/.*lib_dir *= *"\([^"]*\)".*/\1/p')=@zig" \
-       -O2 -std=gnu11 -w -Inative -Iinc/sdl3 -Iinc/freetype
-```
-
-Without the two `-ffile-prefix-map` and `-fdebug-compilation-dir`, the objects
-differ **only** in `.debug_line` (the code sections are already identical, but
-then a hash cannot prove it). The third map matters because zig records its own
-`lib_dir` in the line table: `/usr/lib/zig` on a worker is not `.work/zig/lib`.
-
-Rules that do not change:
-
-* The farm never sees the dump; `--sync` sends only what a job needs.
-* **One writer per object tree.** `.work/obj` belongs to the local build; farm
-  objects land in a scratch directory (`.work/farm-out`) and are linked from
-  there.
+Run it with a declared hypothesis and read only the relevant lines (for example
+`grep "DEMO state"`). Do not attach frame dumps or paste whole logs into the
+session: report exit code, sizes and hashes as text.
 
 ## Controls
 
@@ -359,7 +263,6 @@ AZERTY, QWERTZ and other layouts.
 | Path | Content |
 |---|---|
 | `tools/recomp/` | PE reader, x86 discovery/decoder, C emitter, driver |
-| `tools/farm.py` | TD1 client for the LAN build farm (see *Build farm*) |
 | `native/` | native Linux system layer (runtime, Win32, Konami AVS, D3D9) |
 | `recomp/exe.sha256` | hash of the executable the port is validated against |
 | `flatpak/`, `*.json` | Flatpak packaging (manifest, icon, launcher) |

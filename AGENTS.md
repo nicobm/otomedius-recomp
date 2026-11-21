@@ -51,7 +51,13 @@ y limpia.
    `sh ../.work/tools/build.sh` (capa nativa) o `tools/recomp/recomp.py` (solo
    si cambia `native/x86rt.h`). No inventes ni asumas infraestructura externa.
 
-7. **Language Policy:**
+7. **Build mínimo, no build total.** No ejecutes el build completo del juego
+   (los 85 `rc_*.c` + 20 `native/*.c`) para "probar si algo funciona". Compilá
+   solo los ficheros que tocaste con `sh ../.work/tools/build.sh <fichero>.c`.
+   El build completo solo se justifica si el cambio toca `native/x86rt.h` o si
+   el usuario lo pide explícitamente. Si dudás, preguntá antes de buildear todo.
+
+8. **Language Policy:**
    - **Technical Artifacts & Code:** Always use **English** for all technical
      documentation, code comments, commit messages, logs, pull request
      descriptions, and any generated scripts or files.
@@ -99,8 +105,9 @@ Con esa señal, la IA debe:
    `docs/HANDOVER_PROMPT.md` completos antes de tocar nada.
 2. Ejecutar `git log -1` y `git status` y respetar cualquier cambio sin
    commitear que encuentre (puede ser trabajo del usuario).
-3. Verificar el estado: compilar solo los ficheros tocados y correr el smoke
-   test (ver §3) antes de cambiar código.
+3. Verificar el estado sin gastar contexto: `git log -1`, `git status` y
+   `git diff`. No corras el smoke test "por las dudas": compilá solo lo que
+   toques y corré el smoke únicamente con una hipótesis declarada (ver §3).
 4. Continuar el plan de `docs/HANDOVER_PROMPT.md` §5.
 
 ### `TERMINAR`
@@ -184,6 +191,21 @@ SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy \
 - `tests/smoke.sh` exige: exit 0, sin `no recompiled code`, `DEMO state=5`,
   `CGameMan ctor returned … mask220=00000000` y que no se agote la tabla de
   thunks.
+
+### Presupuesto de contexto (obligatorio)
+
+- **Nunca adjuntes imágenes al contexto** (`frame.ppm`, PNGs de dumps,
+  capturas) salvo que el usuario lo pida explícitamente. Para verificar un
+  frame, reportá en texto tamaño, hash y exit code; no la imagen.
+- **Nunca vuelques logs enteros.** Usá `grep`, `head`, `tail` y `wc -l` para
+  extraer solo las líneas de la hipótesis; si hay más de ~50 líneas de interés,
+  resumí primero y pegá solo el resumen.
+- **Nunca vuelques la salida completa de un build** (menos aún la de 85 + 20
+  objetos). Reportá exit code, cantidad de errores/warnings y las primeras 5
+  líneas de error si las hay.
+- **El smoke test no es "probar a ver qué pasa".** Declará antes qué esperás
+  verificar (p. ej. "que `CGameMan` llegue a `state=5` tras el cambio en
+  `patches.c`") y extraé solo las líneas relevantes con `grep`, no el log.
 
 ---
 
