@@ -429,8 +429,7 @@ The game itself is not covered and not distributed.
 ## How this port is being written
 
 The static recompilation, the reverse engineering and the native Linux layer in
-this repository are being developed with several LLMs, driven through
-**OpenCode** as the coding agent.
+this repository are being developed with several LLMs.
 
 Everything runs against a local dump of the arcade build: the agent reads the
 recompiled C, instruments the emulated Win32/D3D9 layer, and iterates on
