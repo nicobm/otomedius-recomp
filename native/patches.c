@@ -52,6 +52,8 @@ static uint32_t fake_model_iface(void)
  * skipped.  Set OTOMEDIUS_CHKSUM=1 to keep the original behaviour when running
  * against a dump that matches the manifest byte for byte.
  */
+int card_skip_pin(void);   /* card.c */
+
 static int skip_chksum(void)
 {
     const char *v = getenv("OTOMEDIUS_CHKSUM");
@@ -223,6 +225,25 @@ int x86_patch_call(uint32_t addr)
     }
 
     switch (addr) {
+    case 0x4210F3u:                  /* card login: PIN keypad state */
+        /* The login machine 0x420F70 switches on [ebx+0x29D] through the
+         * table at 0x42140C; state 2 (here) reads the 4-digit PIN and, once
+         * complete, sets state 3 at 0x42116E.  With the virtual card
+         * (card.c) the PIN has no meaning, so go straight to state 3 and
+         * leave through the function's epilogue (pop edi; pop esi;
+         * mov esp,ebp; pop ebp; ret).  [ebx+0x7A] == 3 is an error path
+         * that is left to the original code. */
+        if (card_skip_pin() && M8(cpu->ebx + 0x7Au) != 3) {
+            M8(cpu->ebx + 0x29Du) = 3;
+            cpu->edi = M32(cpu->esp);
+            cpu->esi = M32(cpu->esp + 4u);
+            cpu->esp = cpu->ebp;
+            cpu->ebp = M32(cpu->esp);
+            cpu->eip = M32(cpu->esp + 4u);
+            cpu->esp += 8u;
+            return 1;
+        }
+        return 0;
     case 0x40ED00u:                  /* verify one ChkSum.bin entry */
         if (!skip_chksum())
             return 0;

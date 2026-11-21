@@ -381,6 +381,8 @@ AZERTY, QWERTZ and other layouts.
 | `OTOMEDIUS_TEXTURES=1` | real `LockRect`/surface uploads (see HANDOVER §7.6) |
 | `OTOMEDIUS_CHKSUM=1` | keep the original `ChkSum.bin` integrity gate |
 | `OTOMEDIUS_AUTOCOIN=1` | pulse the coin line every 2 s (input testing) |
+| `OTOMEDIUS_CARD=1\|<16 hex>` | virtual e-Amusement card, data in `<game dir>/card/<id>/` (BOOKLET §18) |
+| `OTOMEDIUS_CARD_PIN=1` | with the virtual card, keep the PIN entry (skipped by default) |
 | `OTOMEDIUS_BADTARGET=skip` | report missing functions instead of aborting |
 | `OTOMEDIUS_BEZEL=path` | cabinet artwork (default: `bezel.png` next to the game) |
 | `OTOMEDIUS_BEZEL=0` | disable the cabinet artwork |
