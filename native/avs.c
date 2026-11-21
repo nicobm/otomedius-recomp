@@ -16,6 +16,7 @@
 #include <time.h>
 
 static int g_boot_done;
+static uint32_t g_coins;     /* coins inserted, not yet consumed by the game */
 
 /* The Konami boot machine polls the BMS/touch-panel stubs once per frame.
  * Log the first few calls of each (needs OTOMEDIUS_LOG>=2) so the state
@@ -67,19 +68,36 @@ static void io_get_control_status_buffer(void)
             if (autostart)
                 pad.start = 1;
         }
-        memset(MEM + buf, 0, 16);
-        /* PJEI cabinet: 16 bits of switch inputs, active low */
-        uint16_t sw = 0xFFFF;        if (pad.up) sw &= ~0x0001u;
-        if (pad.down) sw &= ~0x0002u;
-        if (pad.left) sw &= ~0x0004u;
-        if (pad.right) sw &= ~0x0008u;
-        if (pad.b1) sw &= ~0x0010u;
-        if (pad.b2) sw &= ~0x0020u;
-        if (pad.b3) sw &= ~0x0040u;
-        if (pad.b4) sw &= ~0x0080u;
-        if (pad.start) sw &= ~0x0100u;
-        if (pad.coin) sw &= ~0x0200u;
-        M16(buf) = sw;
+        /* PJEI status buffer (game copy at 0x5DC950), read by 0x4132C0 state 5:
+         *   +0x04 dword: switches, ACTIVE HIGH, remapped by the game through the
+         *                (raw mask, game bit) table at 0x5C30A0;
+         *   +0x10 byte : system switches, remapped through the table at 0x5C30E8.
+         * Bit names come from the test mode INPUT CHECK screen (0x456E40: labels
+         * at 0x5CD67C, game-bit masks at 0x5CD69C / 0x5CD6B8):
+         *   raw 0x40 UP, 0x20 DOWN, 0x10 LEFT, 0x08 RIGHT, 0x04 A BUTTON (power-up),
+         *   0x02 B BUTTON (shot), 0x01 C BUTTON (bomb), 0x80 START;
+         *   system raw 0x20 TEST (test mode entered at 0x45480F), 0x10 SERVICE
+         *   (service credit, 0x40D8D0), 0x04 COIN MECH.
+         * Coins are NOT a switch bit: the game takes them from
+         * ac_io_pjei_current_coinstock (see io_coinstock).  Checked on Windows
+         * with the original exe (native loader, 2026-11-21): every switch in the
+         * INPUT CHECK screen, A/B/C roles in game. */
+        memset(MEM + buf, 0, 0x14);
+        uint32_t sw = 0;
+        if (pad.up) sw |= 0x40u;
+        if (pad.down) sw |= 0x20u;
+        if (pad.left) sw |= 0x10u;
+        if (pad.right) sw |= 0x08u;
+        if (pad.b1) sw |= 0x02u;     /* B BUTTON: shot */
+        if (pad.b2) sw |= 0x01u;     /* C BUTTON: bomb */
+        if (pad.b3) sw |= 0x04u;     /* A BUTTON: power-up */
+        if (pad.start) sw |= 0x80u;
+        M32(buf + 4) = sw;
+        *(uint8_t *)(MEM + buf + 0x10) = 0;   /* system switches: none mapped yet */
+        static int coin_prev;
+        if (pad.coin && !coin_prev)
+            g_coins++;
+        coin_prev = pad.coin;
         if (g_verbose > 1)
             AVS_TRACE("ac_io_pjei_get_control_status_buffer", (int)sw);
     }
@@ -105,14 +123,24 @@ static void io_is_active2(void)
         M32(p) = 0;
     RET32(1);
 }
+/* ac_io_pjei_current_coinstock(int slot, int *count) / consume_coinstock(int slot,
+ * int count): 0x41356E reads the count into a local (arg 1, not arg 0) and, when it
+ * is non-zero, inserts that many coins (0x40D3F0) and consumes them.  The pointer
+ * used to be taken from arg 0 (the slot, 0), so the local was never written and the
+ * game read an uninitialised stack value. */
 static void io_coinstock(void)
 {
-    uint32_t p = arg32(0);
+    uint32_t p = arg32(1);
     if (p)
-        M32(p) = 0;
-    RET32(0);
+        M32(p) = g_coins;
+    RET32(1);
 }
-static void io_consume(void) { RET32(0); }
+static void io_consume(void)
+{
+    uint32_t n = arg32(1);
+    g_coins = n >= g_coins ? 0 : g_coins - n;
+    RET32(1);
+}
 /* The security-plug handshake: request, then `_isfinished(&status)` with
  * status == 20 (0x14).  That is the value the detector at 0x4133D6 compares
  * against; anything else is treated as "illegal plug" and drops I/O mode to 7

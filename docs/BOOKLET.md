@@ -2753,3 +2753,38 @@ en los 4 nodos.
    cualquier build. Sin workers vivos, compilar en local y decirlo.
 3. **Método**: cualquier discrepancia nueva se investiga primero en el binario
    (`rc_*.c` o REA/Ghidra), nunca adivinando por logs.
+
+## 17. Contribution 2026-11-21 (Lolo / Otomedius PC Windows loader): cabinet inputs and coins
+
+Source: a native Windows loader that runs the original `otomedius.exe` with replacement
+libacio / libbms / libtouchpanel (Ghidra + call-site analysis, tested in game on Windows).
+
+### 17.1 PJEI status buffer (`ac_io_pjei_get_control_status_buffer`)
+- The game copies the buffer to 0x5DC950 and reads it in the I/O state machine 0x4132C0
+  (state 5): **+0x04 dword = switches, active high**, **+0x10 byte = system switches**.
+  The previous stub wrote 16 active-low bits at +0, which the game never reads, so no input
+  reached it.
+- Raw switch -> game bit table at 0x5C30A0 (mask, value pairs, 0xFFFFFFFF ends it):
+  raw 0x10->0x01, 0x08->0x02, 0x40->0x04, 0x20->0x08, 0x04->0x10, 0x02->0x20, 0x01->0x40,
+  0x80->0x80. System table at 0x5C30E8: raw 0x20->1, 0x10->2, 0x04->4.
+- Names from the test mode INPUT CHECK screen (0x456E40, labels 0x5CD67C, game-bit masks
+  0x5CD69C and 0x5CD6B8 = bytes 04 01 02): LEFT 0x01, RIGHT 0x02, UP 0x04, DOWN 0x08,
+  A BUTTON 0x10 (power-up), B BUTTON 0x20 (shot), C BUTTON 0x40 (bomb), START 0x80;
+  system TEST 1 (test mode entered at 0x45480F), SERVICE 2 (service credit 0x40D8D0),
+  COIN MECH 4. Roles of A/B/C confirmed in game.
+- `pad_state_t` mapping chosen: b1 = B (shot), b2 = C (bomb), b3 = A (power-up), b4 unused.
+
+### 17.2 Coins (`ac_io_pjei_current_coinstock` / `consume_coinstock`)
+- Not a switch bit. 0x41356E calls `current_coinstock(0, &count)`; a non-zero count inserts
+  coins (0x40D3F0) then `consume_coinstock(0, count)`. The old stub took the pointer from
+  argument 0 (the slot), so the count was never written. Now: coin key edges are counted
+  and reported through argument 1, consume subtracts argument 1.
+
+### 17.3 Notes for later (not in this patch)
+- Storage: the cabinet saves to `E:\nvmem\testmode.bin` / `bookkeep.bin` and mirrors to
+  `F:\nvmem\` (strings 0x5561A0 / 0x556284 / 0x558318); error 5-1600-1083 if it fails.
+- Text is Shift-JIS (CP932): on a non-Japanese code page the game's CRT splits double-byte
+  characters (garbled scrolling message) unless the code page APIs answer 932.
+- Widescreen: the gameplay camera is built at 0x407278 (D3DXMatrixPerspectiveFovLH, aspect
+  1.25 constant at 0x550F8C); the HUD is XYZRHW. The game centres its 2D by
+  (D3DPRESENT_PARAMETERS.BackBufferWidth - 1280) / 2 read from the structure it keeps.
