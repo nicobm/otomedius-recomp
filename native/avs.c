@@ -166,8 +166,16 @@ static void io_cardunit_init_fin(void)
     RET32(1);
 }
 static void io_req_uid(void) { RET32(1); }
-static void io_req_uid_fin(void) { RET32(1); }
-static void io_get_uid(void) { RET32(0); }
+/* ac_io_icca_req_uid_isfinished / ac_io_icca_get_uid and the card service
+ * live in card.c (virtual e-Amusement card, OTOMEDIUS_CARD). */
+void card_icca_req_uid_fin(void);
+void card_icca_get_uid(void);
+void card_bms_inquire_wait(void);
+void card_bms_wait_ok(void);
+void card_bms_wait_register(void);
+void card_bms_save(void);
+void card_bms_load(void);
+void card_bms_data_wait(void);
 static void io_fw_dev_index(void) { RET32(0); }
 static void io_watchdog(void) { RET32(0); }
 static void io_go_fw_update(void) { RET32(0); }
@@ -352,8 +360,8 @@ const import_def_t avs_imports[] = {
     {"libacio.dll", "ac_io_icca_cardunit_init", io_cardunit_init, 0},
     {"libacio.dll", "ac_io_icca_cardunit_init_isfinished", io_cardunit_init_fin, 0},
     {"libacio.dll", "ac_io_icca_req_uid", io_req_uid, 0},
-    {"libacio.dll", "ac_io_icca_req_uid_isfinished", io_req_uid_fin, 0},
-    {"libacio.dll", "ac_io_icca_get_uid", io_get_uid, 0},
+    {"libacio.dll", "ac_io_icca_req_uid_isfinished", card_icca_req_uid_fin, 0},
+    {"libacio.dll", "ac_io_icca_get_uid", card_icca_get_uid, 0},
     {"libacio.dll", "ac_io_get_firmware_update_device_index", io_fw_dev_index, 0},
     {"libacio.dll", "ac_io_pjei_get_watchdog_status", io_watchdog, 0},
     {"libacio.dll", "ac_io_go_firmware_update", io_go_fw_update, 0},
@@ -402,21 +410,21 @@ const import_def_t avs_imports[] = {
     {"libbms.dll", "bms_credit_consume_expired", bms_ok, 0},
     {"libbms.dll", "bms_credit_service_blocking", bms_ok, 0},
     {"libbms.dll", "bms_cardmng_inquire", bms_ok, 0},
-    {"libbms.dll", "bms_cardmng_inquire_wait", bms_ok, 0},
+    {"libbms.dll", "bms_cardmng_inquire_wait", card_bms_inquire_wait, 0},
     {"libbms.dll", "bms_cardmng_cardactivate", bms_ok, 0},
-    {"libbms.dll", "bms_cardmng_cardactivate_wait", bms_ok, 0},
+    {"libbms.dll", "bms_cardmng_cardactivate_wait", card_bms_wait_register, 0},
     {"libbms.dll", "bms_cardmng_bindcard", bms_ok, 0},
-    {"libbms.dll", "bms_cardmng_bindcard_wait", bms_ok, 0},
+    {"libbms.dll", "bms_cardmng_bindcard_wait", card_bms_wait_register, 0},
     {"libbms.dll", "bms_cardmng_bindmodel", bms_ok, 0},
-    {"libbms.dll", "bms_cardmng_bindmodel_wait", bms_ok, 0},
+    {"libbms.dll", "bms_cardmng_bindmodel_wait", card_bms_wait_ok, 0},
     {"libbms.dll", "bms_cardmng_playerlogin", bms_ok, 0},
-    {"libbms.dll", "bms_cardmng_playerlogin_wait", bms_ok, 0},
+    {"libbms.dll", "bms_cardmng_playerlogin_wait", card_bms_wait_ok, 0},
     {"libbms.dll", "bms_cardmng_playerlogout", bms_ok, 0},
-    {"libbms.dll", "bms_cardmng_playerlogout_wait", bms_ok, 0},
-    {"libbms.dll", "bms_playerdata_load", bms_ok, 0},
-    {"libbms.dll", "bms_playerdata_load_wait", bms_ok, 0},
-    {"libbms.dll", "bms_playerdata_save", bms_ok, 0},
-    {"libbms.dll", "bms_playerdata_save_wait", bms_ok, 0},
+    {"libbms.dll", "bms_cardmng_playerlogout_wait", card_bms_wait_ok, 0},
+    {"libbms.dll", "bms_playerdata_load", card_bms_load, 0},
+    {"libbms.dll", "bms_playerdata_load_wait", card_bms_data_wait, 0},
+    {"libbms.dll", "bms_playerdata_save", card_bms_save, 0},
+    {"libbms.dll", "bms_playerdata_save_wait", card_bms_data_wait, 0},
     {"libbms.dll", "bms_ranking_get", bms_ok, 0},
     {"libbms.dll", "bms_ranking_get_wait", bms_ok, 0},
     {"libbms.dll", "bms_matching_query", bms_ok, 0},

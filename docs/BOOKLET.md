@@ -2788,3 +2788,27 @@ libacio / libbms / libtouchpanel (Ghidra + call-site analysis, tested in game on
 - Widescreen: the gameplay camera is built at 0x407278 (D3DXMatrixPerspectiveFovLH, aspect
   1.25 constant at 0x550F8C); the HUD is XYZRHW. The game centres its 2D by
   (D3DPRESENT_PARAMETERS.BackBufferWidth - 1280) / 2 read from the structure it keeps.
+
+## 18. Contribution 2026-11-21 (Lolo / Otomedius PC Windows loader): virtual e-Amusement card
+
+Ported from the Windows loader (otomedius-pc v0.6.1, verified there: a card is created, a game is
+played, the next game reloads the profile and the character). New file `native/card.c`; the card
+entries of `avs_imports` point to it; one case in `patches.c` (0x4210F3) skips the PIN keypad.
+
+- Off by default: without `OTOMEDIUS_CARD` the reader reports "no card" (status 10), as before.
+- `OTOMEDIUS_CARD=1` (card E004010000000001) or `OTOMEDIUS_CARD=<16 hex digits>`;
+  `OTOMEDIUS_CARD_PIN=1` keeps the PIN entry. Data: `<game dir>/card/<id>/`.
+- ICCA reader 0x4132C0 (state 5): `ac_io_icca_req_uid_isfinished(unit, &st)` st 9 = card read,
+  10 = no card; `ac_io_icca_get_uid(unit, uid[8])`.
+- `bms_cardmng_inquire_wait(?, &st, info[2])`: st 0 + info {1,0} = registered card (0x41FF60 ->
+  PIN 0x420F70 -> playerdata_load); st 3 = new card (registration). The other cardmng `_wait`
+  calls report st 0 (0x420F70, 0x4209D0, 0x4202F0, 0x421A20).
+- Player data manager (0x1B10 bytes): phase +0x20, record count +0x24, character mask +0x28, data
+  area +0x30 (= the buffer given to playerdata_save/_load), records of 0x6B8 bytes. Save builder
+  0x422D50: phase 0 = profile, plus the played character (index at 0x5DB878) when the count is 2;
+  later phases (0x4233C0) list characters by mask bit. Load parser 0x4234A0: zeros = no data.
+  Stored one file per record (`profile.bin`, `char<N>.bin`): saving per phase lost the character
+  records on reload (bug of the Windows loader v0.6.0).
+- PIN: login machine 0x420F70, `[ebx+0x29D]` through the table at 0x42140C; state 2 = 0x4210F3
+  (keypad) ends at 0x42116E with state 3. The patch sets state 3 and runs the epilogue.
+- Not tested on this recompilation (no Linux machine here): needs a run up to the card screen.
