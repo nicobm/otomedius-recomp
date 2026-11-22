@@ -20,44 +20,47 @@ y limpia.
 
 ### 0.1 Reglas críticas
 
-1. **Nada de fuerza bruta.** No se corre el juego a ciegas ni se repiten
+1. Si las herramientas de REA están presentes SIEMPRE utilizarlas.
+   Si no estan presentes se le notificará de que no se usaran y se seguirá el procedimiento, pero usarlas es prioridad. 
+
+2. **Nada de fuerza bruta.** No se corre el juego a ciegas ni se repiten
    ejecuciones para "adivinar" fallos leyendo logs. Cada corrida debe tener una
    hipótesis concreta y una variable de diagnóstico acotada (`OTOMEDIUS_QUIT_AT`
    bajo, `OTOMEDIUS_TRIPWIRE`, `OTOMEDIUS_WATCH`, `OTOMEDIUS_DUMP_FB`). Los
    `grep`/`head`/`tail` sobre logs sirven para **verificar** una hipótesis
    concreta, no para explorar a ciegas.
 
-2. **Contexto mínimo.** Antes de leer un archivo `rc_*.c` completo, usá `grep`
+3. **Contexto mínimo.** Antes de leer un archivo `rc_*.c` completo, usá `grep`
    para localizar la función `fn_XXXXXXXX` específica que necesitás analizar.
    Leé solo esa función y las estructuras de datos que referencia. No leas
    archivos completos a menos que sea estrictamente necesario para entender una
    cadena de llamadas.
 
-3. **Cero parches masivos.** Nada de reescribir archivos o bloques enteros.
+4. **Cero parches masivos.** Nada de reescribir archivos o bloques enteros.
    Cambios atómicos, quirúrgicos y bien delimitados; el diff debe explicar por sí
    solo qué se corrigió y por qué.
 
-4. **Una sola fuente de verdad.** Antes de tocar código, mirar el binario
+5. **Una sola fuente de verdad.** Antes de tocar código, mirar el binario
    original: REA/Ghidra (MCP) si está disponible y, si no, el código recompilado
    `../.work/gen/rc_*.c` (una función por `fn_XXXXXXXX`). No se deduce la
    semántica del original a partir de logs de la recompilación.
 
-5. **Lectura selectiva del BOOKLET.** No leas `docs/BOOKLET.md` completo. Leé
+6. **Lectura selectiva del BOOKLET.** No leas `docs/BOOKLET.md` completo. Leé
    solo la última sección (§N) para el estado actual y usá `grep` para buscar
    términos específicos si necesitás contexto histórico.
 
-6. **Compilación siempre local.** No existe granja de compilación distribuida en
+7. **Compilación siempre local.** No existe granja de compilación distribuida en
    este repo. Todos los builds se hacen en local con
    `sh ../.work/tools/build.sh` (capa nativa) o `tools/recomp/recomp.py` (solo
    si cambia `native/x86rt.h`). No inventes ni asumas infraestructura externa.
 
-7. **Build mínimo, no build total.** No ejecutes el build completo del juego
+8. **Build mínimo, no build total.** No ejecutes el build completo del juego
    (los 85 `rc_*.c` + 20 `native/*.c`) para "probar si algo funciona". Compilá
    solo los ficheros que tocaste con `sh ../.work/tools/build.sh <fichero>.c`.
    El build completo solo se justifica si el cambio toca `native/x86rt.h` o si
    el usuario lo pide explícitamente. Si dudás, preguntá antes de buildear todo.
 
-8. **Language Policy:**
+9. **Language Policy:**
    - **Technical Artifacts & Code:** Always use **English** for all technical
      documentation, code comments, commit messages, logs, pull request
      descriptions, and any generated scripts or files.
