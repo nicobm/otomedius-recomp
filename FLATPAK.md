@@ -1,34 +1,90 @@
 # Building the Flatpak
 
 `build-game-flatpak.sh` is the only supported way to build the game. It needs
-`flatpak`, `flatpak-builder`, `python3`, `unzip` and `curl` (or `wget`), plus
-your own copy of the Otomedius dump.
+`flatpak`, `flatpak-builder`, `python3` and `curl` (or `wget`), plus your own
+copy of the Otomedius dump. On Fedora Atomic the script uses Toolbx
+automatically.
 
-## Packages per distribution
+## Prerequisites
+
+- A Flatpak host with Toolbx on Fedora Atomic (Silverblue, Bazzite, ...).
+  `build-game-flatpak.sh` re-executes itself inside a toolbox container named
+  `otomedius-recomp`, creating it if needed. The first create downloads the
+  Fedora toolbox image automatically (`toolbox --assumeyes create`), and inside
+  the container the script installs `flatpak` and `flatpak-builder` with `dnf`
+  if they are missing. Use `OTOMEDIUS_TOOLBOX=name` to choose another
+  container, or enter one yourself with `toolbox enter` and run the script
+  there.
+
+  On systems without Toolbx (Debian, Arch, Alpine, plain Fedora, ...) the
+  script does not install anything on the host: it prints the package-manager
+  command for the detected distribution (`apt`, `dnf`, `pacman`, `zypper`,
+  `apk`, `rpm-ostree`, ...).
+
+  To do it by hand instead:
+
+  ```sh
+  toolbox create --assumeyes --container otomedius-recomp
+  toolbox enter --container otomedius-recomp
+  # inside the toolbox, if needed:
+  sudo dnf install flatpak flatpak-builder
+  ```
+
+- The Freedesktop runtime and SDK 26.08. `build-game-flatpak.sh` installs them
+  automatically with `flatpak install -y` if they are missing. To install them
+  manually instead:
+
+  ```sh
+  flatpak install -y flathub \
+      org.freedesktop.Platform//26.08 org.freedesktop.Sdk//26.08
+  ```
+
+  If you prefer a per-user install, add Flathub to your user installation
+  first and use `flatpak install -y --user flathub ...`.
+
+- Your own game dump: a `.zip`, `.rar` or `.7z` archive, or the extracted
+  folder with `otomedius.exe` and `Data/`. With no argument,
+  `build-game-flatpak.sh` searches the XDG Downloads and Documents folders.
+  Reading RAR/7z needs `bsdtar`, `unrar` or `7z`; ZIP needs nothing extra.
+- `curl` or `wget` for the first build: the script downloads the capstone
+  wheel into `flatpak/wheels/`. No source snapshot is needed.
+
+## Packages per distribution (without Toolbx)
 
 | Distribution | Command |
 |---|---|
-| Fedora Workstation | `sudo dnf install flatpak flatpak-builder python3 unzip curl` |
-| Fedora Silverblue / Kinoite | `flatpak` is preinstalled; `rpm-ostree install flatpak-builder && systemctl reboot` |
-| Debian / Ubuntu / Mint / Pop!_OS | `sudo apt update && sudo apt install flatpak flatpak-builder python3 unzip curl` |
-| Arch / Manjaro / EndeavourOS | `sudo pacman -S flatpak flatpak-builder python unzip curl` |
-| openSUSE | `sudo zypper install flatpak flatpak-builder python3 unzip curl` |
-| Alpine | `sudo apk add flatpak flatpak-builder python3 unzip curl` |
-| Void | `sudo xbps-install -S flatpak flatpak-builder python3 unzip curl` |
-
-If Flathub is not configured yet:
-
-```sh
-flatpak remote-add --if-not-exists --user flathub https://flathub.org/repo/flathub.flatpakrepo
-```
-
-The script installs the **Freedesktop Platform and SDK 26.08** automatically.
+| Fedora Workstation | `sudo dnf install flatpak flatpak-builder python3 curl` |
+| Debian / Ubuntu / Mint / Pop!_OS | `sudo apt update && sudo apt install flatpak flatpak-builder python3 curl` |
+| Arch / Manjaro / EndeavourOS | `sudo pacman -S flatpak flatpak-builder python curl` |
+| openSUSE | `sudo zypper install flatpak flatpak-builder python3 curl` |
+| Alpine | `sudo apk add flatpak flatpak-builder python3 curl` |
+| Void | `sudo xbps-install -S flatpak flatpak-builder python3 curl` |
 
 ## Build
 
+From the repository root (the script enters the toolbox itself):
+
 ```sh
-./build-game-flatpak.sh /path/to/otomedius.zip
+./build-game-flatpak.sh
 ```
+
+With no argument the script searches the XDG Downloads and Documents folders
+for a `.zip`, `.rar` or `.7z`, looks inside for `otomedius.exe`, checks its
+SHA-256 against [`recomp/exe.sha256`](recomp/exe.sha256) and writes the
+normalized `game.zip` the manifest expects. You can also pass the dump
+explicitly. Spaces are fine without quotes (the script joins the words again),
+but quote or escape shell metacharacters such as the parentheses and brackets
+in dump names:
+
+```sh
+./build-game-flatpak.sh "/path/to/your/otomedius.zip"
+./build-game-flatpak.sh /path/to/Otomedius.rar
+./build-game-flatpak.sh "Otomedius (2008-04-18)(JPN)[Konami PC][TP].zip"
+```
+
+An existing `game.zip` is reused while its executable hash matches, so the
+dump is not copied again on every build. Pass another dump or delete
+`game.zip` to make the script search from scratch.
 
 A cold build takes a few minutes on a modern machine (the recompiler produces
 roughly 45 MB of C, which the SDK compiles with `-O2`).
@@ -52,7 +108,7 @@ contains the capstone wheel first (run `./build-game-flatpak.sh` once, or
 download it from the URL in the script), then:
 
 ```sh
-cp "/path/to/your/otomedius.zip" game.zip
+python3 tools/find_game.py "/path/to/your/otomedius.zip"
 flatpak-builder --user --force-clean --disable-rofiles-fuse --repo=repo \
     build-dir io.github.nicobm.OtomediusRecomp.json
 flatpak remote-add --user --if-not-exists --no-gpg-verify --no-use-for-deps \

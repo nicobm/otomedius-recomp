@@ -157,9 +157,11 @@ ready-to-paste next-session prompt is
 ## Requirements
 
 - Linux with Flatpak (Wayland recommended; X11/XWayland works through
-  `fallback-x11`).
-- Your own copy of the Otomedius arcade dump (the `.zip` used with
-  TeknoParrot). The build checks its SHA-256 and the executable hash.
+  `fallback-x11`). On Fedora Atomic (Silverblue, Bazzite) Toolbx is used
+  automatically.
+- Your own copy of the Otomedius arcade dump: a `.zip`, `.rar` or `.7z`
+  archive, or the extracted folder with `otomedius.exe` and `Data/`. Reading
+  RAR/7z needs `bsdtar`, `unrar` or `7z`; ZIP needs nothing extra.
 
 Nothing else: the SDK, SDL3 3.4.20 and the Python build dependency are fetched
 by the build script.
@@ -169,14 +171,35 @@ by the build script.
 ```sh
 git clone https://github.com/nicobm/otomedius-recomp
 cd otomedius-recomp
-./build-game-flatpak.sh /path/to/your/otomedius.zip
+./build-game-flatpak.sh
 ```
+
+With no argument the script searches the XDG Downloads and Documents folders
+for a dump, looks inside it for `otomedius.exe` and `Data/`, checks the
+executable SHA-256 against [`recomp/exe.sha256`](recomp/exe.sha256) and writes
+the normalized `game.zip` the manifest expects. You can also pass the dump
+explicitly. Spaces are fine without quotes (the script joins the words again),
+but quote or escape shell metacharacters such as the parentheses and brackets
+in dump names:
+
+```sh
+./build-game-flatpak.sh "/path/to/your/otomedius.zip"
+./build-game-flatpak.sh /path/to/Otomedius.rar
+```
+
+An existing `game.zip` is reused while its executable hash matches, so the
+dump is not copied again on every build. Pass another dump or delete
+`game.zip` to make the script search from scratch.
 
 The script:
 
-1. detects missing `flatpak` / `flatpak-builder` and prints the install command
-   for your distribution (Fedora, Debian/Ubuntu, Arch, openSUSE, …);
-2. verifies the SHA-256 of the archive and of `otomedius.exe`;
+1. on Fedora Atomic re-executes itself inside the `otomedius-recomp` toolbox
+   container, creating it if needed and installing `flatpak-builder` there;
+   elsewhere it detects missing `flatpak` / `flatpak-builder` and prints the
+   install command for your distribution (Fedora, Debian/Ubuntu, Arch,
+   openSUSE, …);
+2. finds the dump and verifies `otomedius.exe` and `Data/` (SHA-256 against
+   `recomp/exe.sha256`);
 3. installs the Freedesktop runtime **and SDK 26.08** if they are missing;
 4. downloads the pinned `capstone` wheel (the Flatpak build itself has **no
    network access**);

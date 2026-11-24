@@ -139,16 +139,21 @@ cd ../.work/oto && ../obj/otomedius-recomp .
 
 ### 1.3 Build pipeline
 
-`build-game-flatpak.sh` (bash, distro-agnostic: prints `dnf`/`apt`/`pacman`/
-`zypper`/`apk`/`xbps` hints when `flatpak`, `flatpak-builder`, `python3`,
-`unzip`, `curl` are missing):
+`build-game-flatpak.sh` (POSIX sh, distro-agnostic: on Fedora Atomic it
+re-executes inside the `otomedius-recomp` toolbox and installs
+`flatpak-builder` with `dnf`; elsewhere it prints `dnf`/`apt`/`pacman`/
+`zypper`/`apk`/`xbps` hints when `flatpak` or `flatpak-builder` is missing):
 
-1. Locates the dump (arg, `game.zip`, or any `./*.zip`), verifies
-   `sha256 == 4c6562eab3fff1bd1a6e84732bcb565a871440fcb894985fe990fe566a8bd897`
-   (warning only), copies it to `game.zip`.
+1. Finds the dump (argument or XDG Downloads/Documents; `.zip`/`.rar`/`.7z`
+   or extracted folder) with `tools/find_game.py`, checks the SHA-256 of
+   `otomedius.exe` against `recomp/exe.sha256`, requires `Data/` next to it and
+   writes the normalized `game.zip`. An existing matching `game.zip` is
+   reused.
 2. Installs runtime + SDK 26.08 (user remotes first, then system, then Flathub).
 3. Downloads the capstone wheel (sha256-checked).
-4. `flatpak-builder --user --install --force-clean --disable-rofiles-fuse --repo=repo build-dir io.github.nicobm.OtomediusRecomp.json`
+4. `flatpak-builder --user --force-clean --disable-rofiles-fuse --repo=repo
+   build-dir io.github.nicobm.OtomediusRecomp.json`, then installs from the
+   `otomedius-local` remote (left disabled).
 
 Manifest module `otomedius-recomp`, `build-commands` (single script, no helpers):
 
@@ -175,6 +180,7 @@ Game data → `/app/share/otomedius-recomp/game/`; the launcher
 otomedius-recomp/
 ├── README.md  FLATPAK.md  LICENSE (MIT © 2026 nicobm)  VERSION (0.1.0)
 ├── build-game-flatpak.sh                 # the only user-facing script
+├── tools/find_game.py                    # dump search + SHA-256 check + normalized game.zip
 ├── io.github.nicobm.OtomediusRecomp.json # Flatpak manifest (python-capstone, sdl3, otomedius-recomp)
 ├── flatpak/                              # launcher, .desktop, .svg, .metainfo.xml, wheels/
 ├── native/                               # the Linux system layer (18 files, ~7.5k lines)
